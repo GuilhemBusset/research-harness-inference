@@ -1,11 +1,12 @@
 """What the spikes share (`spikes/common.py`): timing, percentiles, reading the workspace, the canary
-students' keys, how the gateway is reached, and a run's numbers sent to the reporter. The workspace,
-the secret, the gateway and the bus are stubs. No number here is a measurement; the commit and
+students' keys, how the gateway is reached, the session a job runs in, and a run's numbers sent to
+the reporter. The workspace, the secret, the gateway, the pool-state table and the bus are stubs. No number here is a measurement; the commit and
 every key are made while the tests run.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import math
@@ -22,6 +23,7 @@ from botocore.credentials import Credentials
 
 import common
 from rhi_common.keys import generate_key
+from rhi_common.records import ScalerNote, Session
 from rhi_common.spike_keys import SPIKE_KEYS_SECRET, SpikeKeys
 from rhi_reporter.measure import BUS_VARIABLE, SOURCE, Run, Verdict, decode, read_event
 
@@ -326,8 +328,9 @@ def test_the_gateway_stack_s_host_name_reaches_the_gateway_over_https(monkeypatc
     assert common.gateway_address(" https://example.com/ ") == "https://example.com"
     gateway = common.Gateway("example.com", "coursework", generate_key())
     assert gateway.state() == "cold"
-    gateway.wake()
-    assert calls == [("GET", "https://example.com/status"), ("POST", "https://example.com/wake")]
+    # The status is all a spike asks the gateway: it has no wake to send.
+    assert calls == [("GET", "https://example.com/status")]
+    assert not hasattr(gateway, "wake")
 
 
 def test_the_canary_key_is_never_sent_over_plain_http(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -359,3 +362,94 @@ def test_the_canary_key_does_not_follow_a_redirect(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(urllib.request.AbstractHTTPHandler, "do_open", transport)
     common.Gateway("example.com", "coursework", generate_key()).state()
     assert sent == [("https://example.com/status", True), ("http://example.com/status", False)]
+
+
+# The session.
+
+NOW = 1_800_000_000
+HOUR = 3600
+
+
+def test_require_session(pool_state: Any) -> None:
+    def refusal(session: Session | None, in_service: int | None, *, instances: int = 2, minutes: int = 90) -> str | None:
+        """Why a run of `minutes` on `instances` instances is refused at `NOW`, None when it passes,
+        with this session record and a note of `in_service` instances; None for no record."""
+        pool_state.items.clear()
+        if session is not None:
+            pool_state.hold(session)
+        if in_service is not None:
+            pool_state.hold(ScalerNote("coursework", 2, None, NOW - 30, in_service=in_service))
+        try:
+            common.require_session(
+                pool_state, "coursework", instances=instances, run_minutes=minutes, session_max_hours=12, now=lambda: NOW
+            )
+        except common.SessionRefused as refused:
+            assert str(refused) == refused.reason.value
+            return refused.reason.value
+        return None
+
+    def session(*, starts_at: int = NOW - HOUR, ends_at: int = NOW + 2 * HOUR, set_at: int = NOW - HOUR) -> Session:
+        return Session("coursework", 2, starts_at, ends_at, "an-admin", set_at)
+
+    # An active session with the instances in service that lasts the run, to the second, passes.
+    assert refusal(session(), 2) is None
+    assert refusal(session(), 3, minutes=120) is None
+    assert refusal(session(), 2, instances=1) is None
+    # The record gives no session: none, one of another pool, one not started yet, one that ended.
+    assert refusal(None, 2) == "no-session"
+    assert refusal(dataclasses.replace(session(), pool="mock"), 2) == "no-session"
+    assert refusal(session(starts_at=NOW + 1), 2) == "no-session"
+    assert refusal(session(ends_at=NOW), 2) == "no-session"
+    # The note gives too few instances: fewer in service than the run needs, or no note at all.
+    assert refusal(session(), 1) == "too-few-instances"
+    assert refusal(session(), None) == "too-few-instances"
+    # The record gives too short a session: its end, or the longest a session may last when that
+    # comes first, is before the run's.
+    assert refusal(session(), 2, minutes=121) == "session-too-short"
+    capped = session(starts_at=NOW - 11 * HOUR, set_at=NOW - 11 * HOUR)
+    assert refusal(capped, 2, minutes=60) is None
+    assert refusal(capped, 2, minutes=61) == "session-too-short"
+    # Both items are read each time, and nothing else.
+    assert set(pool_state.reads) == {("coursework", "session"), ("coursework", "note")}
+
+
+def test_the_session_is_judged_at_the_time_its_records_were_read(pool_state: Any) -> None:
+    class Slow:
+        """The table, each read of which takes a second of the clock `at`."""
+
+        at = float(NOW)
+
+        def get_item(self, **key: Any) -> dict[str, Any]:
+            self.at += 1
+            return pool_state.get_item(**key)
+
+    def refusal(minutes: int, *, left: int = 90 * 60) -> str | None:
+        """Why a run of `minutes` is refused in a session with `left` seconds left as the check begins."""
+        table = Slow()
+        pool_state.hold(
+            Session("coursework", 1, NOW - HOUR, NOW + left, "an-admin", NOW - HOUR),
+            ScalerNote("coursework", 1, None, NOW - 30, in_service=1),
+        )
+        try:
+            common.require_session(
+                table, "coursework", instances=1, run_minutes=minutes, session_max_hours=12, now=lambda: table.at
+            )
+        except common.SessionRefused as refused:
+            return refused.reason.value
+        return None
+
+    # The two reads took two seconds of the session: it no longer lasts the run it lasted before them.
+    assert refusal(90) == "session-too-short"
+    assert refusal(89) is None
+    # And a session that ended while they were read is no session.
+    assert refusal(1, left=1) == "no-session"
+
+
+def test_a_run_s_needs_are_the_owner_s_and_its_minutes_have_no_default() -> None:
+    assert common.needs_of({"RHI_SPIKE_RUN_MINUTES": "90"}) == common.Needs(instances=1, run_minutes=90)
+    assert common.needs_of({"RHI_SPIKE_INSTANCES": "3", "RHI_SPIKE_RUN_MINUTES": "45"}) == common.Needs(3, 45)
+    for incomplete in ({}, {"RHI_SPIKE_INSTANCES": "2"}, {"RHI_SPIKE_RUN_MINUTES": "0"}, {"RHI_SPIKE_RUN_MINUTES": "1.5"}):
+        with pytest.raises(ValueError, match="RHI_SPIKE_RUN_MINUTES"):
+            common.needs_of(incomplete)
+    with pytest.raises(ValueError, match="RHI_SPIKE_INSTANCES"):
+        common.needs_of({"RHI_SPIKE_INSTANCES": "0", "RHI_SPIKE_RUN_MINUTES": "90"})

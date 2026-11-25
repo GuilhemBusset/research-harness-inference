@@ -26,8 +26,14 @@ a several-agents student share their student's key, as a real student's agents w
 key for each of its students, and the job refuses, before it sends anything, runs that need more
 keys than the spikes' secret holds.
 
-**One run** first wakes the pool through the gateway and waits until it is ready, so that a run
-measures a warm pool, never a cold start. It then replays its sessions (`loadgen.agent_session`, of
+**In a booked session.** The job starts no machine: the owner books a session of the pool first,
+and before it sends anything the job checks it (`common.require_session`): the session is active,
+it has the job's instances in service, and it lasts `RHI_SPIKE_RUN_MINUTES` from now. Otherwise
+the job prints the reason, `no-session`, `too-few-instances` or `session-too-short`, sends nothing
+to the gateway, and ends as not measured.
+
+**One run** first waits until the gateway's status reads the pool ready, so that a run
+measures a pool that serves. It then replays its sessions (`loadgen.agent_session`, of
 section 4.7's sizes) for the duration it is given: no session starts a pause that would end after
 the duration (`Until`), none sends a request once the duration has passed, however late a pause
 ends (`loadgen.Load.sending`), and the run ends when the requests in flight have. A session holds
@@ -121,7 +127,9 @@ the number of streams, the students, and the class size when the run is at it.
 | `RHI_S5_DURATION_SECONDS` | How long each run sends requests, in seconds |
 | `RHI_S5_LEVER` | The name of the lever the pool is deployed with, lower-case letters, digits and hyphens: `baseline` unless given |
 | `RHI_S5_BUILD` | The name of the build the pool serves, lower-case letters and digits: `8bit` or `4bit` |
-| `RHI_S5_INSTANCES` | The instances the owner holds the pool at for the job: `1` unless given |
+| `RHI_SPIKE_INSTANCES` | The instances the job runs on, which the session has in service: `1` unless given |
+| `RHI_SPIKE_RUN_MINUTES` | How long the job lasts, in minutes, which the session must outlast. Required |
+| `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 | `RHI_S5_WINDOW_TOKENS` | The window at which each session compacts, in tokens, for the smaller window of section 4.7; unset, no session compacts |
 
 The pool's engine and prices, and the floors, come from the deployed configuration
@@ -129,10 +137,13 @@ The pool's engine and prices, and the floors, come from the deployed configurati
 the owner deploys before starting the job; the job never changes the pool. Run it while nothing
 else sends to the pool.
 
-**The instances.** The job is told how many instances the pool is held at (`RHI_S5_INSTANCES`),
-and refuses, as not measured, a run that any other number of instances served, or that one of them
+**The instances.** The job is told how many instances it runs on (`RHI_SPIKE_INSTANCES`): one
+number, which the session must have in service before the job sends anything, which labels the
+run, and which every run must be served by. The job
+refuses, as not measured, a run that any other number of instances served, or that one of them
 did not serve from its start to its end (`held_at`): the numbers of a job are always those many
-instances'. What one instance serves is a job at one; the class's size
+instances'. `RHI_S5_INSTANCES`, the variable's name before the job ran in a session, is not read.
+What one instance serves is a job at one; the class's size
 over the session's instances is a job at the session's instances (`docs/measurements/s5.md` says
 how the owner holds the pool there).
 
@@ -246,12 +257,10 @@ CLASS_SIZE_VARIABLE = "RHI_S5_CLASS_SIZE"
 DURATION_VARIABLE = "RHI_S5_DURATION_SECONDS"
 LEVER_VARIABLE = "RHI_S5_LEVER"
 BUILD_VARIABLE = "RHI_S5_BUILD"
-INSTANCES_VARIABLE = "RHI_S5_INSTANCES"
 WINDOW_VARIABLE = "RHI_S5_WINDOW_TOKENS"
 DEFAULT_POOL = "coursework"
 DEFAULT_STREAMS = (1, 4, 8, 16)
 DEFAULT_LEVER = "baseline"
-DEFAULT_INSTANCES = 1
 # The numbers of streams the names of the numbers are declared for: section 4.7's 1, 4, 8 and 16,
 # and the larger pools' 32 and 64, which spike S6 runs with this job.
 DECLARED_STREAMS = (1, 4, 8, 16, 32, 64)
@@ -282,10 +291,9 @@ SETTLE_SECONDS = 4 * SCRAPE_SECONDS
 # Seconds. Prometheus' lookback delta, its default: how far back before the run's start the job
 # looks for the sample a counter's increase starts from, as the `anchored` modifier would.
 LOOKBACK_SECONDS = 300
-# Seconds. While the pool wakes: its status is read this often, and the wake repeated this often,
-# as `rhi wait` does; a cold launch may take 40 minutes at worst (spike S1).
+# Seconds. Until the pool is ready its status is read this often, for as long as a cold launch
+# may take at worst (spike S1).
 POLL_SECONDS = 5
-WAKE_EVERY_SECONDS = 60
 READY_WAIT_SECONDS = 40 * 60
 READY = "ready"
 
@@ -944,7 +952,7 @@ class Replay(Protocol):
 class Job:
     """The runs of `plan(streams, class_size)` against the pool `pool`, served by `engine` at
     `prices`, each `duration` seconds, labelled with `lever`: sent through the gateway at
-    `endpoint` as the canary students of `keys`, the pool woken through `gateway`, read from
+    `endpoint` as the canary students of `keys`, the pool's state read through `gateway`, read from
     `workspace`. Each session compacts at `window_tokens` when it is given, and each run must be
     served by `instances` instances when that is given."""
 
@@ -981,16 +989,10 @@ class Job:
         self._seed = 0
 
     def _ready(self) -> None:
-        started = woke = self.wall()
-        if self.gateway.state() == READY:
-            return
-        self.gateway.wake()
+        started = self.wall()
         while self.gateway.state() != READY:
             if self.wall() - started >= READY_WAIT_SECONDS:
                 raise TimeoutError("the pool was not ready in time")
-            if self.wall() - woke >= WAKE_EVERY_SECONDS:
-                self.gateway.wake()
-                woke = self.wall()
             self.sleep(POLL_SECONDS)
 
     def _keyed(self, runs: Sequence[Planned]) -> None:
@@ -1706,10 +1708,15 @@ def window_of(environ: Mapping[str, str]) -> int | None:
 
 def main(environ: Mapping[str, str] = os.environ) -> Verdict:
     """Runs every run with the job's environment and credentials, prints what each measured, and
-    posts their numbers and verdict as the run `<build>-<lever>-<instances>` of S5."""
+    posts their numbers and verdict as the run `<build>-<lever>-<instances>` of S5. The pool's
+    session is checked first: a job it does not carry prints the reason, sends nothing to the
+    gateway, and is posted as not measured."""
     streams, lever, build = streams_of(environ), lever_of(environ), build_name_of(environ)
     class_size, duration = whole_of(environ, CLASS_SIZE_VARIABLE), whole_of(environ, DURATION_VARIABLE)
-    instances, window = whole_of(environ, INSTANCES_VARIABLE, DEFAULT_INSTANCES), window_of(environ)
+    window = window_of(environ)
+    # One number of instances: the session's check, the run's label and each run's own check read it.
+    needs = common.needs_of(environ)
+    instances = needs.instances
     # Refused before anything is sent: the canary keys go over HTTPS only.
     endpoint = common.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
@@ -1722,6 +1729,18 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
     label = f"{build}-{lever}-{instances}"
 
     def measure() -> dict[str, int | float]:
+        try:
+            common.require_session(
+                common.pool_state_table(environ),
+                name,
+                instances=instances,
+                run_minutes=needs.run_minutes,
+                session_max_hours=settings.session_max_hours,
+                now=time.time,
+            )
+        except common.SessionRefused as refused:
+            print(f"refused: {refused.reason}")
+            raise
         session = boto3.Session()
         workspace = common.Workspace(environ[WORKSPACE_URL_VARIABLE], environ["AWS_REGION"], session.get_credentials())
         keys = common.canary_keys().students

@@ -36,6 +36,17 @@ FLOORS = (
     "target_failed_requests_percent",
 )
 COMMIT = "c" * 40
+# What the job is given, but for the session's variables (`pool_state.environ`).
+ENVIRON = {
+    "AWS_REGION": "us-east-1",
+    "RHI_SPIKE_WORKSPACE_URL": "https://example.com/workspace",
+    "RHI_SPIKE_ENDPOINT": "example.com",
+    "RHI_S5_BUILD": "8bit",
+    "RHI_S5_CLASS_SIZE": "20",
+    "RHI_S5_DURATION_SECONDS": "600",
+    "RHI_MEASUREMENT_BUS": "rhi-measurements",
+    "CODEBUILD_RESOLVED_SOURCE_VERSION": COMMIT,
+}
 
 
 def measurement_format() -> Any:
@@ -144,7 +155,7 @@ def test_a_class_size_failed_share_above_its_floor_fails_the_job() -> None:
     assert verdict([*job(), run(s5.Shape.HANDS_ON, 8, failed=200)]) is Verdict.PASS
 
 
-def test_the_floors_come_from_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_floors_come_from_configuration(monkeypatch: pytest.MonkeyPatch, pool_state: Any) -> None:
     # Left out, the keys take section 17's values, and the failed share its own default.
     assert s5.floors_of(settings(**dict.fromkeys(FLOORS))) == s5.Floors(5, 15, 10, 0.5)
     stricter = settings(target_stream_median_tokens_per_second=17.5)
@@ -156,25 +167,89 @@ def test_the_floors_come_from_configuration(monkeypatch: pytest.MonkeyPatch) -> 
     events = SimpleNamespace(put_events=lambda Entries: sent.extend(Entries) or {"FailedEntryCount": 0})
     monkeypatch.setattr(s5.config, "read_ssm", lambda: stricter)
     monkeypatch.setattr(s5.Job, "measure", lambda self: job(self.runs[-1].class_size or 0, median=16.0))
-    monkeypatch.setattr(s5.boto3, "Session", lambda: SimpleNamespace(get_credentials=lambda: None))
     monkeypatch.setattr(s5.boto3, "client", lambda service: events)
     monkeypatch.setattr(common, "canary_keys", lambda: SimpleNamespace(students=(generate_key(),)))
-    environ = {
-        "AWS_REGION": "us-east-1",
-        "RHI_SPIKE_WORKSPACE_URL": "https://example.com/workspace",
-        "RHI_SPIKE_ENDPOINT": "example.com",
-        "RHI_S5_BUILD": "8bit",
-        "RHI_S5_CLASS_SIZE": "20",
-        "RHI_S5_DURATION_SECONDS": "600",
-        "RHI_MEASUREMENT_BUS": "rhi-measurements",
-        "CODEBUILD_RESOLVED_SOURCE_VERSION": COMMIT,
-    }
-    assert s5.main(environ) is Verdict.FAIL
+    pool_state.book()
+    assert s5.main(ENVIRON | pool_state.environ) is Verdict.FAIL
     (entry,) = sent
     (posted,) = decode(read_event({"detail": json.loads(entry["Detail"])}))
     assert (posted.measurement, posted.label, posted.verdict) == ("S5", "8bit-baseline-1", Verdict.FAIL)
     assert posted.numbers["stream_median_hands_on_class"] == 16.0
     assert posted.numbers["class_size"] == 20
+
+
+@pytest.fixture
+def posted(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """The runs the job posts, each as the reporter decodes its event, with the deployed
+    configuration the example's and one canary student."""
+    runs: list[Any] = []
+
+    def put_events(Entries: list[Mapping[str, str]]) -> dict[str, int]:
+        runs.extend(decode(read_event({"detail": json.loads(entry["Detail"])}))[0] for entry in Entries)
+        return {"FailedEntryCount": 0}
+
+    monkeypatch.setattr(s5.boto3, "client", lambda service: SimpleNamespace(put_events=put_events))
+    monkeypatch.setattr(s5.config, "read_ssm", settings)
+    monkeypatch.setattr(common, "canary_keys", lambda: SimpleNamespace(students=(generate_key(),)))
+    return runs
+
+
+class Reached(Exception):
+    """Raised where the job would send its first request to the pool."""
+
+
+def test_the_job_admitted_to_its_session_waits_for_the_status_and_sends_no_wake(
+    monkeypatch: pytest.MonkeyPatch, pool_state: Any, gateway_requests: list[tuple[str, str]], posted: list[Any]
+) -> None:
+    def replay(self: s5.Job, planned: s5.Planned, deadline: float) -> list[loadgen.Record]:
+        raise Reached
+
+    monkeypatch.setattr(s5.Job, "_replay", replay)
+    monkeypatch.setattr(s5, "POLL_SECONDS", 0)
+    pool_state.book(in_service=2)
+    with pytest.raises(Reached):
+        # One canary student's key carries one stream and a class of one.
+        one_student = {"RHI_S5_STREAMS": "1", "RHI_S5_CLASS_SIZE": "1"}
+        # The name the instances had before the job ran in a session is not read, and stops nothing.
+        instances = {"RHI_SPIKE_INSTANCES": "2", "RHI_S5_INSTANCES": "1"}
+        s5.main(ENVIRON | pool_state.environ | one_student | instances)
+    # The pool read cold, then ready: all the job asked the gateway before its first request.
+    assert gateway_requests == [("GET", "https://example.com/status")] * 2
+    # The instances the session was checked for are the run's own.
+    assert [run.label for run in posted] == ["8bit-baseline-2"]
+
+
+@pytest.mark.parametrize(
+    ("in_service", "minutes", "given", "reason", "label"),
+    [
+        (None, 600, {}, "no-session", "8bit-baseline-1"),
+        # The job's instances are one number: the session is checked for the two the run is labelled with.
+        (1, 600, {"RHI_SPIKE_INSTANCES": "2"}, "too-few-instances", "8bit-baseline-2"),
+        (1, 30, {}, "session-too-short", "8bit-baseline-1"),
+    ],
+)
+def test_the_job_refused_by_its_session_sends_nothing_and_is_not_measured(
+    in_service: int | None, minutes: int, given: dict[str, str], reason: str, label: str,
+    pool_state: Any, gateway_requests: list[tuple[str, str]], posted: list[Any], capsys: pytest.CaptureFixture[str],
+) -> None:  # fmt: skip
+    if in_service is not None:
+        pool_state.book(in_service=in_service, minutes=minutes)
+    with pytest.raises(common.SessionRefused) as refused:
+        s5.main(ENVIRON | pool_state.environ | given)
+    assert refused.value.reason == reason
+    assert reason in capsys.readouterr().out
+    assert gateway_requests == []
+    assert [(run.label, run.verdict, dict(run.numbers)) for run in posted] == [(label, Verdict.NOT_MEASURED, {})]
+
+
+def test_the_job_does_not_start_without_its_minutes(
+    pool_state: Any, gateway_requests: list[tuple[str, str]], posted: list[Any]
+) -> None:
+    pool_state.book(in_service=2)
+    without_minutes = {name: value for name, value in pool_state.environ.items() if name != "RHI_SPIKE_RUN_MINUTES"}
+    with pytest.raises(ValueError, match="RHI_SPIKE_RUN_MINUTES"):
+        s5.main(ENVIRON | without_minutes)
+    assert (pool_state.reads, gateway_requests, posted) == ([], [], [])
 
 
 def test_the_names_are_declared_one_per_quantity_and_condition() -> None:

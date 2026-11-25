@@ -46,7 +46,7 @@ keeps (`s3_harness_task.Lines`). Every line has `at`, its UTC time, and `kind`:
 | `step` | For each step: when it started and ended, Claude Code's exit status (and the type of the error, when it could not be launched), whether its result is there, what shows how, its requests and refused requests, and the build the pool served as its lifecycle agents report it |
 | `refused_request` | Each request the gateway or the engine refused during a step: the step, its time, route and status, and its cause |
 | `step_failed` | A step that raised, a turn Claude Code could not be launched for (its `step` line still follows), or a reading of the workspace that failed: its name and the type of the error |
-| `job_failed` | An error that stopped the job: the type of the error |
+| `job_failed` | An error that stopped the job: the type of the error, and for a job the pool's session does not carry, the reason |
 
 A refused request, and the build, are read as in the first part (`s3_harness_task`): a status other
 than 200 or a stream an error event ended; the one build the lifecycle agents reported over the
@@ -59,7 +59,11 @@ the model are read for what they hold, never copied.
 
 **What the job is given**, in its environment, as the owner starts it (`rhi-spike-s3_second_session`):
 `RHI_SPIKE_ENDPOINT`, `RHI_SPIKE_WORKSPACE_URL` and `RHI_SPIKE_POOL` (`coursework` unless given),
-as for the first part. It needs one canary student's key. The build the pool serves is the owner's
+as for the first part, and as for it `RHI_SPIKE_INSTANCES` (`1` unless given),
+`RHI_SPIKE_RUN_MINUTES`, without which the job does not start, and `RHI_SPIKE_POOL_STATE_TABLE`:
+the job runs in a session the owner has booked, checks it before it sends anything
+(`common.require_session`), and otherwise writes `job_failed` with the reason and exits 1. It needs
+one canary student's key. The build the pool serves is the owner's
 to set (the 8-bit, then the 4-bit build) before starting the job.
 """
 
@@ -446,7 +450,7 @@ def write_pdf(path: Path, word: str) -> None:
 
 class Job:
     """The session against the pool `pool` (served by `engine`), through the gateway at `endpoint`,
-    as the canary student of `key`; the pool woken through `gateway`, the workspace read through
+    as the canary student of `key`; the pool's state read through `gateway`, the workspace read through
     `workspace`; every line written to `lines`."""
 
     def __init__(
@@ -487,17 +491,11 @@ class Job:
             self.sleep(left)
 
     def ready(self) -> None:
-        """Wakes the pool and waits until it is ready, so that no step meets a cold start."""
-        started = woke = self.wall()
-        if self.gateway.state() == s5.READY:
-            return
-        self.gateway.wake()
+        """Waits until the status reads the pool ready, so that no step meets one that does not serve."""
+        started = self.wall()
         while self.gateway.state() != s5.READY:
             if self.wall() - started >= s3.READY_WAIT_SECONDS:
                 raise TimeoutError("the pool was not ready in time")
-            if self.wall() - woke >= s3.WAKE_EVERY_SECONDS:
-                self.gateway.wake()
-                woke = self.wall()
             self.sleep(s3.POLL_SECONDS)
 
     def build_in(self, start: float, end: float) -> str | None:
@@ -655,22 +653,37 @@ class Job:
 def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = print) -> int:
     """Runs the job with its environment and credentials; exits 1 when a step failed, or when an
     error stopped the job: that error is a line `job_failed` with its type's name, never its text,
-    which may be what AWS returned."""
+    which may be what AWS returned. A job the pool's session does not carry is that line with the
+    reason, one of `common.Refusal`."""
     try:
         return run_job(environ, out)
+    except common.SessionRefused as refused:
+        s3.Lines((), out=out).write(Line.JOB_FAILED, error=type(refused).__name__, reason=refused.reason.value)
+        return 1
     except Exception as error:  # noqa: BLE001 - the job's boundary: no traceback reaches the log
         s3.Lines((), out=out).write(Line.JOB_FAILED, error=type(error).__name__)
         return 1
 
 
 def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
-    """The job, from its environment and credentials; 1 when a step failed."""
+    """The job, from its environment and credentials; 1 when a step failed. `common.SessionRefused`,
+    with nothing sent to the gateway, when the pool's session does not carry the run."""
+    needs = common.needs_of(environ)
     endpoint = common.gateway_address(environ.get(s3.ENDPOINT_VARIABLE, ""))
     name = environ.get(s3.POOL_VARIABLE, s3.DEFAULT_POOL)
-    pools = [pool for pool in config.read_ssm().pools if pool.name == name]
+    settings = config.read_ssm()
+    pools = [pool for pool in settings.pools if pool.name == name]
     if len(pools) != 1:
         raise ValueError("the deployed configuration has no pool of that name")
     (pool,) = pools
+    common.require_session(
+        common.pool_state_table(environ),
+        name,
+        instances=needs.instances,
+        run_minutes=needs.run_minutes,
+        session_max_hours=settings.session_max_hours,
+        now=time.time,
+    )
     keys = common.canary_keys()
     key = keys.students[0]
     workspace = common.Workspace(

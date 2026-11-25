@@ -20,9 +20,20 @@ its samples.
 (`rhi_common.spike_keys`), one key for each student.
 
 **The gateway.** `Gateway` asks the gateway about one pool as a canary student: the pool's state in
-the status, and a wake. `gateway_address` makes its address from the gateway stack's output. The
+the status. `gateway_address` makes its address from the gateway stack's output. The
 canary key goes to the gateway over HTTPS only: an address of any other scheme is refused before
 anything is sent, and the key is sent with no redirect the gateway answers.
+
+**The session.** A job that needs GPU instances runs in a session the owner has booked for it, and
+starts no machine: a request sent outside a session is answered that there is none. The owner
+gives what the run needs when starting the build (`needs_of`): `RHI_SPIKE_INSTANCES`, the instances
+it needs in service, 1 unless given, and `RHI_SPIKE_RUN_MINUTES`, how long it lasts, which has no
+default. Before it sends anything the job calls `require_session`, which reads two items of the
+pool-state table (`pool_state_table`, the table `RHI_SPIKE_POOL_STATE_TABLE` names): the pool's
+session and the scaler's note. It passes when the session is active (`rhi_common.sessions`), the
+note reads at least those instances in service, and the session ends no earlier than the run's
+length from now. Otherwise it raises `SessionRefused` with one of three fixed reasons (`Refusal`):
+`no-session`, `too-few-instances`, `session-too-short`.
 
 **Posting.** A job cannot post a commit status. `run_spike` hands one run's numbers to the reporter
 as the measurement event of `rhi_reporter.measure`, on the bus the variable `RHI_MEASUREMENT_BUS`
@@ -50,6 +61,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
@@ -57,21 +69,27 @@ import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 
-from rhi_common import spike_keys
+from rhi_common import sessions, spike_keys
+from rhi_common.records import NOTE_RECORD, SESSION_RECORD, ScalerNote, Session
 from rhi_reporter.measure import BUS_VARIABLE, Verdict, measurement_event
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
-    from enum import StrEnum
 
 COMMIT_VARIABLE = "CODEBUILD_RESOLVED_SOURCE_VERSION"
 RUN_LABEL_VARIABLE = "RHI_RUN_LABEL"
+# What the owner gives a job that runs in a booked session: the stage's pool-state table, the pools
+# stack's output; the instances the run needs in service; and the minutes the run lasts.
+POOL_STATE_TABLE_VARIABLE = "RHI_SPIKE_POOL_STATE_TABLE"
+INSTANCES_VARIABLE = "RHI_SPIKE_INSTANCES"
+RUN_MINUTES_VARIABLE = "RHI_SPIKE_RUN_MINUTES"
+DEFAULT_INSTANCES = 1
 
 # The name Managed Prometheus signs its requests under.
 SIGNING_SERVICE = "aps"
 # How long one read of the workspace may take.
 QUERY_TIMEOUT_SECONDS = 30
-# Seconds: how long one answer of the gateway, its status or a wake, may take.
+# Seconds: how long one answer of the gateway, its status, may take.
 STATUS_TIMEOUT = 30
 
 _RUN_LABEL = re.compile(r"[a-z0-9-]+")
@@ -251,9 +269,85 @@ class Gateway:
         except (OSError, ValueError, KeyError, TypeError, StopIteration):
             return ""
 
-    def wake(self) -> None:
-        """Wakes the pool, as a student's `rhi wait` does."""
-        self._ask("POST", "/wake", json.dumps({"model": self.pool}).encode())
+
+# The session.
+
+
+class Refusal(StrEnum):
+    """Why a job may not run in the pool's session: the three reasons, and no other text."""
+
+    NO_SESSION = "no-session"
+    TOO_FEW_INSTANCES = "too-few-instances"
+    SESSION_TOO_SHORT = "session-too-short"
+
+
+class SessionRefused(Exception):
+    """The pool's session does not carry the run: `reason` says why, and is the error's whole text."""
+
+    def __init__(self, reason: Refusal) -> None:
+        super().__init__(reason.value)
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class Needs:
+    """What a run needs of the pool's session: instances in service, and minutes."""
+
+    instances: int
+    run_minutes: int
+
+
+def _whole(environ: Mapping[str, str], variable: str, default: int | None = None) -> int:
+    written = environ.get(variable, "").strip()
+    if not written and default is not None:
+        return default
+    # ASCII digits only: `int` takes more than a whole number written plainly.
+    if not (written.isascii() and written.isdigit() and int(written) >= 1):
+        raise ValueError(f"{variable} is a whole number of one or more")
+    return int(written)
+
+
+def needs_of(environ: Mapping[str, str]) -> Needs:
+    """What the owner said the run needs: `RHI_SPIKE_INSTANCES`, 1 unless given, and
+    `RHI_SPIKE_RUN_MINUTES`. ValueError when the minutes are not given, or when either is not a
+    whole number of one or more: the job does not start."""
+    return Needs(_whole(environ, INSTANCES_VARIABLE, DEFAULT_INSTANCES), _whole(environ, RUN_MINUTES_VARIABLE))
+
+
+def pool_state_table(environ: Mapping[str, str]) -> Any:
+    """The pool-state table `RHI_SPIKE_POOL_STATE_TABLE` names, read with the job's own credentials."""
+    return boto3.Session().resource("dynamodb").Table(environ[POOL_STATE_TABLE_VARIABLE])
+
+
+def require_session(
+    table: Any, pool: str, *, instances: int, run_minutes: int, session_max_hours: int, now: Callable[[], float]
+) -> None:
+    """Passes when the pool's session carries a run of `run_minutes` on `instances` instances from
+    now on; `SessionRefused` otherwise, with the first of the reasons that holds:
+
+    - `no-session`: the pool's session record is not active, or there is none;
+    - `too-few-instances`: the scaler's note reads fewer than `instances` in service, or there is none;
+    - `session-too-short`: the session ends before `run_minutes` from now. Its end is the one
+      every reader takes (`rhi_common.sessions.end`), at most `session_max_hours` long.
+
+    `table` is the pool-state table, a DynamoDB table of the AWS SDK; both items are read strongly
+    consistent, and nothing is written or sent. `now` is the clock, in seconds since the epoch: it
+    is read once both items have been, so that the time the reads took is not counted as the
+    session's."""
+
+    def read(record: str) -> Any:
+        return table.get_item(Key={"pool": pool, "record": record}, ConsistentRead=True).get("Item")
+
+    held, noted = read(SESSION_RECORD), read(NOTE_RECORD)
+    at = now()
+    session = None if held is None else Session.from_item(held)
+    if session is None or not sessions.is_active(session, int(at), session_max_hours=session_max_hours):
+        raise SessionRefused(Refusal.NO_SESSION)
+    in_service = 0 if noted is None else ScalerNote.from_item(noted).in_service
+    if in_service < instances:
+        raise SessionRefused(Refusal.TOO_FEW_INSTANCES)
+    if sessions.end(session, session_max_hours=session_max_hours) < at + run_minutes * 60:
+        raise SessionRefused(Refusal.SESSION_TOO_SHORT)
 
 
 # Posting.
