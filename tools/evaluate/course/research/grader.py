@@ -69,20 +69,33 @@ PROPERTIES = tuple(Property)
 # space, `·`, `⋅`, `*`, `×` or `.`, or with nothing between two symbols (`kgm-3`); a power with or
 # without a caret, in digits or superscripts, its minus a hyphen, `−` or `⁻`. What follows a `/`
 # up to the next `/` or the end of its parenthesis divides: W/m·K is read as W/(m·K), as the
-# sources print it. A unit of a quantity of `QUANTITIES` is known; any other is no unit here.
+# sources print it; a divisor that is a parenthesis ends with it, so kg/(m²)·m is kg·m/m². A
+# prefix binds to the symbol it is written against, as SI writes it: mg is a milligram, not a
+# metre times a gram. Kelvin takes no prefix, so W/mK is W/(m·K), as datasheets print it. A unit
+# of a quantity of `QUANTITIES` is known; any other is no unit here.
+
+# The prefixes a symbol of `_PREFIXED` may carry, and their factors.
+_PREFIXES: Mapping[str, float] = {
+    "M": 1e6, "k": 1e3, "h": 1e2, "da": 1e1, "d": 1e-1, "c": 1e-2, "m": 1e-3, "µ": 1e-6, "μ": 1e-6, "n": 1e-9,
+}  # fmt: skip
+# The unprefixed symbols that take a prefix: their factor to the base units, and their powers.
+_PREFIXED: Mapping[str, tuple[float, Mapping[str, int]]] = {
+    "W": (1.0, {"W": 1}),
+    "g": (1e-3, {"kg": 1}),
+    "m": (1.0, {"m": 1}),
+    "L": (1e-3, {"m": 3}),
+    "l": (1e-3, {"m": 3}),
+}
 
 # Each symbol: its factor to the base units, and its powers of them.
 SYMBOLS: Mapping[str, tuple[float, Mapping[str, int]]] = {
-    "W": (1.0, {"W": 1}),
-    "mW": (1e-3, {"W": 1}),
     "K": (1.0, {"K": 1}),
-    "kg": (1.0, {"kg": 1}),
-    "g": (1e-3, {"kg": 1}),
-    "m": (1.0, {"m": 1}),
-    "cm": (1e-2, {"m": 1}),
-    "mm": (1e-3, {"m": 1}),
-    "L": (1e-3, {"m": 3}),
-    "l": (1e-3, {"m": 3}),
+    **_PREFIXED,
+    **{
+        prefix + symbol: (scale * factor, powers)
+        for symbol, (factor, powers) in _PREFIXED.items()
+        for prefix, scale in _PREFIXES.items()
+    },
 }
 
 QUANTITIES: Mapping[str, Mapping[str, int]] = {
@@ -151,7 +164,8 @@ def _parse(unit: str) -> tuple[float, dict[str, int]]:
         factor, powers = product()
         while at < len(tokens) and tokens[at] == "/":
             at += 1
-            divisor = product()
+            # A parenthesis is the whole divisor: what follows it multiplies.
+            divisor = factor_of() if at < len(tokens) and tokens[at] == "(" else product()
             factor, powers = factor / divisor[0], _times(powers, divisor[1], -1)
         return factor, powers
 

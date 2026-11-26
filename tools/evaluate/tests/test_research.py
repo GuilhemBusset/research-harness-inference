@@ -235,6 +235,10 @@ def test_a_plausible_wrong_location_is_rejected_on_the_location_alone(
         # Kelvin multiplied, not divided: the signs that group a unit count.
         lambda answer: answer["evidence"][0].update(unit="(W/m)·K"),
         lambda answer: answer["evidence"][0].update(unit="W·K/m"),
+        # A parenthesized divisor ends with its parenthesis: kg/(m²)·m is kg/m, no density.
+        lambda answer: answer["evidence"][1].update(unit="kg/(m²) × m"),
+        # A prefix binds to its symbol: mg/m³ is a mass per volume, not a metre-gram per volume.
+        lambda answer: answer["conclusion"].update(unit="mg/m³"),
     ],
 )
 def test_a_wrong_unit_is_rejected_on_the_unit_alone(
@@ -347,6 +351,7 @@ def in_other_units_and_notations(answer: dict[str, Any]) -> None:
         (1, "kg·m^−3"),  # a minus sign, U+2212
         (1, "kg m-3"),
         (1, "g/L"),
+        (1, "mg/cm³"),  # a milligram per cubic centimetre is a kilogram per cubic metre
         (0, "W·m⁻¹·K⁻¹"),
         (0, "W / (m K)"),
         (0, "W/m/K"),
