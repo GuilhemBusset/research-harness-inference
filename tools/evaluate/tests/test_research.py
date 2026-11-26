@@ -251,6 +251,26 @@ def test_a_wrong_unit_is_rejected_on_the_unit_alone(
 
 
 @pytest.mark.parametrize(
+    ("row", "unit"),
+    [
+        (None, "kg/mm"),  # a mass per millimetre, a length: never a metre times a metre
+        (1, "mg/m^4"),  # a milligram per metre to the fourth: never a metre-gram per volume
+        (None, "kg/km^200"),  # a factor no float holds: a rejection, not an error
+        (0, "W/mK^-200·K^201"),  # out of range in one reading is no unit, whatever another measures
+    ],
+)
+def test_a_prefixed_symbol_is_one_symbol_and_a_unit_out_of_range_is_rejected_on_the_unit_alone(
+    tmp_path: Path, row: int | None, unit: str
+) -> None:
+    def respelled(answer: dict[str, Any]) -> None:
+        (answer["conclusion"] if row is None else answer["evidence"][row])["unit"] = unit
+
+    report = research.grade(EXEMPLAR, written(tmp_path, changed(EXEMPLAR, respelled)))
+
+    assert failed(report) == {Property.UNIT}
+
+
+@pytest.mark.parametrize(
     ("change", "broken"),
     [
         # The humid conductivity of the same panel, given for the dry one: a wrong fact.

@@ -71,11 +71,15 @@ PROPERTIES = tuple(Property)
 # without a caret, in digits or superscripts, its minus a hyphen, `−` or `⁻`. What follows a `/`
 # up to the next `/` or the end of its parenthesis divides: W/m·K is read as W/(m·K), as the
 # sources print it; a divisor that is a parenthesis ends with it, so kg/(m³)·m is kg·m/m³. A
-# prefix binds to the symbol it is written against, as SI writes it: mg is a milligram, not a
-# metre times a gram, and mW/(m·mK) is a milliwatt per metre per millikelvin. Only where that
-# reading measures no quantity is a prefixed symbol read as two symbols: W/mK, which measures
-# none as a watt per millikelvin, is W/(m·K), as datasheets print it. A unit of a quantity of
-# `QUANTITIES` is known; any other is no unit here.
+# prefix binds to the symbol it is written against, as SI writes it, and a prefixed symbol is
+# never read as the product of its parts: mg is a milligram, not a metre times a gram, mm a
+# millimetre, so kg/mm is a mass per length, and mW/(m·mK) is a milliwatt per metre per
+# millikelvin. One notation is the exception, the datasheets' divisor written run together: where
+# the SI reading measures no quantity, a metre written against another symbol as the first factor
+# of a divisor is the two of them, so W/mK, which measures none as a watt per millikelvin, is
+# W/(m·K). A unit whose factor is out of range, such as km^200, is no unit, whatever another
+# reading of it would measure. A unit of a quantity of `QUANTITIES` is known; any other is no unit
+# here.
 
 # The prefixes a symbol of `_PREFIXED` may carry, and their factors.
 _PREFIXES: Mapping[str, float] = {
@@ -123,11 +127,35 @@ class _NoUnit(Exception):
     """A text that is no unit the grader reads."""
 
 
+class _OutOfRange(Exception):
+    """A unit with a factor no float holds: no reading of it is taken."""
+
+
+def _in_range(factor: float) -> float:
+    if not (math.isfinite(factor) and factor > 0):
+        raise _OutOfRange
+    return factor
+
+
+# Each symbol, and the symbols of its base: m, mm and km are all metres.
+_SAME_BASE: Mapping[str, frozenset[str]] = {
+    symbol: frozenset(other for other, (_factor, theirs) in SYMBOLS.items() if theirs == powers)
+    for symbol, (_scale, powers) in SYMBOLS.items()
+}
+
+
+def _symbol_at(text: str, at: int) -> str | None:
+    """The longest symbol a text gives at a place, or None."""
+    return next((symbol for symbol in _BY_LENGTH if text.startswith(symbol, at)), None)
+
+
 def _readings(unit: str) -> Iterator[list[_Token]]:
     """The ways to read a unit as factors and signs, a product written out as `·`, the SI one first.
 
     The symbols of a run of letters are matched the longest first, so that the first reading binds
-    each prefix to its symbol; a later one splits a prefixed symbol into a symbol and the next.
+    each prefix to its symbol; a later one splits a prefixed symbol into a metre and the next
+    symbol, only as the first factor of a divisor and only where that symbol is no metre (W/mK).
+    A symbol raised out of the range of a float raises `_OutOfRange`.
     """
     text = unit.translate(_SIGNS).strip()
     if len(text) > _LONGEST_UNIT:
@@ -157,12 +185,23 @@ def _readings(unit: str) -> Iterator[list[_Token]]:
         if at in dead:
             return
         ended = False
+        # Only the first factor of a divisor may be split, as datasheets run it together (W/mK).
+        divisor = tokens[-1:] == ("/",) or tokens[-2:] == ("/", "(")
+        longest = None
         for symbol in _BY_LENGTH:
             if text.startswith(symbol, at):
+                if longest is None:
+                    longest = symbol
+                elif not divisor or _symbol_at(text, at + len(symbol)) in (None, *_SAME_BASE[symbol]):
+                    continue  # a prefixed symbol is one symbol: mg a milligram, mm a millimetre
                 factor, powers = SYMBOLS[symbol]
                 raised = _POWER.match(text, at + len(symbol))
                 power = int(raised[1]) if raised else 1
-                token = (factor**power, {base: exponent * power for base, exponent in powers.items()})
+                try:
+                    scaled = _in_range(factor**power)
+                except OverflowError:
+                    raise _OutOfRange from None
+                token = (scaled, {base: exponent * power for base, exponent in powers.items()})
                 for reading in onward(raised.end() if raised else at + len(symbol), joined(tokens, token)):
                     ended = True
                     yield reading
@@ -232,16 +271,22 @@ def _times(powers: Mapping[str, int], more: Mapping[str, int], sign: int) -> dic
 def _unit(unit: str) -> tuple[str, float] | None:
     """The quantity a unit measures and its factor to the quantity's base unit, or None.
 
-    The first reading of the unit (`_readings`) that measures a quantity is the one taken.
+    The first reading of the unit (`_readings`) that measures a quantity is the one taken. A
+    factor out of the range of a float, in any reading tried, is no unit: the whole unit is
+    rejected, and no other reading of it is taken.
     """
-    for reading in _readings(unit):
-        try:
-            factor, powers = _parse(reading)
-        except (_NoUnit, OverflowError, ZeroDivisionError, ValueError):
-            continue
-        for quantity, base in QUANTITIES.items():
-            if powers == base:
-                return quantity, factor
+    try:
+        for reading in _readings(unit):
+            try:
+                factor, powers = _parse(reading)
+            except _NoUnit:
+                continue
+            _in_range(factor)
+            for quantity, base in QUANTITIES.items():
+                if powers == base:
+                    return quantity, factor
+    except (_OutOfRange, OverflowError, ZeroDivisionError):
+        return None
     return None
 
 
