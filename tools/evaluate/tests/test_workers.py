@@ -26,7 +26,7 @@ from evaluate import workers
 from evaluate.workers import Limits, Refused, Spec, Streamed, Undisposed, WorkerFault, Workers
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
 MEBIBYTE = 1024 * 1024
 LIMITS = Limits(
@@ -42,6 +42,12 @@ IMAGE = "sha256:" + "ab" * 32
 SETUP = ("run", "inspect", "copy", "await")
 
 
+def folders(output: int = LIMITS.output_bytes, more: dict[str, str] | None = None) -> dict[str, object]:
+    """What a runtime reports as the writable folders of a worker of `LIMITS`, or of another one."""
+    scratch = dict.fromkeys((workers.HOME, workers.WORK, workers.TEMPORARY), f"rw,size={LIMITS.scratch_bytes}")
+    return {"Tmpfs": {**scratch, workers.OUTPUT: f"rw,noexec,size={output}", **(more or {})}}
+
+
 def option(arguments: Sequence[str], name: str) -> list[str]:
     """The values one option was given in a `docker run`, before the image."""
     before = arguments[: arguments.index(IMAGE)]
@@ -51,13 +57,16 @@ def option(arguments: Sequence[str], name: str) -> list[str]:
 class Runtime:
     """A runtime that holds a container from its `run` to its `rm`, and reports for it the limits
     it was started with unless `reported` says otherwise. `breaks` raises at a step, after the step
-    took effect; a name in `stuck` is a container that no removal removes."""
+    took effect, and `once` does so a single time; a name in `stuck` is a container that no removal
+    removes. `during` is called while a streamed command runs."""
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.started: list[list[str]] = []
         self.alive: set[str] = set()
         self.breaks: dict[str, BaseException] = {}
+        self.once: dict[str, BaseException] = {}
+        self.during: Callable[[], object] = lambda: None
         self.reported: dict[str, object] = {}
         self.stuck: set[str] = set()
         self.ended: Streamed = Streamed(0, False)
@@ -91,6 +100,7 @@ class Runtime:
                     "NetworkMode": option(run, "network")[0],
                     "ReadonlyRootfs": "--read-only" in run,
                     "Privileged": "--privileged" in run,
+                    "Tmpfs": dict(value.split(":", 1) for value in option(run, "tmpfs")),
                     **self.reported,
                 }
             )
@@ -99,6 +109,8 @@ class Runtime:
         elif step == "ps":
             name = arguments[-1].rpartition("=")[2]
             result = name if name in self.alive else ""
+        if step in self.once:
+            raise self.once.pop(step)
         if step in self.breaks:
             raise self.breaks[step]
         return result
@@ -108,6 +120,7 @@ class Runtime:
         self.allowed.append(seconds)
         if "command" in self.breaks:
             raise self.breaks["command"]
+        self.during()
         packed = io.BytesIO()
         with tarfile.open(fileobj=packed, mode="w") as archive:
             for name, data in self.output.items():
@@ -117,7 +130,7 @@ class Runtime:
             link = tarfile.TarInfo("link")
             link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
             archive.addfile(link)
-        sink.write_bytes(packed.getvalue() if arguments[2:4] == ["python", "-c"] else b"printed\n")
+        sink.write_bytes(packed.getvalue() if arguments[2:5] == ["python", "-I", "-c"] else b"printed\n")
         return self.ended
 
     def removed(self) -> set[str]:
@@ -339,6 +352,30 @@ def test_a_source_that_would_bring_in_what_stays_outside_is_refused(
     assert left_in(scratch) == []
 
 
+def test_the_configuration_of_this_host_is_no_source_and_no_scratch_folder(
+    runtime: Runtime, scratch: Path, task: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "operator"
+    monkeypatch.setenv("HOME", str(home))
+    (home / ".aws").mkdir(parents=True)
+    (home / ".aws" / "config").write_text("# a stand-in for this host's configuration\n", encoding="utf-8")
+    (home / ".config" / "tool").mkdir(parents=True)
+    (home / "course" / "task").mkdir(parents=True)
+
+    with Workers(scratch, runtime=runtime) as started:
+        for folder in (home / ".aws", home / ".config" / "tool", home / ".config"):
+            for spec in (Spec(IMAGE, folder, LIMITS), Spec(IMAGE, task, LIMITS, tools={"search": folder})):
+                with pytest.raises(Refused):
+                    started.start(spec)
+        assert runtime.calls == []
+        assert left_in(scratch) == []
+        # What a worker wrote is the next one's source: the scratch folder is held to the same.
+        with pytest.raises(Refused):
+            Workers(home / ".cache" / "evaluate", runtime=runtime)
+        # The rest of the home folder is not the host's configuration: a task may be kept there.
+        started.start(Spec(IMAGE, home / "course" / "task", LIMITS))
+
+
 def test_a_copy_follows_no_link_and_takes_no_socket(runtime: Runtime, scratch: Path, task: Path, sealed: Path) -> None:
     (task / "answer.json").symlink_to(sealed / "references" / "optimum.json")
     with Workers(scratch, sealed=[sealed], runtime=runtime) as started:
@@ -364,6 +401,11 @@ def test_a_copy_follows_no_link_and_takes_no_socket(runtime: Runtime, scratch: P
         {"NanoCpus": 0},
         {"NetworkMode": "bridge"},
         {"ReadonlyRootfs": False},
+        # A writable folder larger than asked for, one with no size, one more, and none reported.
+        folders(output=2 * LIMITS.output_bytes),
+        folders(more={workers.HOME: "rw"}),
+        folders(more={"/var": f"rw,size={LIMITS.scratch_bytes}"}),
+        {"Tmpfs": None},
     ],
 )
 def test_a_worker_without_its_limits_runs_nothing(
@@ -435,9 +477,50 @@ def test_a_command_past_its_wall_time_ends_its_worker(runtime: Runtime, scratch:
 
         assert ran.timed_out
         assert ran.exit_code is None
-        assert runtime.allowed == [LIMITS.wall_seconds]
+        assert len(runtime.allowed) == 1
+        assert 0 < runtime.allowed[0] <= LIMITS.wall_seconds
         assert runtime.alive == set()
 
+    assert left_in(scratch) == []
+
+
+def test_the_commands_of_a_worker_share_its_wall_time(
+    runtime: Runtime, scratch: Path, task: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [100.0]
+    monkeypatch.setattr(workers.time, "monotonic", lambda: clock[0])
+    runtime.during = lambda: clock.__setitem__(0, clock[0] + 6)
+    limits = Limits(**{**vars(LIMITS), "wall_seconds": 10})
+
+    with Workers(scratch, runtime=runtime) as started:
+        trial = started.start(Spec(IMAGE, task, limits))
+        ran = [trial.run(["claude", "--print", "go on"]) for _ in range(3)]
+
+        # Ten seconds, then the four that are left; with none left the third is not run at all,
+        # and it has timed out: the worker is ended.
+        assert runtime.allowed == [10, 4]
+        assert [one.timed_out for one in ran] == [False, False, True]
+        assert runtime.alive == set()
+
+
+def test_a_timeout_is_not_returned_while_the_runtime_still_holds_the_worker(
+    runtime: Runtime, scratch: Path, task: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workers, "REMOVAL_PAUSE", 0)
+    runtime.ended = Streamed(None, False)
+
+    with Workers(scratch, runtime=runtime) as started:
+        trial = started.start(Spec(IMAGE, task, LIMITS))
+        runtime.stuck = {trial.name}
+        with pytest.raises(Undisposed):
+            trial.run(["sleep", "infinity"])
+        with pytest.raises(Undisposed):
+            trial.stop()
+        assert runtime.alive == {trial.name}
+        # The worker stays recorded: the disposal of the run tries again, and now ends it.
+        runtime.stuck = set()
+
+    assert runtime.alive == set()
     assert left_in(scratch) == []
 
 
@@ -468,6 +551,61 @@ def test_transcripts_and_collected_output_are_gone_after_grading(runtime: Runtim
     assert not ran.transcript.exists()
     assert not submitted.exists()
     assert runtime.alive == set()
+    assert left_in(scratch) == []
+
+
+def test_the_files_of_a_task_are_not_imported_by_the_programs_that_serve_the_worker(
+    runtime: Runtime, forwarder: tuple[str, int], scratch: Path, task: Path, tmp_path: Path
+) -> None:
+    for module in ("tarfile", "socket", "threading"):
+        (task / f"{module}.py").write_text("raise SystemExit('a file of the task was imported')\n", encoding="utf-8")
+    output = tmp_path / "written"
+    output.mkdir()
+    (output / "answer.txt").write_text("20", encoding="utf-8")
+
+    def packed_here(arguments: Sequence[str], *, sink: Path, limit: int, seconds: float) -> Streamed:
+        """The program that reads the output folder, run as it is given, in the task's folder."""
+        program = [*arguments[3:-1], arguments[-1].replace(workers.OUTPUT, str(output))]
+        with sink.open("wb") as file:
+            done = subprocess.run([sys.executable, *program], cwd=task, stdout=file, timeout=60, check=False)
+        return Streamed(done.returncode, False)
+
+    with Workers(scratch, runtime=runtime) as started:
+        trial = started.start(Spec(IMAGE, task, LIMITS, forwarder=forwarder))
+        runtime.stream = packed_here
+        assert (trial.collect() / "answer.txt").read_text(encoding="utf-8") == "20"
+
+    # The same holds for the worker's first process and for the wait for its relay.
+    run = runtime.started[0]
+    programs = [run[run.index(IMAGE) + 1 :], *(call[2:] for call in runtime.calls if call[2:3] == ["python"])]
+    assert len(programs) == 2
+    assert all(program[:3] == ["python", "-I", "-c"] for program in programs)
+
+
+@pytest.mark.parametrize("first", [True, False], ids=["first-removal", "second-removal"])
+def test_an_interrupt_during_disposal_does_not_end_it(
+    first: bool,
+    runtime: Runtime,
+    relays: list[subprocess.Popen[bytes]],
+    forwarder: tuple[str, int],
+    scratch: Path,
+    task: Path,
+) -> None:
+    interrupt = KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt) as raised, Workers(scratch, runtime=runtime) as started:
+        started.start(Spec(IMAGE, task, LIMITS, forwarder=forwarder))
+        late = started.start(Spec(IMAGE, task, LIMITS, forwarder=forwarder))
+        if first:
+            runtime.once["rm"] = interrupt
+        else:
+            # The second removal: the first worker to be disposed of is ended by hand.
+            late.stop()
+            runtime.once["rm"] = interrupt
+
+    assert raised.value is interrupt
+    assert runtime.alive == set()
+    assert all(relay.poll() is not None for relay in relays)
     assert left_in(scratch) == []
 
 
