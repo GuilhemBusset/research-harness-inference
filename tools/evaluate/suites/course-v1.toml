@@ -168,7 +168,10 @@ instances = [
     { id = "debugging.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
 ]
 
-# The production-planning model: integrality, balance, capacity, the objective, and the table.
+# The production-planning model: balance, integrality, capacity, the objective, and the table.
+# Its instances and its grader are tools/evaluate/course/optimization/, whose `fixture_digest` and
+# `grader_digest` compute the digests below; tools/evaluate/tests/test_optimization.py holds the
+# two together.
 [[tasks]]
 id = "optimization.t01"
 core = true
@@ -177,9 +180,9 @@ background = "hands_on"
 features = []
 harnesses = ["claude_code", "codex", "opencode", "pi", "sdk_tool_loop"]
 instances = [
-    { id = "optimization.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "optimization.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "optimization.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "optimization.t01.i01", fixture_digest = "sha256:91374db9c172313f05b9a364645a9e4d2d2d76e429b2a3c07d3731aa705e4d3c", grader_digest = "sha256:8a319adb5863f2d43bea257599824dfb6d071561a12d187acb031656369076c2" },
+    { id = "optimization.t01.i02", fixture_digest = "sha256:e9aec4d13545dd6961ab3d3dc1eae6a4eeee7853a6e2445bf24471c49775d93d", grader_digest = "sha256:c1a54dbe1c077cbe496f3d7cfeeb8b9d2692eca3eda167d9ab54765c0ee87247" },
+    { id = "optimization.t01.i03", fixture_digest = "sha256:bdfcf1fe7b70b6d6ac4492a249f463e1d15e93924d64fcf319b1cef81530a721", grader_digest = "sha256:3cb1930eb62b5f6af1491fefe66c974f0a1eee07701f97ed6772977c3e2438cd" },
 ]
 
 # Grounded research: the facts, their units, the source IDs, and the cited page or table.
