@@ -37,6 +37,8 @@ import json
 import os
 import posixpath
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -2010,30 +2012,56 @@ class Engine:
         the head, or None when there is nothing to run or the probe's path is refused.
 
         The command runs as written. A run in which pytest could not load the verifier's result
-        plugin (`verify._notes`) ran no test and says nothing of the code: #766's examiner replaced
-        PYTHONPATH, every head failed, and its builder may not change the examiner's command. Then,
-        and only then, the command runs once more, in a fresh copy, with the PYTHONPATH it assigns
-        extended by the verifier's (`extended_pythonpath`), and that run is the verdict. A command
-        that ran is judged as written, so a module only the verifier's directory holds
-        (`implement_loop`) cannot make it pass."""
+        plugin (the note `verify.run_check` gives it, `verify._notes`) ran no test and says nothing
+        of the code: #766's examiner replaced PYTHONPATH, every head failed, and its builder may not
+        change the examiner's command. Then, and only then, the command runs once more, in a fresh
+        copy, with the PYTHONPATH it assigns extended by a directory that holds the plugin alone
+        (`_plugin_only`, `extended_pythonpath`), never the engine's own directory, whose
+        `implement_loop` a probe of the code under review would import. That run is the verdict
+        only when it left a pytest record, as a verification requires; otherwise the first run is.
+        A command that ran is judged as written."""
         if not command:
             return None
         if probe and not self._inside(Path("/nonexistent-root"), probe[0]):
             self.store.event("probe_path_refused", path=str(probe[0])[:200])
             return None
-        ran = self._run_reproduction(wt, command, cwd, probe)
-        if ran is None:
+        first = self._run_reproduction(wt, command, cwd, probe)
+        if first is None:
             return None
-        ev, cases = ran
-        extended = extended_pythonpath(command)
-        if cases is None and extended != command and verify._notes(None, ev.output_tail):
-            ran = self._run_reproduction(wt, extended, cwd, probe)
-        return ran[0] if ran is not None else None
+        unloaded = verify._notes(None, f'Error importing plugin "{verify.PLUGIN}"')
+        if not any(note in first[0].note for note in unloaded):
+            return first[0]
+        work = self.store.issue_dir(0) / "repro"
+        work.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=work, prefix="plugin-") as tmp:
+            plugin = self._plugin_only(Path(tmp))
+            extended = extended_pythonpath(command, str(plugin))
+            retry = None if extended == command else self._run_reproduction(wt, extended, cwd, probe, plugin)
+        return retry[0] if retry is not None and retry[1] is not None else first[0]
 
-    def _run_reproduction(self, wt: Path, command: str, cwd: str,
-                          probe: tuple[str, str] | None) -> tuple[Evidence, dict | None] | None:
-        """One run of `command` in a throwaway copy of the head with the probe written into it:
-        what `verify.run_check` returns, or None when the probe's path leads out of the copy."""
+    @staticmethod
+    def _plugin_only(root: Path) -> Path:
+        """`root`, holding the verifier's result plugin under the name the verifier loads it by
+        (`verify.PLUGIN`, `implement_loop.loop_pytest`), copied from where the verifier ships it,
+        with an empty `__init__.py` beside it and nothing else of the engine. The plugin drops the
+        package it was loaded from once loaded, so a test then imports the code under review's own
+        `implement_loop` if its path has one, and this empty one if not. A copy, not a link: the
+        plugin finds its package by its own real path."""
+        parts = verify.PLUGIN.split(".")
+        source = verify.ENGINE_DIR.joinpath(*parts).with_suffix(".py")
+        target = root.joinpath(*parts).with_suffix(".py")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for package in target.relative_to(root).parents:
+            if package != Path("."):
+                (root / package / "__init__.py").touch()
+        shutil.copyfile(source, target)
+        return root
+
+    def _run_reproduction(self, wt: Path, command: str, cwd: str, probe: tuple[str, str] | None,
+                          plugin: Path | None = None) -> tuple[Evidence, dict | None] | None:
+        """One run of `command` in a throwaway copy of the head with the probe written into it (and
+        `plugin`, read-only, where the command may see it): what `verify.run_check` returns, or
+        None when the probe's path leads out of the copy."""
         with self.ws.disposable(wt) as scratch:
             if probe:
                 target = scratch / probe[0]
@@ -2043,8 +2071,9 @@ class Engine:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(probe[1])
             spec = CheckSpec(criterion="repro", command=command, cwd=cwd)
+            mounts = self._mounts(scratch).plus(readable=[plugin] if plugin else [])
             return verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
-                                    self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch))
+                                    self.caps.check_timeout_s, extra_env=self.check_env, mounts=mounts)
 
     @staticmethod
     def _replace_file(target: Path, text: str) -> None:
@@ -3744,20 +3773,19 @@ _SETS_PYTHONPATH = re.compile(
     rf"(?:[A-Za-z_][A-Za-z0-9_]*={_LITERAL}[ \t]+)*PYTHONPATH=(?P<value>{_LITERAL})(?=[ \t\n;&|]|$)")
 
 
-def extended_pythonpath(command: str) -> str:
-    """`command` with the PYTHONPATH its first simple command assigns extended by the verifier's
-    instead of replacing it, for the second run of a reproduction (`Engine._reproduction`).
-    `[env [-u NAME]... | export] [NAME=value]... PYTHONPATH=<value>` at the head of the command,
-    every value literal, becomes `PYTHONPATH=<value>:"$PYTHONPATH"`: `verify.run_check` runs the
-    command with `bash -c`, and the sandbox keeps the environment it is given, so bash expands it
-    to the verifier's value. Anything else is left as written: a value that is not literal, and a
-    PYTHONPATH set anywhere else in the command, where a `PYTHONPATH=` word may be an argument
-    (`grep PYTHONPATH=src`) that only a shell parser could tell from an assignment."""
+def extended_pythonpath(command: str, directory: str) -> str:
+    """`command` with `directory` added after the PYTHONPATH its first simple command assigns, for
+    the second run of a reproduction (`Engine._reproduction`). `[env [-u NAME]... | export]
+    [NAME=value]... PYTHONPATH=<value>` at the head of the command, every value literal, becomes
+    `PYTHONPATH=<value>:<directory>`, the directory quoted for the shell (`verify.run_check` runs
+    the command with `bash -c`). Anything else is left as written: a value that is not literal,
+    and a PYTHONPATH set anywhere else in the command, where a `PYTHONPATH=` word may be an
+    argument (`grep PYTHONPATH=src`) that only a shell parser could tell from an assignment."""
     m = _SETS_PYTHONPATH.match(command)
     if not m:
         return command
     # An empty entry is the current directory, which an empty value did not ask for.
-    tail = ':"$PYTHONPATH"' if m.group("value") else '"$PYTHONPATH"'
+    tail = (":" if m.group("value") else "") + shlex.quote(directory)
     return command[:m.end()] + tail + command[m.end():]
 
 

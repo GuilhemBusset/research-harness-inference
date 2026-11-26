@@ -5,7 +5,7 @@ The verifier loads its result plugin through PYTHONPATH. The examiner's probes r
 the plugin, so every run failed whatever the code did, the findings "still reproduced" on every
 head the builder made, and the builder may not change an examiner's command. The engine runs a
 reproduction as written and, only when pytest could not load the plugin there, once more with the
-PYTHONPATH its first command assigns extended by the verifier's.
+PYTHONPATH its first command assigns extended by a directory that holds the plugin alone.
 
 The engine runs are real (git, the verifier, real pytest, squash merges into a bare remote); the
 agents and GitHub are the fakes."""
@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from helpers import HAS_PYTEST, SHIP, TempRepo, issue_body
+from helpers import HAS_PYTEST, SHIP, TempRepo, git, issue_body
 from test_deploying import L  # the `implement_loop` beside these tests (`loop_beside_these_tests`)
 
 EPIC, ISSUE = 1, 2
@@ -83,7 +83,7 @@ def test_a_finding_whose_reproduction_sets_pythonpath_closes_once_the_code_passe
 
 @pytest.fixture
 def engine(repo):
-    """An engine with what running a reproduction needs, on the repository's coordination worktree."""
+    """An engine with what running a reproduction needs."""
     made = L.engine.Engine.__new__(L.engine.Engine)
     made.ws = L.workspace.Workspace(repo.work, EPIC, SHIP, base_dir=repo.loop_dir)
     made.store = L.state.RunStore.for_root(repo.work, EPIC)
@@ -91,59 +91,102 @@ def engine(repo):
     return made
 
 
-def reproduces(engine, command: str, probe: str) -> bool | None:
+@pytest.fixture
+def wt(engine):
+    """The head under judgement: the repository's coordination worktree."""
+    return engine.ws.coord()
+
+
+def commit(wt, files: dict[str, str]) -> None:
+    """Add `files` to the head under judgement."""
+    for rel, text in files.items():
+        (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+        (wt / rel).write_text(text)
+    git("add", "-A", cwd=wt)
+    git("commit", "-qm", "code under review", cwd=wt)
+
+
+def reproduces(engine, wt, command: str, probe: str) -> bool | None:
     """The engine's verdict on a finding whose probe `checks/probe_x.py` holds `probe`."""
-    return engine._reproduces(engine.ws.coord(), command, ".", ("checks/probe_x.py", probe))
+    return engine._reproduces(wt, command, ".", ("checks/probe_x.py", probe))
 
 
 PASSES, FAILS = "def test_x():\n    pass\n", "def test_x():\n    assert 1 == 2\n"
+# A pytest run that does not find the verifier's plugin, with the test the probe holds.
+REPLACES = f"env PYTHONPATH=lib {PY} -m pytest -q checks/probe_x.py"
+# The code under review's own `implement_loop`, as a repository whose package has that name holds it.
+UNDER_REVIEW = {"src/implement_loop/__init__.py": "", "src/implement_loop/engine.py": ""}
 
 
 @pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
 @pytest.mark.parametrize(("probe", "holds"), [(PASSES, False), (FAILS, True)])
-def test_a_pytest_run_that_cannot_load_the_plugin_is_judged_on_the_extended_run(engine, probe, holds):
-    assert reproduces(engine, f"env PYTHONPATH=lib {PY} -m pytest -q checks/probe_x.py", probe) is holds
+def test_a_pytest_run_that_cannot_load_the_plugin_is_judged_on_the_extended_run(engine, wt, probe, holds):
+    assert reproduces(engine, wt, REPLACES, probe) is holds
 
 
-def test_a_command_that_fails_on_its_own_is_judged_as_written(engine):
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+@pytest.mark.parametrize(("code", "holds"), [({}, True), (UNDER_REVIEW, False)])
+def test_the_extended_run_imports_the_implement_loop_under_review_not_the_verifiers(engine, wt, code, holds):
+    """Codex's review of the second version, whose second run put the engine's own directory on
+    PYTHONPATH: a probe of the code under review's `implement_loop` imported the verifier's when
+    the code had none, and passed."""
+    commit(wt, {"README.md": "code under review\n", **code})
+    probe = ("import sys\n\nsys.path.insert(0, 'src')\n\n\ndef test_x():\n"
+             "    from implement_loop import engine  # the verifier's copy has one too\n")
+    assert reproduces(engine, wt, REPLACES, probe) is holds
+
+
+def test_an_extended_run_that_left_no_pytest_record_proves_nothing(engine, wt):
+    """Codex's review of the second version: its second run closed a finding on exit 0 alone. As
+    written, this command runs pytest, which cannot load the plugin; extended, it runs none."""
+    command = f"PYTHONPATH=lib; case $PYTHONPATH in *:*) ;; *) {PY} -m pytest -q checks/probe_x.py;; esac"
+    assert extended(command, "/plugin") != command
+    assert reproduces(engine, wt, command, PASSES) is True
+
+
+def test_a_command_that_fails_on_its_own_is_judged_as_written(engine, wt):
     """Codex's review of the first version, which always extended: the verifier's directory holds
     `implement_loop`, so a command that fails because it cannot import it passed once extended,
     and its finding would have closed on a command other than the one the examiner wrote."""
     command = f"env PYTHONPATH=lib {PY} -S checks/probe_x.py"
-    assert reproduces(engine, command, "import implement_loop\n") is True
-    assert reproduces(engine, command, "import os\n") is False
+    assert reproduces(engine, wt, command, "import implement_loop\n") is True
+    assert reproduces(engine, wt, command, "import os\n") is False
 
 
 @pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
-def test_a_value_that_is_not_literal_is_run_as_written_only(engine):
+def test_a_value_that_is_not_literal_is_run_as_written_only(engine, wt):
     """The first version split `PYTHONPATH=lib:<(true)` before the process substitution."""
     command = f"PYTHONPATH=lib:<(true) {PY} -m pytest -q checks/probe_x.py"
-    assert extended(command) == command
-    assert reproduces(engine, command, PASSES) is True, "it still cannot load the plugin: the examiner's to fix"
+    assert extended(command, "/plugin") == command
+    assert reproduces(engine, wt, command, PASSES) is True, "it still cannot load the plugin: the examiner's to fix"
 
 
-def run(command: str) -> str:
-    """What `command`, extended, prints where the verifier's PYTHONPATH is `/verifier`: bash
-    expands it as the verifier's own run does (`verify._run`)."""
+def run(command: str, directory: str) -> str:
+    """What `command`, extended by `directory`, prints, run by bash as the verifier's own run is
+    (`verify._run`), where the verifier's PYTHONPATH is `/verifier`."""
     env = {"PATH": os.environ["PATH"], "PYTHONPATH": "/verifier"}
-    return subprocess.run(["bash", "-c", extended(command)], env=env, capture_output=True, text=True,
+    return subprocess.run(["bash", "-c", extended(command, directory)], env=env, capture_output=True, text=True,
                           check=True).stdout.strip()
 
 
 @pytest.mark.parametrize(("command", "printed"), [
-    ("env PYTHONPATH=tools:tools/evaluate/tests printenv PYTHONPATH", "tools:tools/evaluate/tests:/verifier"),
-    ("PYTHONPATH=src printenv PYTHONPATH", "src:/verifier"),
-    ("env -u VIRTUAL_ENV PYTHONPATH=client printenv PYTHONPATH", "client:/verifier"),
-    ("CI=true PYTHONPATH=src printenv PYTHONPATH", "src:/verifier"),
-    ("PYTHONPATH=src; printenv PYTHONPATH", "src:/verifier"),
-    ("PYTHONPATH=src&&printenv PYTHONPATH", "src:/verifier"),
-    ("export PYTHONPATH=src && printenv PYTHONPATH", "src:/verifier"),
+    ("env PYTHONPATH=tools:tools/evaluate/tests printenv PYTHONPATH", "tools:tools/evaluate/tests:/plugin"),
+    ("PYTHONPATH=src printenv PYTHONPATH", "src:/plugin"),
+    ("env -u VIRTUAL_ENV PYTHONPATH=client printenv PYTHONPATH", "client:/plugin"),
+    ("CI=true PYTHONPATH=src printenv PYTHONPATH", "src:/plugin"),
+    ("PYTHONPATH=src; printenv PYTHONPATH", "src:/plugin"),
+    ("PYTHONPATH=src&&printenv PYTHONPATH", "src:/plugin"),
+    ("export PYTHONPATH=src && printenv PYTHONPATH", "src:/plugin"),
     # an empty value adds no empty entry, which is the current directory
-    ("PYTHONPATH= printenv PYTHONPATH", "/verifier"),
+    ("PYTHONPATH= printenv PYTHONPATH", "/plugin"),
 ])
-def test_a_literal_pythonpath_the_first_command_assigns_extends_the_verifiers(command, printed):
-    assert extended(command) != command
-    assert run(command) == printed
+def test_a_literal_pythonpath_the_first_command_assigns_is_extended_by_the_directory(command, printed):
+    assert extended(command, "/plugin") != command
+    assert run(command, "/plugin") == printed
+
+
+def test_the_directory_is_quoted_for_the_shell():
+    assert run("env PYTHONPATH=src printenv PYTHONPATH", "/a b/$HOME") == "src:/a b/$HOME"
 
 
 @pytest.mark.parametrize("command", [
@@ -173,4 +216,4 @@ def test_a_literal_pythonpath_the_first_command_assigns_extends_the_verifiers(co
     "grep -r PYTHONPATH=src scripts",
 ])
 def test_any_other_command_is_left_as_written(command):
-    assert extended(command) == command
+    assert extended(command, "/plugin") == command
