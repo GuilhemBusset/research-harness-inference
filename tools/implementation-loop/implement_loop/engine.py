@@ -37,6 +37,8 @@ import json
 import os
 import posixpath
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -2007,12 +2009,60 @@ class Engine:
 
     def _reproduction(self, wt: Path, command: str | None, cwd: str, probe: tuple[str, str] | None) -> Evidence | None:
         """The verifier's run of a reproduction (and an optional probe file) in a throwaway copy of
-        the head, or None when there is nothing to run or the probe's path is refused."""
+        the head, or None when there is nothing to run or the probe's path is refused.
+
+        The command runs as written. A run in which pytest could not load the verifier's result
+        plugin (the note `verify.run_check` gives it, `verify._notes`) ran no test and says nothing
+        of the code: #766's examiner replaced PYTHONPATH, every head failed, and its builder may not
+        change the examiner's command. Then, and only then, the command runs once more, in a fresh
+        copy, with the PYTHONPATH it assigns extended by a directory that holds the plugin alone
+        (`_plugin_only`, `extended_pythonpath`), never the engine's own directory, whose
+        `implement_loop` a probe of the code under review would import. That run is the verdict
+        only when it left a pytest record, as a verification requires; otherwise the first run is.
+        A command that ran is judged as written."""
         if not command:
             return None
         if probe and not self._inside(Path("/nonexistent-root"), probe[0]):
             self.store.event("probe_path_refused", path=str(probe[0])[:200])
             return None
+        first = self._run_reproduction(wt, command, cwd, probe)
+        if first is None:
+            return None
+        unloaded = verify._notes(None, f'Error importing plugin "{verify.PLUGIN}"')
+        if not any(note in first[0].note for note in unloaded):
+            return first[0]
+        work = self.store.issue_dir(0) / "repro"
+        work.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=work, prefix="plugin-") as tmp:
+            plugin = self._plugin_only(Path(tmp))
+            extended = extended_pythonpath(command, str(plugin))
+            retry = None if extended == command else self._run_reproduction(wt, extended, cwd, probe, plugin)
+        return retry[0] if retry is not None and retry[1] is not None else first[0]
+
+    @staticmethod
+    def _plugin_only(root: Path) -> Path:
+        """`root`, holding the verifier's result plugin under the name the verifier loads it by
+        (`verify.PLUGIN`, `implement_loop.loop_pytest`), copied from where the verifier ships it,
+        and a package `__init__.py` of the engine's own (`PLUGIN_PACKAGE`), and nothing else of the
+        engine. Importing that package takes `root` off `sys.path`; the plugin still loads through
+        the package's `__path__`, and drops the package once loaded. So a test then imports the code
+        under review's own `implement_loop` if its path has one, and none if not. A copy, not a
+        link: the plugin finds its package by its own real path."""
+        parts = verify.PLUGIN.split(".")
+        source = verify.ENGINE_DIR.joinpath(*parts).with_suffix(".py")
+        target = root.joinpath(*parts).with_suffix(".py")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for package in target.relative_to(root).parents:
+            if package != Path("."):
+                (root / package / "__init__.py").write_text(PLUGIN_PACKAGE.format(root=str(root.resolve())))
+        shutil.copyfile(source, target)
+        return root
+
+    def _run_reproduction(self, wt: Path, command: str, cwd: str, probe: tuple[str, str] | None,
+                          plugin: Path | None = None) -> tuple[Evidence, dict | None] | None:
+        """One run of `command` in a throwaway copy of the head with the probe written into it (and
+        `plugin`, read-only, where the command may see it): what `verify.run_check` returns, or
+        None when the probe's path leads out of the copy."""
         with self.ws.disposable(wt) as scratch:
             if probe:
                 target = scratch / probe[0]
@@ -2022,9 +2072,9 @@ class Engine:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(probe[1])
             spec = CheckSpec(criterion="repro", command=command, cwd=cwd)
-            ev, _ = verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
-                                     self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch))
-        return ev
+            mounts = self._mounts(scratch).plus(readable=[plugin] if plugin else [])
+            return verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
+                                    self.caps.check_timeout_s, extra_env=self.check_env, mounts=mounts)
 
     @staticmethod
     def _replace_file(target: Path, text: str) -> None:
@@ -3713,6 +3763,47 @@ VERIFIER_RUN = "verifier_run"   # on an open finding: the engine's last run of i
 PROBE_TEXT = "probe_text"       # on a finding a probe witnesses: the probe's content, never committed
 RUN_OUTPUT = 1500               # the characters of a run's output a builder is given, as for a standing check
 FAILED_RUNS = 4                 # the failed commands of one verification whose output a builder is given
+
+
+# The `__init__.py` of the package `Engine._plugin_only` writes, which holds the verifier's result
+# plugin alone. Importing it takes the directory it was found in (`root`) off `sys.path` and out of
+# the path-importer cache: the plugin's own module still loads through the package's `__path__`, and
+# once the plugin has dropped the package from `sys.modules`, `import implement_loop` cannot find
+# this one again. It runs in whatever Python the command uses: standard library and Python 3.8.
+PLUGIN_PACKAGE = """# The verifier's result plugin, for one run of a reproduction; nothing else of the engine.
+import os
+import sys
+
+_ROOT = os.path.realpath({root!r})
+sys.path[:] = [p for p in sys.path if not p or os.path.realpath(p) != _ROOT]
+for _key in [k for k in list(sys.path_importer_cache) if k and os.path.realpath(k) == _ROOT]:
+    sys.path_importer_cache.pop(_key, None)
+"""
+
+
+# A value the engine extends: literal path characters only. A quote, an escape, an expansion
+# (`$PYTHONPATH` among them), a substitution (`<(...)`), a glob, a brace or a tilde is left as
+# written: where such a word ends, and what it holds, is the shell's to say.
+_LITERAL = r"[A-Za-z0-9_./:@+,%-]*"
+_SETS_PYTHONPATH = re.compile(
+    r"^\s*(?:env(?:[ \t]+(?:-u[ \t]*|--unset[= \t][ \t]*)[A-Za-z_][A-Za-z0-9_]*)*[ \t]+|export[ \t]+)?"
+    rf"(?:[A-Za-z_][A-Za-z0-9_]*={_LITERAL}[ \t]+)*PYTHONPATH=(?P<value>{_LITERAL})(?=[ \t\n;&|]|$)")
+
+
+def extended_pythonpath(command: str, directory: str) -> str:
+    """`command` with `directory` added after the PYTHONPATH its first simple command assigns, for
+    the second run of a reproduction (`Engine._reproduction`). `[env [-u NAME]... | export]
+    [NAME=value]... PYTHONPATH=<value>` at the head of the command, every value literal, becomes
+    `PYTHONPATH=<value>:<directory>`, the directory quoted for the shell (`verify.run_check` runs
+    the command with `bash -c`). Anything else is left as written: a value that is not literal,
+    and a PYTHONPATH set anywhere else in the command, where a `PYTHONPATH=` word may be an
+    argument (`grep PYTHONPATH=src`) that only a shell parser could tell from an assignment."""
+    m = _SETS_PYTHONPATH.match(command)
+    if not m:
+        return command
+    # An empty entry is the current directory, which an empty value did not ask for.
+    tail = (":" if m.group("value") else "") + shlex.quote(directory)
+    return command[:m.end()] + tail + command[m.end():]
 
 
 def run_verdict(ran: Evidence | None) -> bool | None:
