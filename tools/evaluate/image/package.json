@@ -1,0 +1,18 @@
+{
+  "name": "rhi-evaluate-trial-harnesses",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The four npm harnesses of the evaluation's trial image, at the pins of spikes/harnesses.py. package-lock.json pins what they bring.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.323",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@openai/codex": "0.169.0",
+    "opencode-ai": "1.19.5"
+  },
+  "allowScripts": {
+    "@anthropic-ai/claude-code@2.1.323": true,
+    "opencode-ai@1.19.5": true,
+    "@google/genai": false,
+    "protobufjs": false
+  }
+}
