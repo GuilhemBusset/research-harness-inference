@@ -419,6 +419,22 @@ def test_pool_limits_that_cannot_be_read_refuse_the_booking_unwritten(pool: Depl
     assert pool.puts == [] and pool.runs == 0
 
 
+@pytest.mark.parametrize("minutes", [MINUTES, None], ids=["managed", "designated"])
+def test_a_record_that_does_not_read_as_a_session_is_refused_and_left_as_it_is(
+    pool: Deployed, journal: Path, minutes: int | None
+) -> None:
+    key = {"pool": POOL, "record": SESSION_RECORD}
+    pool.table.put_item(Item=key)
+    pool.scaler_runs = False
+    run = capacity(pool, journal)
+
+    outcome = run.acquire(minutes=minutes)
+
+    assert (outcome.reason, outcome.cleanup) == (Reason.POOL_STATE_UNREADABLE, Cleanup.NOT_OWNED)
+    assert run.release() is Cleanup.NOT_OWNED
+    assert pool.puts == [] and pool.runs == 0 and pool.table.get_item(Key=key)["Item"] == key
+
+
 def _cancel() -> None:
     raise KeyboardInterrupt
 
@@ -605,6 +621,23 @@ def test_hosts_are_counted_only_from_a_note_of_the_scaler_that_is_fresh(
     assert pool.now == (NOW if ready else LAST_START)
 
 
+def test_a_note_that_grows_too_old_while_the_hosts_are_probed_admits_no_batch(pool: Deployed, journal: Path) -> None:
+    def a_second_passes() -> None:
+        pool.now += 1
+
+    # As old as a note may be when the poll reads it, and a second older when the probes have answered.
+    write(pool, DESIGNATED)()
+    pool.hosts = 2
+    pool.note(written_at=NOW - evaluation.SUPPLY_FRESH_SECONDS)
+    pool.scaler_runs, pool.during_probe = False, a_second_passes
+
+    outcome = capacity(pool, journal).acquire()
+
+    # Not admitted on that poll, and polled again for a newer note, within the window.
+    assert (outcome.reason, outcome.session) == (Reason.SUPPLY_STALE, None)
+    assert pool.sleeps != [] and pool.now == LAST_START
+
+
 # Ambiguous writes.
 
 
@@ -767,6 +800,50 @@ def test_a_restart_leaves_a_record_that_is_no_longer_its_booking(pool: Deployed,
     assert run.reconcile() is (Cleanup.YIELDED if answered else Cleanup.NOT_OWNED)
     assert run.release() is run.reconcile()
     assert pool.puts == [] and stored(pool) == changed
+
+
+def test_a_booking_with_a_stop_still_on_its_way_admits_no_batch_after_a_restart(pool: Deployed, journal: Path) -> None:
+    # Every stop times out with its request kept: each can still be stored while the record is the booking.
+    run = restarted(pool, journal, answered=True)
+    booked = run.journal.booking
+    pool.faults = ["pending"] * (2 * evaluation.STOP_ATTEMPTS)
+    assert run.release() is Cleanup.UNCONFIRMED and stored(pool) == booked
+
+    # The record still is the booking and the hosts are there, but it is not held for a batch.
+    resumed = capacity(pool, journal)
+    assert resumed.reconcile() is Cleanup.UNCONFIRMED
+    outcome = resumed.wait()
+    assert (outcome.reason, outcome.cleanup, outcome.session) == (Reason.BOOKING_RELEASING, Cleanup.UNCONFIRMED, None)
+
+    # The first of those stops is stored at last: it is this invocation's, by the saved record.
+    assert stored(pool) == booked
+    pool.table.put_item(**pool.pending[0])
+    last = capacity(pool, journal)
+    assert last.release() is Cleanup.RELEASED and stopped_under_the_saved_marker(pool, last.journal)
+    assert len(pool.puts) == 2 * evaluation.STOP_ATTEMPTS
+
+
+@pytest.mark.parametrize("designated", [False, True], ids=["managed", "designated"])
+def test_a_restart_that_selects_another_number_of_hosts_is_refused_before_any_wait(
+    pool: Deployed, journal: Path, designated: bool
+) -> None:
+    session = Session(POOL, 1, NOW - 600, END, OPERATOR, NOW - 600)
+    pool.hosts = 1
+    if designated:
+        write(pool, session)()
+        pool.note()
+    assert capacity(pool, journal, instances=1).acquire(minutes=None if designated else MINUTES).ready
+    record = stored(pool)
+    # Two hosts in service now, and two selected, over a session of one.
+    pool.hosts, pool.puts = 2, []
+    pool.note()
+
+    with pytest.raises(ValueError, match="another number of hosts"):
+        capacity(pool, journal, instances=2)
+
+    assert pool.puts == [] and stored(pool) == record
+    assert capacity(pool, journal, instances=1).release() is (Cleanup.NOT_OWNED if designated else Cleanup.RELEASED)
+    assert stored(pool) == (session if designated else evaluation.Journal.load(journal).stops[-1])
 
 
 def test_a_restart_after_the_saved_deadline_has_nothing_to_stop(pool: Deployed, journal: Path) -> None:

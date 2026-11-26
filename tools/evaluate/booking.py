@@ -31,8 +31,9 @@ all of:
   enough, and two where one was selected would spread a one-host measurement over both;
 - the gateway ready, by the driver's probe;
 - exactly the selected number of hosts reporting a release, each the expected one;
-- and, read again once those have answered, the record still that one and its end at least the
-  batch and the cleanup away: a probe takes time, and an operator can edit the session during it.
+- and, once those have answered, the record read again and still that one, its end at least the
+  batch and the cleanup away, and the note still no older than `SUPPLY_FRESH_SECONDS`: a probe
+  takes time, and an operator can edit the session during it.
 
 The last moment a batch may start is the bound record's end less the batch and the cleanup. No
 poll starts after it and none admits a batch after it, so the wait is bounded by the booking
@@ -41,14 +42,21 @@ the wait at once: a session someone else wrote is not waited on, and not used.
 
 **Reasons.** Whatever is declined carries one member of `Reason`, a fixed vocabulary: never free
 text, never text of AWS. A wait that runs out gives the reason of its last poll. A read that
-fails is a poll that found the pool's state unreadable, not an error of the wait. The driver's two
-probes are the driver's code: an error of one is raised to the driver, after the release.
+fails, or a record that does not read as a session, is the pool's state found unreadable, not an
+error of the call. The driver's two probes are the driver's code: an error of one is raised to the
+driver, after the release.
 
 **Releasing.** `release` is the pipeline's conditional stop (`booking.stop`) of the exact booking
 this invocation made, and of nothing else. It runs when a wait is refused or interrupted, and when
 the driver calls it after its batch. What it finds is one member of `Cleanup`. A record that is no
 longer that booking, in any attribute, is someone else's from then on: an operator who changed its
 instances, moved its end, stopped it or booked again owns it, and `release` writes nothing.
+
+A stop is saved in the journal before it is sent, and a stop that was sent can be stored for as
+long as the record is the booking, whatever its answer was. So a booking with a saved stop is no
+longer one to run a batch in, in this process or after a restart: `reconcile` gives it as
+`Cleanup.UNCONFIRMED`, `wait` declines it with `Reason.BOOKING_RELEASING`, and `release` goes on
+stopping it.
 
 **Ambiguous writes.** A write whose answer does not arrive may have been stored, and the SDK's own
 retry of a stored write fails its condition, so `None` from `book` or `stop` does not say the
@@ -68,8 +76,8 @@ condition can no longer meet. A write that was answered and refused is ruled out
 bounds. A new `Capacity` over the same journal file starts from `reconcile`, which reads the
 record and says whether the booking is still held, was released, has ended, or is no longer this
 invocation's, before the driver resumes with `wait` or cleans up with `release`. A journal is
-read against the pool of the session it saved: a `Capacity` that selects another pool is refused
-before anything is read or saved.
+read against the pool and the number of hosts of the session it saved, in both modes: a `Capacity`
+that selects another pool or another number is refused before anything is read or saved.
 
 The journal is a local file of the driver. It holds the pool's name and the booking's times, which
 are not published (the design, "Where results persist"): keep it out of the repository.
@@ -139,6 +147,8 @@ class Reason(enum.StrEnum):
     BOOKING_UNCONFIRMED = "booking-unconfirmed"
     # The record is no longer the booking this invocation made, or the session that was designated.
     BOOKING_CHANGED = "booking-changed"
+    # A stop of the booking was sent and may still be stored: no batch starts in it.
+    BOOKING_RELEASING = "booking-releasing"
     # The pool's settings, its session or the scaler's note could not be read.
     POOL_STATE_UNREADABLE = "pool-state-unreadable"
     # The scaler's note is too old, or older than the session, to count hosts from.
@@ -166,8 +176,8 @@ class Cleanup(enum.StrEnum):
     ENDED = "ended"
     # This invocation made no booking: a designated session, a refusal, a lost race.
     NOT_OWNED = "not-owned"
-    # The record could not be read, or the booking or its stop not confirmed: the booking's end
-    # bounds it, and `release` can be called again.
+    # The record could not be read, or the booking or a stop that was sent for it not confirmed:
+    # the booking's end bounds it, and `release` can be called again.
     UNCONFIRMED = "unconfirmed"
 
 
@@ -298,6 +308,8 @@ class Capacity:
         saved = journal.booking or journal.intended or journal.designated
         if saved is not None and saved.pool != selection.pool:
             raise ValueError("the journal holds a session of another pool than the selected one")
+        if saved is not None and saved.instances != selection.instances:
+            raise ValueError("the journal holds a session of another number of hosts than the selected one")
         self.selection, self.access, self.journal = selection, access, journal
         self._hours = access.sessions.session_max_hours
         self._reserved = selection.batch_seconds + selection.cleanup_seconds
@@ -356,8 +368,8 @@ class Capacity:
         """Saves the pool's session as the designated one; why not, when it cannot hold the batch."""
         now = self._now()
         try:
-            actual = self._read()
-        except _AWS:
+            actual = pool_booking.read(self._table, self.selection.pool)
+        except (RecordError, *_AWS):
             return Reason.POOL_STATE_UNREADABLE
         if actual is None or now >= self._end(actual):
             return Reason.SESSION_NOT_FOUND
@@ -398,6 +410,10 @@ class Capacity:
             written = pool_booking.book(
                 self._table, chosen.pool, minutes=minutes, set_by=marker, now=now, instances=chosen.instances, **bounds
             )
+        except RecordError:
+            # The pool's record does not read as a session: `book` read it, and sent no write.
+            self._settled(Cleanup.NOT_OWNED)
+            return Reason.POOL_STATE_UNREADABLE
         except _AWS:
             written, answered = None, False
         if written is None:
@@ -445,6 +461,8 @@ class Capacity:
         bound = self.journal.booking if managed else self.journal.designated
         if bound is None:
             return Reason.BOOKING_UNCONFIRMED if managed else Reason.SESSION_NOT_FOUND, None
+        if self.journal.stops:
+            return Reason.BOOKING_RELEASING, None
         last_start = self._end(bound) - self._reserved
         found = None
         while True:
@@ -496,7 +514,10 @@ class Capacity:
         changed = self._changed(bound)
         if changed is not None:
             return changed
-        return Reason.WINDOW_TOO_SHORT if self._now() > last_start else None
+        now = self._now()
+        if now > last_start:
+            return Reason.WINDOW_TOO_SHORT
+        return Reason.SUPPLY_STALE if now - note.written_at > SUPPLY_FRESH_SECONDS else None
 
     def _settled(self, cleanup: Cleanup) -> Cleanup:
         if cleanup is Cleanup.RELEASED:
@@ -507,7 +528,14 @@ class Capacity:
         return cleanup
 
     def reconcile(self) -> Cleanup:
-        """What the journal's booking is in the table now. Nothing is written to the table."""
+        """What the journal's booking is in the table now. Nothing is written to the table. A
+        booking a stop was sent for is not held, though the record still is it: that stop can
+        still be stored."""
+        found = self._found()
+        return Cleanup.UNCONFIRMED if found is Cleanup.HELD and self.journal.stops else found
+
+    def _found(self) -> Cleanup:
+        """What the record says of the booking: `Cleanup.HELD` while it still is that booking."""
         journal = self.journal
         if journal.cleanup is not None and journal.cleanup in _SETTLED:
             return journal.cleanup
@@ -547,12 +575,12 @@ class Capacity:
         for attempt in range(STOP_ATTEMPTS):
             if attempt:
                 self.access.sleep(RETRY_SECONDS)
-            found = self.reconcile()
+            found = self._found()
             if found is Cleanup.HELD:
                 found = self._stopped()
             if found in _SETTLED:
                 return found
-        found = self.reconcile()
+        found = self._found()
         return Cleanup.UNCONFIRMED if found is Cleanup.HELD else found
 
     def _stopped(self) -> Cleanup:
@@ -568,7 +596,7 @@ class Capacity:
         self.journal.save()
         try:
             written = pool_booking.stop(self._table, booking, now=now, session_max_hours=self._hours)
-        except _AWS:
+        except (RecordError, *_AWS):
             return Cleanup.UNCONFIRMED
         # `None` does not say why nothing was written: the next read of the record does.
         return Cleanup.UNCONFIRMED if written is None else self._settled(Cleanup.RELEASED)
