@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
+from starlette.datastructures import Headers
 
 from evaluate import plan, replay, traces
 from evaluate.contracts import (
@@ -34,6 +35,7 @@ from evaluate.contracts import (
 )
 from evaluate.replay import Fresh, Refusal, Segment, Stop
 from rhi_common.keys import generate_key
+from rhi_gateway.auth import presented_key
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
@@ -223,11 +225,12 @@ def run(
     deadline_ms: int | None = None,
     sizes: traces.Sizes | None = None,
     first_request: int = 0,
+    evidence: replay.Evidence | None = None,
     **answers: Any,
 ) -> tuple[replay.CellRun, Pool]:
     """Drives a cell against a made-up gateway on a clock of the test: what it left, and what the
     gateway saw. `finished_at` and `cancel_at` are the times the two signals are given at: before
-    the cell starts, for a time that is not after its start."""
+    the cell starts, for a time that is not after its start. `evidence` is what earlier cells showed."""
     clock = pool.clock if pool else Clock()
     pool = pool or Pool(clock, keys, **answers)
     gateway = replay.Gateway("https://gateway.example.com", "coursework", Busy(clock, late_ms, stall), pool)
@@ -253,7 +256,7 @@ def run(
 
         stops = replay.Stops(finished=signal(finished_at), cancel=signal(cancel_at), deadline_ms=deadline_ms)
         return await replay.run_cell(
-            planned, cell, gateway, keys, stops=stops, sizes=sizes, first_request=first_request
+            planned, cell, gateway, keys, stops=stops, sizes=sizes, first_request=first_request, evidence=evidence
         )
 
     return clock.drive(work()), pool
@@ -524,89 +527,123 @@ def test_a_prefix_is_shared_in_its_cell_paired_across_treatments_and_apart_for_e
 def test_too_few_keys_are_refused_before_anything_is_sent() -> None:
     needed = SCREEN.canary_identities
     assert (replay.keys_needed(SCREEN), replay.keys_needed(SCREEN, cohorts=2)) == (needed, 2 * needed)
-    # A key given twice is one key, an empty entry is none, and a second cohort needs as many again.
+    # A key given twice is one key, and so is one given again with a space beside it: the gateway
+    # reads it as the same student. An entry that is no key is none, and a second cohort needs as
+    # many again.
     few = KEYS[: needed - 1]
-    short = [(few, 1), ([*few, KEYS[0]], 1), ([*few, ""], 1), ([*few, " "], 1), (KEYS[: 2 * needed - 1], 2)]
+    junk = KEYS[0][:-1] + ("0" if KEYS[0][-1] != "0" else "1")
+    again = [KEYS[0], " " + KEYS[0], KEYS[0] + " ", "", " ", junk]
+    short = [(few, 1), *(([*few, entry], 1) for entry in again), (KEYS[: 2 * needed - 1], 2)]
     for keys, cohorts in short:
         with pytest.raises(replay.ReplayError) as refused:
             replay.preflight(SCREEN, keys, cohorts=cohorts)
         assert refused.value.reason is Refusal.INSUFFICIENT_KEYS
-    assert [len(set(cohort)) for cohort in replay.preflight(SCREEN, KEYS, cohorts=2)] == [needed, needed]
+
+    # The cohorts it gives have a student of the gateway's for each identity, whatever else was given.
+    for cohort in replay.preflight(SCREEN, [" " + KEYS[0], junk, *KEYS], cohorts=2):
+        as_read = {presented_key(Headers({"authorization": f"Bearer {key}"})) for key in cohort}
+        assert len(as_read) == len(cohort) == needed
 
     # A cell is not driven with fewer keys than it has identities.
     cell = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 16)
     idle = Pool(Clock(), KEYS)
-    for keys in (KEYS[:15], [*KEYS[:15], ""]):
+    for keys in (KEYS[:15], [*KEYS[:15], ""], [*KEYS[:15], " " + KEYS[0]]):
         with pytest.raises(replay.ReplayError) as refused:
             run(SCREEN, cell, keys=keys, pool=idle)
         assert refused.value.reason is Refusal.INSUFFICIENT_KEYS
     assert idle.arrived == []
 
 
-# The second sweep cell of a class: one student replayed under its namespace in the cell before.
-FOUR_SEATS = (SCREEN, cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 4))
-# The cell that opens the last repetition's namespace: two students, the two agents of each at once.
-TWINS = (QUALIFY, cell_of(QUALIFY, Phase.CAPACITY_SWEEP, Shape.SEVERAL_AGENTS, 4, repetition=2))
+# The first sweep cell of a class has one student. The second has four: that one, and three more.
+ONE_SEAT = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 1)
+FOUR_SEATS = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 4)
+# Two students, the two agents of each at once.
+TWINS = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.SEVERAL_AGENTS, 4)
 
 
 @pytest.mark.parametrize(
-    ("of", "new", "stale", "later", "fresh"),
+    ("cell", "stale", "later", "fresh"),
     [
-        # Each new student's first request read nothing from the cache. Its twin, sent with it, may.
-        (TWINS, (0, 1), {}, 12, Fresh.VERIFIED),
-        # Both first requests of one student read a few tokens: fewer than the opening holds,
+        # Each student's first answer read nothing from the cache. Its twin, sent with it, may.
+        (TWINS, {}, 12, Fresh.VERIFIED),
+        # Both first answers of one student read a few tokens: fewer than the opening holds,
         # and still not shown fresh.
-        (TWINS, (0, 1), {1: 5}, 12, Fresh.UNVERIFIED),
+        (TWINS, {1: 5}, 12, Fresh.UNVERIFIED),
         # Nothing read later, once an answer has ended, says what the student's first request met.
-        (FOUR_SEATS, (1, 2, 3), {1: 5}, 0, Fresh.UNVERIFIED),
+        (FOUR_SEATS, {1: 5}, 0, Fresh.UNVERIFIED),
         # One student's first answer reported no usage.
-        (FOUR_SEATS, (1, 2, 3), {3: None}, 12, Fresh.UNVERIFIED),
-        # The student of the cell before may read what that cell left: the others show it fresh.
-        (FOUR_SEATS, (1, 2, 3), {0: 5}, 12, Fresh.VERIFIED),
+        (FOUR_SEATS, {3: None}, 0, Fresh.UNVERIFIED),
     ],
 )
-def test_a_cell_counts_only_when_usage_shows_its_prefix_fresh_for_each_student_new_to_it(
-    of: tuple[plan.Plan, int], new: tuple[int, ...], stale: dict[int, int | None], later: int, fresh: Fresh
+def test_a_cell_counts_only_when_usage_shows_its_prefix_fresh_for_each_of_its_students(
+    cell: int, stale: dict[int, int | None], later: int, fresh: Fresh
 ) -> None:
-    planned, cell = of
-    ran, pool = run(planned, cell, stale=stale, later=later)
+    ran, pool = run(SCREEN, cell, stale=stale, later=later)
 
     assert len(pool.arrived) > 4
-    assert (ran.summary.fresh_students, ran.summary.fresh_prefix) == (new, fresh)
+    # No cell came before: every student of the cell had to show it there.
+    assert ran.summary.fresh_students == tuple(range(SCREEN.cells[cell].identities))
+    assert ran.summary.fresh_prefix is fresh
     assert (InvalidFlag.MISSING_EVIDENCE in ran.record.invalid_flags) is (fresh is Fresh.UNVERIFIED)
     assert ran.valid is (fresh is Fresh.VERIFIED)
 
 
-def test_a_student_who_joins_a_repetition_after_its_first_cell_must_find_the_prefix_fresh_too() -> None:
-    one_seat = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 1)
-    four_seats = FOUR_SEATS[1]
-    assert SCREEN.cells[one_seat].prefix_namespace == SCREEN.cells[four_seats].prefix_namespace
+def test_a_student_of_an_earlier_cell_has_shown_the_prefix_fresh_only_by_what_that_cell_observed() -> None:
+    assert SCREEN.cells[ONE_SEAT].prefix_namespace == SCREEN.cells[FOUR_SEATS].prefix_namespace
 
-    # The cells run one after the other on one engine. The first student's cache holds the prefix
-    # by the second cell, and that is no fault: the three who join there find it fresh.
+    def two_cells(pool: Pool, evidence: replay.Evidence | None) -> tuple[replay.CellRun, replay.CellRun]:
+        """The two cells one after the other on one engine: with what the first showed, if any is kept."""
+        first, _pool = run(SCREEN, ONE_SEAT, pool=pool, evidence=evidence)
+        pool.refused = frozenset()
+        second, _pool = run(SCREEN, FOUR_SEATS, pool=pool, evidence=evidence)
+        return first, second
+
+    # The first student's cache holds the prefix by the second cell, and that is no fault: the
+    # first cell saw them meet it uncached, and the three who join find it fresh.
     pool = Pool(Clock(), KEYS)
-    first, _pool = run(SCREEN, one_seat, pool=pool)
-    second, _pool = run(SCREEN, four_seats, pool=pool)
+    shown = replay.Evidence()
+    first, second = two_cells(pool, shown)
     assert (first.summary.fresh_students, second.summary.fresh_students) == ((0,), (1, 2, 3))
     opening = [one for one in second.requests if one.sent_ms == second.record.started_ms]
     assert [one.usage.cached_input_tokens for one in opening if one.usage] == [pool.later, 0, 0, 0]
     assert (first.valid, second.summary.fresh_prefix, second.valid) == (True, Fresh.VERIFIED, True)
+    # It was shown for those keys: another cohort on that engine has it all to show.
+    others = KEYS[SCREEN.canary_identities :]
+    ran, _pool = run(SCREEN, FOUR_SEATS, keys=others, evidence=shown, pool=Pool(Clock(), others, stale={0: 5}))
+    assert (ran.summary.fresh_students, ran.summary.fresh_prefix) == ((0, 1, 2, 3), Fresh.UNVERIFIED)
 
-    # What the first student showed in the first cell shows nothing for another student, whose
-    # cache has a salt of its own: one who joins and reads from the cache leaves the cell unverified.
-    pool = Pool(Clock(), KEYS, stale={1: 20})
-    first, _pool = run(SCREEN, one_seat, pool=pool)
-    second, _pool = run(SCREEN, four_seats, pool=pool)
+    # With nothing kept of the first cell, a place after it in the plan shows nothing: the cached
+    # input the first student reads leaves the second cell unverified.
+    _first, second = two_cells(Pool(Clock(), KEYS), None)
+    assert (second.summary.fresh_students, second.summary.fresh_prefix) == ((0, 1, 2, 3), Fresh.UNVERIFIED)
+    assert not second.valid
+
+    # A student who joins and reads from the cache leaves it unverified too: a cache has a salt
+    # for each student, and what the first one showed shows nothing for another.
+    first, second = two_cells(Pool(Clock(), KEYS, stale={1: 20}), replay.Evidence())
     assert (first.valid, second.summary.fresh_prefix, second.valid) == (True, Fresh.UNVERIFIED, False)
     assert InvalidFlag.MISSING_EVIDENCE in second.record.invalid_flags
 
-    # Who must show it comes from the plan, and no caller says otherwise: each student of a
-    # namespace in the first cell that has them replay under it, and in no other.
-    for namespace in {one.prefix_namespace for one in SCREEN.cells}:
-        cells = [one for one in SCREEN.cells if one.prefix_namespace == namespace]
-        new = [student for one in cells for student in replay.new_students(SCREEN, one)]
-        students = {replay.seat_of(SCREEN, one, slot) for one in cells for slot in range(one.replay_slots)}
-        assert sorted(new) == sorted(students)
+
+@pytest.mark.parametrize(("cached", "fresh"), [(20, Fresh.UNVERIFIED), (0, Fresh.VERIFIED)])
+def test_a_student_refused_through_an_earlier_cell_still_has_the_fresh_prefix_to_show(
+    cached: int, fresh: Fresh
+) -> None:
+    # The gateway refuses the only student of the first cell every time: no usage shows what
+    # their cache held, and the cell does not count.
+    pool = Pool(Clock(), KEYS, refused=frozenset({0}), stale={0: cached})
+    shown = replay.Evidence()
+    first, _pool = run(SCREEN, ONE_SEAT, pool=pool, evidence=shown)
+    assert len(first.requests) > 4
+    assert all(one.usage is None for one in first.requests)
+    assert (first.summary.fresh_prefix, first.valid) == (Fresh.UNVERIFIED, False)
+
+    # In the next cell that student is served, and is still to show it with the three who join:
+    # the cell counts only if the first answer they get reports nothing read from the cache.
+    pool.refused = frozenset()
+    second, _pool = run(SCREEN, FOUR_SEATS, pool=pool, evidence=shown)
+    assert (second.summary.fresh_students, second.summary.fresh_prefix) == ((0, 1, 2, 3), fresh)
+    assert second.valid is (fresh is Fresh.VERIFIED)
 
 
 @pytest.mark.parametrize("stale", [{0: None}, {2: 7}])

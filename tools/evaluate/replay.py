@@ -11,7 +11,7 @@ no telemetry: the hosts of a cell and its counters are read elsewhere.
 concurrency limit, cache salt and gateway affinity. Slot `s` of a cell is a conversation of seat
 `s // n`, where `n` is the suite's conversations of the cell's shape: one in hands-on, two in
 several-agents, which therefore advance independently under one key. Seat `i` has key `i` of the
-keys given, and is student `i` in the records; a key is never recorded. A live cell reserves its
+keys given, each counted once, and is student `i` in the records; a key is never recorded. A live cell reserves its
 first seat (`reserved_seats`) for the live task and whatever that task fans out to: the replay
 takes the seats after it and sends nothing with that seat's key.
 
@@ -62,18 +62,29 @@ is flagged `driver_saturation`. A conversation that was eligible before the send
 that the driver did not start is a skipped start: it is planned and not started, and the cell
 does not count.
 
-**Keys and the fresh prefix.** `preflight` counts the keys a plan needs, for each cohort it is
-run with: a paired treatment on a reused engine takes a cohort of its own. Fewer distinct keys
-are refused before anything is sent (`Refusal.INSUFFICIENT_KEYS`), by `run_cell` as well; an
-empty entry is no key. The gateway keeps a cache salt for each student, so what one student left
-in a cache says nothing of another's: every student must find the prefix uncached the first time
-the plan has them replay under its namespace (`new_students`), in whichever cell that is. The
-plan fixes who must show it, and no caller waives it. It is read from served usage: of the
-student's first requests in that cell, those sent while none of that student's had ended, one
-must report a cached input of exactly zero. A count above zero, however small, may be the
-namespace read back and is not told apart from cached framing; no count is no evidence. The
-student's other first request may report a cached input: it can read what its twin just wrote.
-A cell that does not show it for each of them is flagged `missing_evidence` and does not count.
+**Keys.** `preflight` counts the keys a plan needs, for each cohort it is run with: a paired
+treatment on a reused engine takes a cohort of its own. Fewer distinct keys are refused before
+anything is sent (`Refusal.INSUFFICIENT_KEYS`), by `run_cell` as well. A key is counted as the
+gateway reads it: an entry that is not a well-formed key (`rhi_common.keys.is_valid_key`) is no
+key, whether it is empty, junk, or a key with a space beside it, which the gateway would take for
+the key itself, so that two seats would be one student.
+
+**The fresh prefix.** The gateway keeps a cache salt for each student, so what one student left
+in a cache says nothing of another's: a cell counts only when every one of its students met its
+prefix uncached, and only what was observed shows that. A student's place in the plan shows
+nothing: one whose every request an earlier cell saw refused has met no cache there. It is read
+from served usage: of the student's first answers under the prefix, those of requests sent while
+no answer to that student had ended, one must report a cached input of exactly zero. A count
+above zero, however small, may be the namespace read back and is not told apart from cached
+framing; an answer with no count is no evidence, and what a later request reports says nothing
+of the first. The student's other first answer may report a cached input: it can read what its
+twin just wrote. A request that brought nothing of an answer back, refused by the gateway or
+lost or cut before a count or an output came, is no first answer: the question stays open until
+one comes, in that cell or in a later one. `Evidence` holds what the cells driven with it have
+shown, for each key on a gateway, pool and prefix, and takes it from the records of requests
+alone; a caller passes one to every cell of a run. A cell given none starts with nothing shown,
+so each of its students must show it there. A cell with a student who has not shown it is flagged
+`missing_evidence` and does not count.
 
 **What is recorded** is ordinals, times on the run's clock, counts and labels: no key, no host,
 no text of a request or an answer. `Summary` tells the three kinds of traffic apart (`Segment`),
@@ -115,11 +126,13 @@ from evaluate.contracts import (
     CellStatus,
     InvalidFlag,
     Phase,
+    RequestOutcome,
     RequestRecord,
     Route,
     Traffic,
 )
 from evaluate.streams import Attempt, Attempts, Tally
+from rhi_common.keys import is_valid_key, key_hash
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine, Iterable, Sequence
@@ -166,9 +179,8 @@ class Stop(StrEnum):
 
 
 class Fresh(StrEnum):
-    """Whether served usage showed the cell's prefix uncached for each student who met it there
-    first. A cell whose students all replayed under its namespace in earlier cells has nothing to
-    show."""
+    """Whether served usage showed the cell's prefix uncached for each student of the cell who had
+    not shown it yet. A cell whose students all showed it in earlier cells has nothing to show."""
 
     VERIFIED = "verified"
     UNVERIFIED = "unverified"
@@ -247,7 +259,7 @@ class Summary:
     prefix_hash: str | None
     # Whether the conversations were drawn to the plan's sizes. A cell sent with others does not count.
     sizes_planned: bool
-    # The students who had to find the prefix uncached in this cell, and whether usage showed it.
+    # The students nothing had shown fresh when the cell started, and whether usage has shown each since.
     fresh_students: tuple[int, ...]
     fresh_prefix: Fresh
     arrivals: tuple[Arrival, ...]
@@ -326,8 +338,9 @@ def keys_needed(plan: Plan, *, cohorts: int = 1) -> int:
 
 
 def _distinct(keys: Iterable[str]) -> tuple[str, ...]:
-    """The keys given, each once, in order. An empty entry is no key."""
-    return tuple(dict.fromkeys(key for key in keys if key.strip()))
+    """The keys given, each once, in order. An entry that is not a well-formed key is no key: the
+    gateway refuses it, or reads it, with a space beside a key, as a key that is counted already."""
+    return tuple(dict.fromkeys(key for key in keys if is_valid_key(key)))
 
 
 def preflight(plan: Plan, keys: Sequence[str], *, cohorts: int = 1) -> tuple[tuple[str, ...], ...]:
@@ -338,19 +351,6 @@ def preflight(plan: Plan, keys: Sequence[str], *, cohorts: int = 1) -> tuple[tup
         raise ReplayError(Refusal.INSUFFICIENT_KEYS)
     each = plan.canary_identities
     return tuple(distinct[at * each : (at + 1) * each] for at in range(cohorts))
-
-
-def _students(plan: Plan, cell: PlannedCell) -> set[int]:
-    return {seat_of(plan, cell, slot) for slot in range(cell.replay_slots)}
-
-
-def new_students(plan: Plan, cell: PlannedCell) -> tuple[int, ...]:
-    """The students of the cell that no earlier cell of the plan has replay under its prefix
-    namespace: the gateway salts the cache for each student, so each of them meets the prefix
-    for the first time here, and must find it uncached."""
-    earlier = plan.cells[: cell.identity.cell]
-    met = [_students(plan, one) for one in earlier if one.prefix_namespace == cell.prefix_namespace]
-    return tuple(sorted(_students(plan, cell).difference(*met)))
 
 
 def _pair(held: Sequence[int]) -> tuple[int, int]:
@@ -374,17 +374,47 @@ def sizes_of(plan: Plan) -> traces.Sizes:
     )
 
 
-def prefix_was_fresh(requests: Sequence[RequestRecord], students: Iterable[int]) -> bool:
-    """Whether served usage shows each of the students met the prefix uncached: one of the
-    student's first requests, those sent while none of the student's had ended, reported a cached
-    input of exactly zero."""
-    for student in students:
-        own = [one for one in requests if one.student == student]
-        first_end = min((one.ended_ms for one in own), default=0)
-        reports = [one.usage.cached_input_tokens for one in own if one.sent_ms <= first_end and one.usage is not None]
-        if 0 not in reports:
-            return False
-    return True
+def _answered(one: RequestRecord) -> bool:
+    """Whether anything of an answer came back: all of it, a count, or an output."""
+    return one.outcome is RequestOutcome.COMPLETED or one.usage is not None or one.first_output_ms is not None
+
+
+def met_fresh(requests: Iterable[RequestRecord]) -> bool | None:
+    """Whether served usage shows that a student, whose requests under one prefix these are, met
+    it uncached: one of the student's first answers, those of requests sent while no answer had
+    ended, reported a cached input of exactly zero. `None` while no answer has come: a request
+    that was refused, or lost or cut before a count or an output, shows nothing either way."""
+    answers = [one for one in requests if _answered(one)]
+    if not answers:
+        return None
+    first_end = min(one.ended_ms for one in answers)
+    first = [one.usage for one in answers if one.sent_ms <= first_end]
+    return any(usage is not None and usage.cached_input_tokens == 0 for usage in first)
+
+
+class Evidence:
+    """What served usage has shown, over the cells driven with it, of how each student first met
+    each prefix. It is kept for the key on its gateway and pool, by the key's hash, and for the
+    bytes of the prefix, by theirs: another cohort, engine or plan has shown nothing here. Once a
+    student's first answers have come, what they showed stays."""
+
+    def __init__(self) -> None:
+        self._met: dict[tuple[str, str, str, str], bool] = {}
+
+    @staticmethod
+    def _mark(gateway: Gateway, key: str, prefix_hash: str) -> tuple[str, str, str, str]:
+        return gateway.endpoint, gateway.model, key_hash(key), prefix_hash
+
+    def fresh(self, gateway: Gateway, key: str, prefix_hash: str) -> bool:
+        """Whether the student with that key has shown they met the prefix uncached."""
+        return self._met.get(self._mark(gateway, key, prefix_hash), False)
+
+    def read(self, gateway: Gateway, key: str, prefix_hash: str, requests: Iterable[RequestRecord]) -> None:
+        """Takes what the student's requests under the prefix show (`met_fresh`), unless the
+        student's first answers came before."""
+        mark = self._mark(gateway, key, prefix_hash)
+        if mark not in self._met and (fresh := met_fresh(requests)) is not None:
+            self._met[mark] = fresh
 
 
 def _derive(*parts: object) -> int:
@@ -437,8 +467,10 @@ class _Drive:
         stops: Stops,
         sizes: traces.Sizes,
         first_request: int,
+        evidence: Evidence,
     ) -> None:
         self.plan, self.cell, self.gateway, self.keys, self.stops, self.sizes = plan, cell, gateway, keys, stops, sizes
+        self.evidence = evidence
         self.clock = gateway.clock
         self.rule = _RULES[cell.identity.phase]
         self.course = traces.read_course()
@@ -642,6 +674,21 @@ class _Drive:
             )
         return attempt
 
+    def _shown(self, requests: Sequence[RequestRecord], prefix: str | None) -> tuple[tuple[int, ...], Fresh]:
+        """The students of the cell nothing had shown fresh when it started, and whether usage has
+        shown each of them fresh since. What the cell's requests show is kept in the evidence."""
+        if prefix is None:
+            return (), Fresh.NOT_REQUIRED
+        gateway, evidence, keys = self.gateway, self.evidence, self.keys
+        students = sorted({one.student for one in self.slots})
+        owed = tuple(student for student in students if not evidence.fresh(gateway, keys[student], prefix))
+        for student in owed:
+            evidence.read(gateway, keys[student], prefix, [one for one in requests if one.student == student])
+        if not owed:
+            return owed, Fresh.NOT_REQUIRED
+        shown = all(evidence.fresh(gateway, keys[student], prefix) for student in owed)
+        return owed, Fresh.VERIFIED if shown else Fresh.UNVERIFIED
+
     def _result(self, stop: Stop, closed_ms: int, ended_ms: int, prefix: str | None) -> CellRun:
         plan, cell, rule = self.plan, self.cell, self.rule
         requests = tuple(sorted(self.requests, key=lambda one: one.request))
@@ -649,10 +696,7 @@ class _Drive:
         lag_p95 = percentile(lags, 95) if lags else None
         tolerance = plan.spec.protocol["driver"]["scheduling_lag_p95_ms_max"]
         students = sorted({one.student for one in self.slots})
-        fresh_students = new_students(plan, cell)
-        fresh = Fresh.NOT_REQUIRED
-        if fresh_students:
-            fresh = Fresh.VERIFIED if prefix_was_fresh(requests, fresh_students) else Fresh.UNVERIFIED
+        fresh_students, fresh = self._shown(requests, prefix)
         sizes_planned = self.sizes == sizes_of(plan)
         flags = set()
         if lag_p95 is not None and lag_p95 > tolerance:
@@ -718,13 +762,16 @@ async def run_cell(
     stops: Stops | None = None,
     sizes: traces.Sizes | None = None,
     first_request: int = 0,
+    evidence: Evidence | None = None,
 ) -> CellRun:
     """Drives cell `cell` of the plan on the gateway and returns what it left.
 
     `keys` are the canary students' keys of this treatment's cohort, one seat each, in order.
     `sizes` are the sizes its conversations are drawn to: the plan's (`sizes_of`) unless given,
     and a cell sent with others does not count. `first_request` is the ordinal of the first
-    request it sends.
+    request it sends. `evidence` is what the cells driven before have shown of each student's
+    prefix cache, and takes what this one shows: without it nothing was shown before, and every
+    student of the cell must meet the prefix uncached here.
 
     `ReplayError`, with nothing sent, for fewer distinct keys than the cell has identities, for a
     warm-up or a live cell that nothing would end, and for a suite that replays on another route.
@@ -738,4 +785,14 @@ async def run_cell(
     if not _RULES[planned.identity.phase].window and stops.finished is None and stops.deadline_ms is None:
         raise ReplayError(Refusal.UNBOUNDED_CELL)
     drawn = sizes_of(plan)
-    return await _Drive(plan, planned, gateway, seats, stops, drawn if sizes is None else sizes, first_request).run()
+    drive = _Drive(
+        plan,
+        planned,
+        gateway,
+        seats,
+        stops,
+        drawn if sizes is None else sizes,
+        first_request,
+        Evidence() if evidence is None else evidence,
+    )
+    return await drive.run()
