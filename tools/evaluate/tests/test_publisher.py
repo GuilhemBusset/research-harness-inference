@@ -115,6 +115,8 @@ class FakeGitHub:
         params = dict(urllib.parse.parse_qsl(query))
         if route == "/user":
             return 200, {"login": DRIVER}
+        if route == f"/repos/{REPO}":
+            return 200, {"full_name": REPO, "has_issues": True, "archived": False}
         rest = route.removeprefix(f"/repos/{REPO}/issues").strip("/").split("/")
         if rest == [""] and method == "POST":
             return 201, self.issues[self.post_issue(DRIVER, body["body"])]

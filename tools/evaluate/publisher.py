@@ -633,6 +633,14 @@ class GitHub:
             self._login = answer["login"]
         return self._login
 
+    def hosts_issues(self) -> bool:
+        """Whether the repository is there for the driver and takes issues: not archived, its
+        issues enabled. `Rejected` when GitHub has no such repository for the driver."""
+        answer = self._call("GET", f"/repos/{self.repository}")
+        if not isinstance(answer, dict):
+            raise Unanswered
+        return answer.get("has_issues") is True and answer.get("archived") is not True
+
     def _pages(self, path: str, query: Mapping[str, object]) -> Iterator[dict[str, Any]]:
         page = 1
         while True:
