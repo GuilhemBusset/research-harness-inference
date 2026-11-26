@@ -820,6 +820,40 @@ def test_a_launch_fingerprint_that_changes_inside_a_window_leaves_that_cell_unqu
     cannot_qualify(bench, result, cell)
 
 
+def test_hosts_that_serve_different_images_qualify_no_cell_when_no_image_was_requested(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    assert REQUESTED.engine_image_digest is None
+    rows = bench.workspace.series[telemetry.selectors(POOL, VLLM)[telemetry.Source.RELEASE]]
+    labels, value, present = rows[1]
+    rows[1] = labels | {"image_digest": "sha256:" + "ba" * 32}, value, present
+    result = bench.run()
+    assert result.cells and not any(one.qualifies for one in result.cells)
+    assert all(one.record and InvalidFlag.HOST_TURNOVER in one.record.invalid_flags for one in result.cells)
+
+
+def test_a_stream_whose_speed_eligibility_does_not_reconcile_leaves_its_cell_unqualified(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+
+    # The output count comes before the last output: the driver gives the stream no speed, its row one.
+    def answer(route: Route, cached: int) -> list[bytes]:
+        if running(bench) != sweep.identity.cell:
+            return _answer(route, cached)
+        usage = {"input_tokens": 30, "cache_read_input_tokens": cached, "output_tokens": 4}
+        start = _event({"type": "message_start", "message": {"usage": usage}})
+        delta = _event({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}})
+        return [start + delta, delta, _event({"type": "message_stop"})]
+
+    bench.gateway.answer = answer
+    result = bench.run()
+    cell = next(one for one in result.cells if one.cell == sweep)
+    offline = next(one for one in graded(result).cells if one.identity == sweep.identity)
+    assert capacity.Reason.ELIGIBILITY_UNRECONCILED in offline.reasons
+    assert cell.record is not None and InvalidFlag.UNRECONCILED_COUNTERS in cell.record.invalid_flags
+    assert not bench.journal.attempts[cell.attempt].reusable
+    cannot_qualify(bench, result, cell)
+
+
 def test_a_gateway_that_does_not_count_each_canary_leaves_its_cells_unqualified(tmp_path: Path) -> None:
     bench = Bench(tmp_path)
     bench.workspace.misattributed = True
@@ -856,6 +890,38 @@ def test_a_later_serial_miss_does_not_certify_a_cached_first_live_answer(tmp_pat
     bench.gateway.answer = answer
     result = bench.run()
     assert served[:2] == [12, 0]
+    cell = next(one for one in result.cells if one.cell == low)
+    assert cell.record is not None and InvalidFlag.MISSING_EVIDENCE in cell.record.invalid_flags
+    cannot_qualify(bench, result, cell)
+
+
+def test_an_uncached_side_query_does_not_verify_a_live_tasks_cached_opening(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
+    served: list[int] = []
+
+    # The live attempt's first request, a side query, met nothing cached; each under the task's prefix did.
+    def answer(route: Route, cached: int) -> list[bytes]:
+        if running(bench) == low.identity.cell:
+            cached = 12 if served else 0
+            served.append(cached)
+        return _answer(route, cached)
+
+    attempt = bench.harness.attempt
+
+    @contextlib.asynccontextmanager
+    async def with_side_query(trial: Any, key: str, cancel: asyncio.Event) -> AsyncGenerator[trials.Work]:
+        async with attempt(trial, key, cancel) as work:
+            if trial.trial in low.trials:
+                side, *primary = work.evidence.requests
+                requests = (replace(side, side_call=True), *primary)
+                work = replace(work, evidence=replace(work.evidence, requests=requests, side_calls=1))
+            yield work
+
+    bench.gateway.answer = answer
+    bench.harness.attempt = with_side_query
+    result = bench.run()
+    assert served[:2] == [0, 12]
     cell = next(one for one in result.cells if one.cell == low)
     assert cell.record is not None and InvalidFlag.MISSING_EVIDENCE in cell.record.invalid_flags
     cannot_qualify(bench, result, cell)
@@ -997,19 +1063,24 @@ def test_a_live_cell_cancelled_once_its_window_is_read_contributes_no_offline_su
     cannot_qualify(bench, result, cell)
 
 
-def test_a_cancellation_while_the_booking_probe_is_pending_stops_within_the_drain(tmp_path: Path) -> None:
+def test_a_booking_probe_slow_to_clean_up_cannot_hold_admissions_open_after_a_cancellation(tmp_path: Path) -> None:
     bench = Bench(tmp_path)
     sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
     cancelled_at: list[int] = []
+    polling: list[bool] = []
 
     async def slow() -> booking.Reason | None:
-        # The probe takes 30 s to answer, well beyond the cell's drain.
+        # The probe takes 30 s to answer, and 20 s more to clean up once it is cut short.
         if running(bench) == sweep.identity.cell and not cancelled_at:
-            await bench.clock.sleep_ms(30_000)
+            polling.append(True)
+            try:
+                await bench.clock.sleep_ms(30_000)
+            finally:
+                await bench.clock.sleep_ms(20_000)
         return None
 
     def cancel(at: int, _student: int) -> None:
-        if running(bench) == sweep.identity.cell and not cancelled_at:
+        if polling and not cancelled_at:
             cancelled_at.append(at)
             bench.cancel.set()
 
@@ -1017,7 +1088,7 @@ def test_a_cancellation_while_the_booking_probe_is_pending_stops_within_the_drai
     bench.gateway.on_arrival = cancel
     result = bench.run()
     assert result.ended is phases.Ended.CANCELLED and cancelled_at
-    assert not any(at > cancelled_at[0] + sweep.drain_ms for at, _ in bench.gateway.arrived)
+    assert max(at for at, _ in bench.gateway.arrived) <= cancelled_at[0] + sweep.drain_ms
     cannot_qualify(bench, result, result.cells[-1])
 
 
@@ -1189,6 +1260,66 @@ def test_a_resume_on_another_engine_image_reuses_nothing_and_keeps_what_served_t
     assert warm_up.cell.identity.phase is Phase.WARM_UP and not warm_up.checkpointed
     saved = loads((first.journal.directory / phases.MANIFEST).read_text(), Manifest)
     assert saved.observed.engine_image_digest == IMAGE == after.manifest.observed.engine_image_digest
+
+
+def test_a_resume_on_another_engine_launch_reuses_nothing_measured_on_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = Bench(tmp_path / "first")
+    low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
+    first.harness.on_turn = lambda trial, _turn: first.cancel.set() if trial in low.trials else None
+    assert any(one.qualifies for one in first.run().cells[1:])
+
+    # The same image and model, started with other launch settings, requested and observed.
+    monkeypatch.setattr(sys.modules[__name__], "FINGERPRINT", "ad" * 32)
+    second = Bench(tmp_path / "second", resumes=first.journal)
+    second.clock.at = first.clock.at + 60_000
+    after = second.run()
+    assert after.ended is phases.Ended.SERVING_CHANGED
+    (warm_up,) = after.cells
+    assert warm_up.cell.identity.phase is Phase.WARM_UP and not warm_up.checkpointed
+
+
+def test_a_cell_invalidated_by_host_turnover_runs_again_on_a_booking_that_matches(tmp_path: Path) -> None:
+    first = Bench(tmp_path / "first")
+    floor = next(
+        one for one in PLAN.cells if plan.Role.CLASS_FLOOR in one.roles and one.identity.shape is Shape.HANDS_ON
+    )
+
+    def change(at: int, student: int) -> None:
+        if student == 1 and running(first) == floor.identity.cell and first.workspace.change_at is None:
+            first.workspace.change_at = ORIGIN_S + at / 1000 + 5
+
+    first.gateway.on_arrival = change
+    before = first.run()
+    turned = next(one for one in before.cells if one.cell == floor)
+    assert any(one.qualifies for one in before.cells[1:]) and not turned.qualifies
+    # The manifest says what served the measurements that are kept; the turnover stays in its attempt.
+    saved = loads((first.journal.directory / phases.MANIFEST).read_text(), Manifest)
+    assert saved.observed.host_count == 2
+    assert first.journal.observations(turned.attempt)
+
+    second = Bench(tmp_path / "second", resumes=first.journal)
+    second.clock.at = first.clock.at + 60_000
+    after = second.run()
+    assert after.ended is phases.Ended.COMPLETED
+    assert any(one.cell == floor and one.qualifies for one in after.cells)
+
+
+def test_a_resume_with_another_harness_image_is_refused_and_keeps_the_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = Bench(tmp_path / "first")
+    assert first.run().trials
+    saved = (first.journal.directory / phases.MANIFEST).read_text()
+    monkeypatch.setattr(sys.modules[__name__], "RUN", replace(RUN, harness_image_digest="sha256:" + "bc" * 32))
+    second = Bench(tmp_path / "second", resumes=first.journal)
+    second.clock.at = first.clock.at + 60_000
+    with pytest.raises(phases.PhaseError) as refused:
+        second.run()
+    assert refused.value.reason is phases.Refusal.INCOMPATIBLE_RESUME
+    assert second.gateway.arrived == []
+    assert (first.journal.directory / phases.MANIFEST).read_text() == saved
 
 
 def test_a_booking_that_changes_interrupts_the_cell_and_starts_no_other(tmp_path: Path) -> None:

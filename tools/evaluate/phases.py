@@ -32,8 +32,9 @@ member of `Refusal`:
   and the suite, arrival and protocol digests computed again from the spec and the cells that will
   be sent (`plan.digests_hold`);
 - a journal that holds earlier cells holds them under this workload and this treatment, and so
-  does the manifest beside it (`incompatible-resume`): a run is resumed, never overwritten. What
-  served the measurements it keeps is what that manifest observed;
+  does the manifest beside it, whose run record (its source, lock, harness and driver images) is
+  this run's (`incompatible-resume`): a run is resumed, never overwritten, and what it keeps stays
+  attributed to what made it. What served the measurements it keeps is in `SERVED`;
 - the telemetry a reading needs answers on every host the booking selected, and on no other host
   (`telemetry-unavailable`, `booking-mismatch`);
 - the load driver has headroom: the plan's largest replay, driven on the run's clock against a
@@ -60,15 +61,18 @@ window and resolves it. Over the whole window it then checks:
   booking selected, and the reading's `hosts`, `release` and `launch_settings` treatments are not
   contradicted: a release or a launch fingerprint that changed, or a host count other than the
   requested one, flags the cell `host_turnover`, and a part the telemetry does not show flags it
-  `missing_evidence`. What identifies what served (`SERVING`, and the launch fingerprint) is also
-  what served the warm-up, declared or not, and flagged the same way when it is not;
+  `missing_evidence`. Declared or not, every host served the same instance type, image, model
+  revision and launch fingerprint through the window (`served_alike`), and what identifies what
+  served (`SERVING`, and the launch fingerprint) is what served the warm-up, flagged the same way
+  when it is not;
 - the identities: every seat the cell drives sent as its own student, and the gateway's count of
   each canary's alias over the window is the number of requests the driver sent as that student;
 - the cache conditions: the replay's fresh prefix was not left unverified, and each live attempt's
-  first answers, those sent before the first of them ended, reported a cached input of exactly
-  zero (`replay.met_fresh`);
-- the accounting: each scheduler's tally against its request rows, request by request and outcome
-  by outcome, the forwarder's against its measurements, the driver's dispatch lag of the live
+  first answers under the task's prefix, those sent before the first of them ended, reported a
+  cached input of exactly zero (`replay.met_fresh`): a side query has a prefix of its own;
+- the accounting: each scheduler's tally against its request rows, request by request, outcome
+  by outcome and in the streams eligible for a speed, as `capacity.read` gives them one; the
+  forwarder's against its measurements, the driver's dispatch lag of the live
   requests within the suite's tolerance at p95, and the gateway's count of the cohort against
   every request the driver says reached it: the replay's, the route warm-up's and the live seat's,
   side queries included.
@@ -79,16 +83,20 @@ samples (`contracts.HostSample`, from the series the window was read from) once 
 A counter's samples are the increase each of its series counted since the first sample of the
 window's range, summed over the host's series at each scrape: what the reading counted is what
 `capacity.read` counts from them, whatever the counter's lifetime total and whichever of its
-series restarted. The attempt is then checkpointed with the record, and the manifest written again
-with what every checkpointed window observed alike; `CellResult.evidence` is what `capacity.read`
-and `quality.read` grade offline. Nothing is graded here.
+series restarted. The attempt is then checkpointed with the record. A record valid for
+qualification also writes the manifest again, with what every such window observed alike, and,
+past the warm-up, what served it to `SERVED`; an invalid one's observations stay in its attempt,
+for diagnosis, and say nothing of what served the run. `CellResult.evidence` is what
+`capacity.read` and `quality.read` grade offline. Nothing is graded here.
 
 **Stopping.** From the moment a cell's attempt opens until its checkpoint is decided, a watcher
 reads the cancel event, the deadline (the booking's end less the suite's cleanup, or the run's own
 deadline if earlier) and the booking's continuity (`Admitted.continuity`: the record still the
 booking, the same hosts, the same release); a probe that cannot answer is a continuity that cannot
 be established (`pool-state-unreadable`). A pending probe does not hold the other two back: a
-cancellation or the deadline cuts it short, and both are read again once it has answered. When one trips, the cell's stop is set: no route and no
+cancellation or the deadline cuts it short, and the stop is set without waiting for the probe's
+cleanup, which the run awaits once its traffic has stopped; both are read again once a probe has
+answered. When one trips, the cell's stop is set: no route and no
 replay request is sent after it and the replay cuts what it has open, the live attempt is told to
 stop and is recorded invalid, `interrupted`, and what is still running after the cell's drain (and,
 for a live cell, the worker's `forwarding.CANCEL_S`) is cancelled. A stop while the window's
@@ -103,9 +111,10 @@ measurement.
 
 **Resuming.** Request ordinals and trial executions go on from the highest the journal holds, and
 an execution of a trial the journal already holds one of names the latest in `replaces`. The
-measurements kept are reused only when the new booking's warm-up shows what served them (`SERVING`,
-as the manifest observed it); otherwise the run ends `serving-changed`, before any other cell, and
-the manifest keeps what served them.
+measurements kept are reused only when the new booking's warm-up shows what served them (`SERVING`
+and the launch fingerprint, as `SERVED` holds them); otherwise the run ends `serving-changed`,
+before any other cell, and the manifest and `SERVED` keep what served them. A cell checkpointed
+invalid is run again on a booking that matches.
 
 Everything recorded is ordinals, run-clock times, counts and labels, as `evaluate.contracts` holds
 them. It needs `spikes` and `services/gateway` on the path, as `evaluate.replay` does.
@@ -201,6 +210,10 @@ BOOKED = (telemetry.Treatment.HOSTS, telemetry.Treatment.RELEASE, telemetry.Trea
 # What identifies what served a window, of what it observed: the same through the run, and through
 # the measurements a resumed run keeps.
 SERVING = ("host_count", "instance_type", "engine_image_digest", "model_revision")
+# The launch fingerprint, with them; and the file of the journal's directory that holds what
+# served the measurements a resume keeps.
+LAUNCH = "launch_fingerprint"
+SERVED = "served.json"
 _UNSEEN = (telemetry.Reason.NOT_OBSERVED, telemetry.Reason.INCOMPLETE_COVERAGE)
 
 
@@ -397,10 +410,12 @@ def _graders_held(plan_: Plan, cells: Iterable[int], graders: Mapping[Family, tr
             raise PhaseError(Refusal.ARTIFACT_MISMATCH)
 
 
-def _resumable(plan_: Plan, journal: Journal, manifest: Manifest) -> Settings | None:
-    """Refuses a journal that holds cells, or a manifest, of another workload or treatment. Gives
-    what served the measurements a resume keeps, as the manifest beside them observed it: `None`
-    when it keeps none. A journal that keeps measurements without a manifest is refused."""
+def _resumable(plan_: Plan, journal: Journal, manifest: Manifest) -> tuple[Settings, Serving] | None:
+    """Refuses a journal that holds cells, or a manifest, of another workload or treatment, or
+    observations made with another run record (its images, its driver): the manifest the journal
+    holds attributes them, and is not rewritten under them. Gives what the manifest observed of
+    the measurements a resume keeps, and what served them (`SERVED`): `None` when it keeps none.
+    A journal that keeps measurements without both is refused."""
     saved = journal.directory / MANIFEST
     before: Manifest | None = None
     if saved.is_file():
@@ -410,15 +425,18 @@ def _resumable(plan_: Plan, journal: Journal, manifest: Manifest) -> Settings | 
             raise PhaseError(Refusal.INCOMPATIBLE_RESUME) from None
         if (before.workload_id, before.treatment_id) != (manifest.workload_id, manifest.treatment_id):
             raise PhaseError(Refusal.INCOMPATIBLE_RESUME)
+        if journal.attempts and before.run != manifest.run:
+            raise PhaseError(Refusal.INCOMPATIBLE_RESUME)
     try:
         journal.resume([(one.identity.cell, 0) for one in plan_.cells], 0, manifest.workload_id, manifest.treatment_id)
     except JournalError:
         raise PhaseError(Refusal.INCOMPATIBLE_RESUME) from None
     if not any(one.reusable and plan_.cells[one.cell].identity.phase is not Phase.WARM_UP for one in journal.attempts):
         return None
-    if before is None:
+    served = _load_served(journal.directory)
+    if before is None or served is None:
         raise PhaseError(Refusal.INCOMPATIBLE_RESUME)
-    return before.observed
+    return before.observed, served
 
 
 def _history(journal: Journal) -> tuple[int, int, dict[int, int]]:
@@ -439,15 +457,20 @@ def _history(journal: Journal) -> tuple[int, int, dict[int, int]]:
     return next_request, execution, executions
 
 
-def _write_manifest(directory: Path, manifest: Manifest) -> None:
-    """The manifest, written whole beside the journal: to a file beside it, then renamed."""
-    beside = directory / (MANIFEST + ".tmp")
+def _write_whole(directory: Path, name: str, text: str) -> None:
+    """A file of the journal's directory, written whole: to a file beside it, then renamed."""
+    beside = directory / (name + ".tmp")
     descriptor = os.open(beside, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as file:
-        file.write(dumps(manifest) + "\n")
+        file.write(text + "\n")
         file.flush()
         os.fsync(file.fileno())
-    os.replace(beside, directory / MANIFEST)
+    os.replace(beside, directory / name)
+
+
+def _write_manifest(directory: Path, manifest: Manifest) -> None:
+    """The manifest, written whole beside the journal."""
+    _write_whole(directory, MANIFEST, dumps(manifest))
 
 
 def cohort(plan_: Plan, canaries: Canaries) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -626,7 +649,9 @@ def _tally(tallies: Iterable[Tally]) -> Tally:
 
 def reconciled(tally: Tally, rows: Sequence[RequestRecord]) -> bool:
     """Whether a scheduler's tally is its request rows: every send ended and has one row of its
-    own, and the completions and each cause of failure are as many as the rows say."""
+    own, the completions and each cause of failure are as many as the rows say, and the streams it
+    found eligible for a speed are as many as the rows give one (`capacity.speed_of`), as offline
+    grading reads them."""
     outcomes = Counter(one.outcome for one in rows)
     causes = {cause: tally.failures.get(cause, 0) for cause in RequestOutcome if cause is not RequestOutcome.COMPLETED}
     return (
@@ -634,6 +659,7 @@ def reconciled(tally: Tally, rows: Sequence[RequestRecord]) -> bool:
         and tally.attempts == len(rows) == len({one.request for one in rows})
         and tally.completed == outcomes[RequestOutcome.COMPLETED]
         and all(outcomes[cause] == count for cause, count in causes.items())
+        and tally.eligible == sum(capacity.speed_of(one) is not None for one in rows)
     )
 
 
@@ -657,9 +683,43 @@ def _agreed(observed: Iterable[Settings]) -> Settings:
     return Settings(**agreed) if held else _nothing_observed()
 
 
-def serving(observed: Settings) -> tuple[object, ...]:
-    """What identifies what served, of what was observed (`SERVING`)."""
-    return tuple(getattr(observed, name) for name in SERVING)
+type Serving = dict[str, object]
+
+
+def serving(reading: telemetry.Reading) -> Serving:
+    """What identifies what served a window, of what it observed (`SERVING`), and the one launch
+    fingerprint its engines said: `None` for a part the hosts did not all show alike."""
+    return {name: getattr(reading.observed, name) for name in SERVING} | {LAUNCH: reading.observed_launch_fingerprint}
+
+
+def served_alike(reading: telemetry.Reading) -> set[InvalidFlag]:
+    """Whether every host of the window served the same thing, declared or not: one instance type,
+    image, model revision and launch fingerprint, the same on each host. A part a host does not
+    show is `missing_evidence`; hosts, or a host, that showed two are `host_turnover`."""
+    flags: set[InvalidFlag] = set()
+    parts = [
+        (host.instance_type, host.image_digest, host.model_revision, host.launch_fingerprints) for host in reading.hosts
+    ]
+    if any(None in part[:3] or not part[3] for part in parts):
+        flags.add(InvalidFlag.MISSING_EVIDENCE)
+    if len(set(parts)) > 1 or any(len(part[3]) > 1 for part in parts):
+        flags.add(InvalidFlag.HOST_TURNOVER)
+    return flags
+
+
+def _load_served(directory: Path) -> Serving | None:
+    try:
+        held = json.loads((directory / SERVED).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(held, dict) or set(held) != {*SERVING, LAUNCH} or None in held.values():
+        return None
+    return held
+
+
+def _write_served(directory: Path, served: Serving) -> None:
+    """What served the measurements a resume keeps, written whole beside the manifest."""
+    _write_whole(directory, SERVED, json.dumps(served, sort_keys=True))
 
 
 # --- The route warm-up ----------------------------------------------------------------------------
@@ -824,7 +884,7 @@ class _Run:
         cancel: asyncio.Event,
         origin_s: float,
         deadline_ms: int,
-        prior: Settings | None,
+        prior: tuple[Settings, Serving] | None,
     ) -> None:
         self.plan, self.admitted, self.gateway, self.keys, self.aliases = plan_, admitted, gateway, keys, aliases
         self.source, self.harnesses, self.graders, self.journal = source, _Recorded(harnesses), graders, journal
@@ -834,13 +894,14 @@ class _Run:
         self.ordinals = telemetry.Ordinals()
         self.evidence = replay.Evidence()
         self.warm_up: telemetry.Window | None = None
-        # What served the measurements a resume keeps; what served this run's warm-up, and its
-        # engines' launch fingerprint; and what every checkpointed window observed alike.
-        self.prior = prior
-        self.served: tuple[tuple[object, ...], str | None] | None = None
-        self.observed: Settings | None = prior
+        # What served the measurements a resume keeps (`SERVED`); what served this run's warm-up;
+        # and what every qualifying window observed alike, the kept ones' included.
+        self.prior = None if prior is None else prior[1]
+        self.served: Serving | None = None
+        self.observed: Settings | None = None if prior is None else prior[0]
         self.ended: Ended | None = None
         self.breach: booking.Reason | None = None
+        self.abandoned: set[asyncio.Future[booking.Reason | None]] = set()
         session = admitted.outcome.session
         self.hosts = 0 if session is None else session.instances
         # Ordinals go on from what the journal holds: a resume adds to the run, it does not restart it.
@@ -877,9 +938,18 @@ class _Run:
         if (now := self._now()) is not None:
             return now
         probe = asyncio.ensure_future(self._continuity())
-        await _first(probe, self.cancel.wait(), _until(self.clock, self.deadline_ms))
+        try:
+            await _first(asyncio.shield(probe), self.cancel.wait(), _until(self.clock, self.deadline_ms))
+        finally:
+            if not probe.done():
+                # Cut short: the probe's own cleanup goes on without holding the stop back.
+                probe.cancel()
+                self.abandoned.add(probe)
         if (now := self._now()) is not None:
             return now
+        if probe.cancelled():
+            self.breach = self.breach or booking.Reason.POOL_STATE_UNREADABLE
+            return Ended.CONTINUITY_LOST
         breach = probe.result()
         if breach is not None:
             self.breach = self.breach or breach
@@ -971,6 +1041,13 @@ class _Run:
     # The cells.
 
     async def run(self, cells: Sequence[int]) -> list[CellResult]:
+        try:
+            return await self._cells(cells)
+        finally:
+            # The probes a stop cut short finish their cleanup once traffic has stopped.
+            await asyncio.gather(*self.abandoned, return_exceptions=True)
+
+    async def _cells(self, cells: Sequence[int]) -> list[CellResult]:
         done: list[CellResult] = []
         for cell in cells:
             if self.ended is not None:
@@ -1042,7 +1119,7 @@ class _Run:
         warm = planned.identity.phase is Phase.WARM_UP
         # A resume keeps measurements only of what served them: this booking must serve it too.
         prior = self.prior
-        if reading is not None and warm and prior is not None and serving(reading.observed) != serving(prior):
+        if reading is not None and warm and prior is not None and serving(reading) != prior:
             self.ended = self.ended or Ended.SERVING_CHANGED
         if reading is not None and self.ended is None and not stop.is_set():
             # The booking must still hold once the window has been read: it held through all of it.
@@ -1054,9 +1131,14 @@ class _Run:
             self.journal.checkpoint_cell(sink.attempt, record)
             if warm:
                 self.warm_up = window
-                self.served = serving(reading.observed), reading.observed_launch_fingerprint
-            self.observed = _agreed([*([] if self.observed is None else [self.observed]), reading.observed])
-            _write_manifest(self.journal.directory, dataclasses.replace(self.manifest, observed=self.observed))
+                self.served = serving(reading)
+            if record.valid_for_qualification:
+                # Only what can be kept says what served the run: an invalid window's observations
+                # stay in its attempt, for diagnosis, and a resume runs it again.
+                if not warm:
+                    _write_served(self.journal.directory, serving(reading))
+                self.observed = _agreed([*([] if self.observed is None else [self.observed]), reading.observed])
+                _write_manifest(self.journal.directory, dataclasses.replace(self.manifest, observed=self.observed))
         else:
             self.journal.interrupt(sink.attempt)
             if record is not None:
@@ -1104,12 +1186,12 @@ class _Run:
                 flags.add(InvalidFlag.MISSING_EVIDENCE if reason in _UNSEEN else InvalidFlag.HOST_TURNOVER)
         # What served the window is what served the warm-up, declared or not: a part it showed then
         # and does not show now is unestablished, and one it shows otherwise changed.
+        flags |= served_alike(reading)
         if self.served is not None and planned.identity.phase is not Phase.WARM_UP:
-            then = (*self.served[0], self.served[1])
-            now = (*serving(reading.observed), reading.observed_launch_fingerprint)
-            for before, after in zip(then, now, strict=True):
-                if before is not None and after != before:
-                    flags.add(InvalidFlag.MISSING_EVIDENCE if after is None else InvalidFlag.HOST_TURNOVER)
+            now = serving(reading)
+            for name, before in self.served.items():
+                if before is not None and now[name] != before:
+                    flags.add(InvalidFlag.MISSING_EVIDENCE if now[name] is None else InvalidFlag.HOST_TURNOVER)
         # Every seat sent as its own student, and the gateway counted each of them as the driver did.
         sent = Counter(one.student for one in sink.requests)
         if len(sent) < driven.identities:
@@ -1288,7 +1370,10 @@ class _Run:
         driven.side_queries += sum(one.side_call for one in evidence.requests)
         if not reconciled(evidence.tally, rows):
             driven.flags.add(InvalidFlag.UNRECONCILED_COUNTERS)
-        if replay.met_fresh(rows) is not True:
+        # The task's starting cache is read from the requests under its prefix: a side query has
+        # its own, and is counted in the accounting only.
+        primary = [row for row, measured in zip(rows, evidence.requests, strict=True) if not measured.side_call]
+        if replay.met_fresh(primary) is not True:
             driven.flags.add(InvalidFlag.MISSING_EVIDENCE)
         return len(rows)
 
@@ -1366,7 +1451,7 @@ async def run(
     manifest = resolve_manifest(plan_, artifacts, source.requested.settings)
     prior = _resumable(plan_, journal, manifest)
     if prior is not None:
-        manifest = dataclasses.replace(manifest, observed=prior)
+        manifest = dataclasses.replace(manifest, observed=prior[0])
     _history(journal)
     clock = gateway.clock
     found = telemetry.preflight(source.reader, source.pool, source.engine, origin_s + clock.now_ms() / 1000)
