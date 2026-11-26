@@ -395,6 +395,46 @@ def test_a_viewport_that_shows_the_whole_chart_is_accepted(tmp_path: Path, viewp
     assert report.accepted, report.faults
 
 
+def nest(root: ElementTree.Element, size: dict[str, str]) -> ElementTree.Element:
+    """Moves everything the figure draws into an `svg` of this size inside it."""
+    inner = ElementTree.Element(SVG + "svg", size)
+    inner.extend(list(root))
+    root[:] = [inner]
+    return inner
+
+
+@pytest.mark.parametrize("where", ["outer-width", "outer-height", "nested-width"])
+def test_a_viewport_zero_percent_wide_or_high_shows_nothing(tmp_path: Path, where: str) -> None:
+    def zero(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        svg = nest(root, {}) if where.startswith("nested") else root
+        svg.set(where.partition("-")[2], "0%")
+
+    assert failed(graded_with_edit(tmp_path, EXEMPLAR, zero)) == {Property.DATA}
+
+
+@pytest.mark.parametrize("clip", ["100%", "50%"])
+def test_a_nested_viewport_that_sets_no_size_is_the_viewport_around_it(tmp_path: Path, clip: str) -> None:
+    """Its percentages, the background's and those of a clip of the lines, are of the viewport
+    around it, as with an explicit `100%`: a clip of half its width hides some of the plot."""
+
+    def graded(size: dict[str, str]) -> analysis.Report:
+        def nested(root: ElementTree.Element, _instance: grader.Instance) -> None:
+            inner = nest(root, size)
+            inner[0].attrib.update({"width": "100%", "height": "100%"})
+            clip_path = ElementTree.SubElement(ElementTree.SubElement(inner, SVG + "defs"), SVG + "clipPath")
+            clip_path.set("id", "plot")
+            ElementTree.SubElement(clip_path, SVG + "rect", {"width": clip, "height": "100%"})
+            for line in series_lines(inner):
+                line.set("clip-path", "url(#plot)")
+
+        return graded_with_edit(tmp_path / str(len(size)), EXEMPLAR, nested)
+
+    explicit, unset = graded({"width": "100%", "height": "100%"}), graded({})
+
+    assert unset.faults == explicit.faults
+    assert failed(unset) == (set() if clip == "100%" else {Property.DATA})
+
+
 def test_a_plot_clipped_to_its_area_is_accepted(tmp_path: Path) -> None:
     def clipped(root: ElementTree.Element, _instance: grader.Instance) -> None:
         clip = ElementTree.SubElement(ElementTree.SubElement(root, SVG + "defs"), SVG + "clipPath", {"id": "plot"})

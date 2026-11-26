@@ -25,8 +25,9 @@ in a transformed group, a label in a `tspan`) is accepted when it shows the same
 
 **What is drawn.** The grader reads an SVG's geometry (`transform`, `x`, `y`, the shapes'
 coordinates, and each `svg` element's viewport: `width`, `height`, `viewBox`,
-`preserveAspectRatio`; a percentage is one of the viewport around, as SVG reads it, and one of a
-viewport of no set size cannot be read) and its paint, from presentation attributes and `style` attributes,
+`preserveAspectRatio`; a percentage is one of the viewport around, as SVG reads it, a nested
+`svg` that sets no size being `100%` of it, and one of a viewport of no set size cannot be read,
+but for zero percent, which is zero) and its paint, from presentation attributes and `style` attributes,
 inherited as SVG inherits them; it reads no style sheet. A colour is one colour however SVG lets it
 be written (a keyword, `#rgb`, `#rrggbb`, `rgb()`, `hsl()`). A line, a text or a mark that is not
 displayed (`display`, `visibility`, an `opacity` of 0, no paint, a stroke of width 0, a text of
@@ -675,18 +676,19 @@ def _declared(element: ElementTree.Element) -> dict[str, str]:
 
 def _size(text: str | None, reference: float | None) -> float | None:
     """A width or a height in user units, a percentage being one of `reference`; None when it is
-    not set, or is relative to a size not known (the window around the figure)."""
+    not set, or is a percentage other than zero of a size not known (the window around the
+    figure): zero percent of any size is zero."""
     if text is None:
         return None
     stripped = text.strip()
     number = stripped.removesuffix("%")
-    if (
-        number != stripped
-        and reference is not None
-        and math.isfinite(reference)
-        and re.fullmatch(_NUMBER.pattern, number)
-    ):
-        return _finite(number, FIGURE) / 100 * reference
+    if number != stripped and re.fullmatch(_NUMBER.pattern, number):
+        part = _finite(number, FIGURE)
+        if part == 0:
+            return 0.0
+        if reference is not None and math.isfinite(reference):
+            return part / 100 * reference
+        return None
     if not re.fullmatch(_NUMBER.pattern + r"(?:px)?", stripped):
         return None
     return _finite(stripped.removesuffix("px"), FIGURE)
@@ -697,13 +699,15 @@ def _viewport(element: ElementTree.Element, nested: bool, outer: Extent) -> tupl
     rectangle of its user space its viewport shows (`viewBox` and `preserveAspectRatio` as SVG
     reads them, a size it does not set as large as its content) and the size its percentages refer
     to (its `viewBox`, else its own); None when it shows nothing. The percentages of a nested one
-    refer to the viewport around it; those of the outermost one, to a window the grader does not
-    know."""
+    refer to the viewport around it, and a size it does not set is `100%` of it; those of the
+    outermost one, to a window the grader does not know."""
     if not nested:
         outer = (None, None)
     x = (_coordinate(element.get("x"), outer[0]) or 0.0) if nested else 0.0
     y = (_coordinate(element.get("y"), outer[1]) or 0.0) if nested else 0.0
-    width, height = _size(element.get("width"), outer[0]), _size(element.get("height"), outer[1])
+    unset = "100%" if nested else None
+    width = _size(element.get("width", unset), outer[0])
+    height = _size(element.get("height", unset), outer[1])
     if (width is not None and not width > 0) or (height is not None and not height > 0):
         return None
     try:
