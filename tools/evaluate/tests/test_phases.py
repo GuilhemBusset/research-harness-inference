@@ -1300,6 +1300,94 @@ def test_a_cell_invalidated_by_host_turnover_runs_again_on_a_booking_that_matche
     assert any(one.cell == floor and one.qualifies for one in after.cells)
 
 
+class Exited(BaseException):
+    """The driver's process ending where a test says: nothing more is written to its journal."""
+
+
+def exit_at_checkpoint(monkeypatch: pytest.MonkeyPatch, bench: Bench, measured: int, *, landed: bool) -> None:
+    """Ends the driver at the checkpoint of its `measured`-th measured cell (the first is 1): just
+    before it lands, or right after (`landed`). The journal is given up as an exit gives it up."""
+    checkpoint = Journal.checkpoint_cell
+    seen = [0]
+
+    def ending(journal: Journal, ordinal: int, record: Any) -> Any:
+        warm = PLAN.cells[journal.attempts[ordinal].cell].identity.phase is Phase.WARM_UP
+        seen[0] += 0 if warm else 1
+        if seen[0] != measured or warm:
+            return checkpoint(journal, ordinal, record)
+        if landed:
+            checkpoint(journal, ordinal, record)
+        journal.close()
+        raise Exited
+
+    monkeypatch.setattr(Journal, "checkpoint_cell", ending)
+    with pytest.raises(Exited):
+        bench.run()
+    monkeypatch.undo()
+
+
+def restarted(first: Bench, tmp_path: Path, **changes: Any) -> Bench:
+    """A new driver on the journal the first left, in a later booking."""
+    journal = Journal.open(first.journal.directory.parent, first.journal.run_id)
+    second = Bench(tmp_path / "second", resumes=journal, **changes)
+    second.clock.at = first.clock.at + 60_000
+    return second
+
+
+def kept(journal: Journal) -> dict[int, tuple[Any, ...]]:
+    return {one.ordinal: journal.observations(one.ordinal) for one in journal.attempts}
+
+
+@pytest.mark.parametrize(("measured", "landed"), [(2, False), (1, True)], ids=["before-checkpoint", "after-checkpoint"])
+def test_a_driver_that_exits_at_a_checkpoint_is_resumed_with_what_it_observed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, measured: int, landed: bool
+) -> None:
+    first = Bench(tmp_path / "first")
+    exit_at_checkpoint(monkeypatch, first, measured, landed=landed)
+    second = restarted(first, tmp_path)
+    last = second.journal.attempts[-1]
+    assert last.reusable is landed and (second.journal.directory / phases.SERVED).is_file()
+    before = kept(second.journal)
+    assert before[last.ordinal]
+    measurements = [
+        one
+        for one in second.journal.attempts
+        if one.reusable and PLAN.cells[one.cell].identity.phase is not Phase.WARM_UP
+    ]
+    assert measurements
+
+    after = second.run()
+    assert after.ended is phases.Ended.COMPLETED and all(one.qualifies for one in after.cells)
+    # What was kept is not measured again, and stays kept; the cell cut short before its checkpoint runs again.
+    ran = {one.cell.identity.cell for one in after.cells}
+    assert not {one.cell for one in measurements} & ran and (landed or last.cell in ran)
+    assert all(second.journal.attempts[one.ordinal].reusable for one in measurements)
+    # Every observation the first driver made, kept or not, is still there under its attempt.
+    assert {ordinal: kept(second.journal)[ordinal] for ordinal in before} == before
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"planned": plan.expand(PLAN.spec, Profile.SCREEN, 2, input_seed=PLAN.workload.input_seed + 1)},
+        {"requested": replace(REQUESTED, prefix_caching=True)},
+    ],
+    ids=["workload", "treatment"],
+)
+def test_a_driver_that_exits_at_a_checkpoint_is_not_resumed_under_another_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, changes: dict[str, Any]
+) -> None:
+    first = Bench(tmp_path / "first")
+    exit_at_checkpoint(monkeypatch, first, 1, landed=True)
+    second = restarted(first, tmp_path, **changes)
+    saved, before = (second.journal.directory / phases.MANIFEST).read_text(), kept(second.journal)
+    with pytest.raises(phases.PhaseError) as refused:
+        second.run()
+    assert refused.value.reason is phases.Refusal.INCOMPATIBLE_RESUME
+    assert second.gateway.arrived == []
+    assert (second.journal.directory / phases.MANIFEST).read_text() == saved and kept(second.journal) == before
+
+
 def test_a_resume_with_another_harness_image_is_refused_and_keeps_the_manifest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
