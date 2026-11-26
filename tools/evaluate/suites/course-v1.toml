@@ -152,9 +152,9 @@ background = "several_agents"
 features = ["delegation"]
 harnesses = ["claude_code"]
 instances = [
-    { id = "analysis.t01.i01", fixture_digest = "sha256:a386e31bf75169018b3b1ee5b31d9d9b205077e7945ee5bf1534879a7aaa3a05", grader_digest = "sha256:951762eb38be46245cc4a58ff8b50b51715d9e4c595e845e2bd8a46a2babcf71" },
-    { id = "analysis.t01.i02", fixture_digest = "sha256:ba7ecde061f3f8faf42920e3aa3a90c4c737582633c93fb3ef74b3950cd29e2d", grader_digest = "sha256:73129a38c7405a88869d1eaa426c3b180286badb58d607ab38d2ebf8ba6fbdf4" },
-    { id = "analysis.t01.i03", fixture_digest = "sha256:5aa8abc3ff5f35b7395675755b776c5bc74db85ed224027286636caba94019d9", grader_digest = "sha256:987a65a4e1eedf0e257a3ee2cd0560db4a91dc309c774c29b0ecf13dc8146673" },
+    { id = "analysis.t01.i01", fixture_digest = "sha256:6b8cc28fc2c280bbc744ca3968cd57d83a16099310210687389ec474cd1164fe", grader_digest = "sha256:3ddd91b459b8d04adb73a5d2ee341f7ff104ba1f343633c43e8eedf9f60e640f" },
+    { id = "analysis.t01.i02", fixture_digest = "sha256:1adcbd81f2631c664f031d366fada4b1a1f5e5182fc0d8ee9fc0edc3a4d7e762", grader_digest = "sha256:4e3fd41a586cdd5a67aa3f07fa5d91af2ff82b83f531a637345036c4199c318d" },
+    { id = "analysis.t01.i03", fixture_digest = "sha256:27e482de852b718cd741b7be57e791cdc02cde4691f75e97b9cc3898782fa041", grader_digest = "sha256:268beeb6c88b191d9ac61864093764c9be85df047386fbc45149a5a67af5045c" },
 ]
 
 # Debug and revise: the original cases, the changed cases, and the follow-up constraint.

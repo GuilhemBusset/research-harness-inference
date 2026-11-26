@@ -13,8 +13,8 @@ figure and result, copied, are no answer to either.
 **What stays outside** is everything else here: the grader (`grader.py`), and `SEALED`, the folder
 of the reference solution (`reference/analysis.py`) and of what it produces on each instance
 (`reference/<instance>/`). `grade` reads what a run wrote, against the trusted copy of the
-instance, with the lifecycle of the run's workers (`Span`) that the trusted side observed: never
-anything the run could change. What the reference produced is committed; it is made again by
+instance, with the lifecycle of the run's workers that the trusted side observed (the trial's
+`Delegation`, or the `Span` of each worker): never anything the run could change. What the reference produced is committed; it is made again by
 running the reference in a workspace, which the tests do.
 
 **Versions.** The instances and the grader are files of this folder, and the suite
@@ -28,17 +28,17 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from collections.abc import Sequence
 from pathlib import Path
 
 from evaluate.course.analysis import grader
-from evaluate.course.analysis.grader import PROPERTIES, Instance, Property, Report, Span
+from evaluate.course.analysis.grader import PROPERTIES, Evidence, Instance, Property, Report, Span
 
 __all__ = [
     "INSTANCE_IDS",
     "PROPERTIES",
     "SEALED",
     "TASK_ID",
+    "Evidence",
     "Instance",
     "Property",
     "Report",
@@ -98,8 +98,8 @@ def reference_artifacts(instance_id: str) -> Path:
     return SEALED / _name(instance_id)
 
 
-def grade(instance_id: str, artifacts: Path, workers: Sequence[Span] | None) -> Report:
-    """Grade what a folder holds, with the spans of the run's workers, as an answer to an instance."""
+def grade(instance_id: str, artifacts: Path, workers: Evidence) -> Report:
+    """Grade what a folder holds, with the lifecycle of the run's workers, as an answer to an instance."""
     return grader.grade(load_instance(instance_id), artifacts, workers)
 
 

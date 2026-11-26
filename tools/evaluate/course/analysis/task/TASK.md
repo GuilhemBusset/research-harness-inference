@@ -20,13 +20,18 @@ work at the same time:
 When both have finished, write `figure.svg`, a line chart of both series, with the Python
 standard library only. Install nothing.
 
-- Draw each series as one `<polyline>` or one `<path>` of straight segments, with `id="series_a"`
-  and `id="series_b"`, with one point for each row of `data.csv`, in the order of `x`.
+- Draw each series as one `<polyline>`, or one `<path>` of connected straight segments (one
+  moveto, then linetos), with `id="series_a"` and `id="series_b"`, with one point for each row of
+  `data.csv`, in the order of `x`. Give the two lines two different stroke colours.
 - Both lines share one linear x axis, increasing to the right, and one linear y axis, increasing
   upward.
 - Label the axes with a `<text>` each, holding exactly `x_label` and `y_label`: the x axis label
-  below the lines, the y axis label to their left.
-- Add a legend: a `<text>` that holds the name of each source, from `instance.json`.
+  below the lines, the y axis label to their left. A tick label, a `<text>` holding only a number
+  below the lines or left of them, sits where that number is on its axis.
+- Add a legend: for each source, a `<text>` that holds its name, from `instance.json`, beside a
+  mark (a short line, a square) in the colour of its line.
+- Set colours and visibility with attributes (`stroke="..."`, or `style="stroke: ..."`) on the
+  elements or the groups around them, not in a `<style>` sheet.
 
 ## 3. The comparison
 
@@ -43,7 +48,7 @@ Answer with one sentence saying what the figure shows and what the comparison sa
 
 The files are read after the run, by a check that is not in this folder. It establishes that the
 two agents were running at the same time, that both series and every plotted point are what
-`data.csv` gives, that the axes are labelled and oriented as asked, and that `result.json` holds
-the comparison `data.csv` gives. A number of a series or of the comparison may be off by 0.005; a
-plotted point may be off its axes by 1% of the lines' extent. Any size, margin, colour and scale
-of the figure is accepted.
+`data.csv` gives, that the axes, their ticks and the legend say what the lines show, and that
+`result.json` holds the comparison `data.csv` gives. A number of a series or of the comparison may
+be off by 0.005; a plotted point may be off its axes by 1% of the lines' extent, and a tick label
+by 5%. Any size, margin, colour and scale of the figure is accepted.

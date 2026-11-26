@@ -1,10 +1,11 @@
 """The parallel-analysis task of the course suite and its grader (`evaluate.course.analysis`).
 
 The grader reads what a run wrote (`series_a.csv`, `series_b.csv`, `figure.svg`, `result.json`)
-and the spans of the run's workers, so most tests copy the committed reference of an instance,
-change one thing and grade it. `chart` draws a figure of an instance as a run might, in another
-way than the reference: an equivalent figure is accepted, and a figure that misplaces a series or
-a label is not. One test runs the reference solution in a scratch workspace.
+and the evidence of the run's workers (the spans of each, or what the trial's adapter read), so
+most tests copy the committed reference of an instance, change one thing (`graded_with_edit`
+edits its figure) and grade it. `chart` draws a figure of an instance as a run might, in another
+way than the reference: an equivalent figure is accepted, and a figure that misplaces a series, a
+label or a tick is not. One test runs the reference solution in a scratch workspace.
 """
 
 from __future__ import annotations
@@ -14,11 +15,13 @@ import json
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
-from evaluate import contracts
+from evaluate import adapters, contracts
 from evaluate import plan as planning
 from evaluate.course import analysis
 from evaluate.course.analysis import INSTANCE_IDS, PROPERTIES, Property, Span, grader
@@ -27,6 +30,10 @@ EXEMPLAR, CHANGED_DATA, CHANGED_COMPARISON = INSTANCE_IDS
 
 # Two workers alive at once, as the trusted side observed them.
 OVERLAPPING = (Span(0, 10), Span(2, 12))
+
+SVG = "{http://www.w3.org/2000/svg}"
+ElementTree.register_namespace("", SVG[1:-1])
+COLOURS = ("#1f77b4", "#d62728")
 
 
 def failed(report: analysis.Report) -> set[Property]:
@@ -48,9 +55,10 @@ def chart(
     labels: tuple[str, str] | None = None,
     nudge: float = 0.0,
 ) -> str:
-    """A line chart of an instance: 500 by 300 units of plot at (100, 50), times `scale`, its lines
-    in a group of transform `group`, with these ids and axis labels; `nudge` moves the third point
-    of series_a down by that part of the y extent of the plotted lines."""
+    """A line chart of an instance, its legend in the colours of the lines and a tick at each end
+    of the y axis: 500 by 300 units of plot at (100, 50), times `scale`, its lines and ticks in a
+    group of transform `group`, with these ids and axis labels. `nudge` moves every point but the
+    first and the last right by that part of the x extent, and the middle one left by it."""
     series = (instance.series_a, instance.series_b)
     low, high = min(min(one) for one in series), max(max(one) for one in series)
     x0, x1 = instance.x[0], instance.x[-1]
@@ -59,24 +67,30 @@ def chart(
         return (scale * (100 + 500 * (x - x0) / (x1 - x0)), scale * (350 - 300 * (y - low) / (high - low)))
 
     drawn = []
-    for identifier, values in zip(lines, series, strict=True):
+    for identifier, values, colour in zip(lines, series, COLOURS, strict=True):
         points = [point(x, y) for x, y in zip(instance.x, values, strict=True)]
-        if identifier == "series_a":
-            points[2] = (points[2][0], points[2][1] + nudge * 300 * scale)
+        middle = len(points) // 2
+        for index in range(1, len(points) - 1):
+            moved = nudge * 500 * scale * (-1 if index == middle else 1)
+            points[index] = (points[index][0] + moved, points[index][1])
+        paint = f'stroke="{colour}" fill="none"'
         if path:
             d = "M " + " L ".join(f"{x:.3f} {y:.3f}" for x, y in points)
-            drawn.append(f'<path id="{identifier}" d="{d}"/>')
+            drawn.append(f'<path id="{identifier}" d="{d}" {paint}/>')
         else:
-            drawn.append(f'<polyline id="{identifier}" points="{" ".join(f"{x:.3f},{y:.3f}" for x, y in points)}"/>')
+            coordinates = " ".join(f"{x:.3f},{y:.3f}" for x, y in points)
+            drawn.append(f'<polyline id="{identifier}" points="{coordinates}" {paint}/>')
     x_label, y_label = labels or (instance.x_label, instance.y_label)
+    ticks = [f'<text x="{90 * scale}" y="{point(x0, y)[1] + 4 * scale}">{y:g}</text>' for y in (low, high)]
     return "\n".join(
         [
             '<svg xmlns="http://www.w3.org/2000/svg">',
             f'<g transform="{group}">',
             *drawn,
+            *ticks,
             "</g>",
-            f'<text x="{620 * scale}" y="{60 * scale}">{instance.name_a}</text>',
-            f'<text x="{620 * scale}" y="{80 * scale}">{instance.name_b}</text>',
+            f'<text x="{620 * scale}" y="{60 * scale}" fill="{COLOURS[0]}">{instance.name_a}</text>',
+            f'<text x="{620 * scale}" y="{80 * scale}" style="fill: {COLOURS[1]}">{instance.name_b}</text>',
             f'<text x="{350 * scale}" y="{390 * scale}">{x_label}</text>',
             f'<text transform="translate({30 * scale} {200 * scale}) rotate(-90)">{y_label}</text>',
             "</svg>",
@@ -88,6 +102,23 @@ def graded_with_figure(folder: Path, instance_id: str, svg: str) -> analysis.Rep
     produced = reference_copy(folder, instance_id)
     (produced / "figure.svg").write_text(svg, encoding="utf-8")
     return analysis.grade(instance_id, produced, OVERLAPPING)
+
+
+def graded_with_edit(folder: Path, instance_id: str, edit: Callable[[ElementTree.Element, grader.Instance], None]):
+    """The grade of the reference of an instance, its figure edited in place."""
+    produced = reference_copy(folder, instance_id)
+    tree = ElementTree.parse(produced / "figure.svg")
+    edit(tree.getroot(), analysis.load_instance(instance_id))
+    tree.write(produced / "figure.svg", encoding="unicode")
+    return analysis.grade(instance_id, produced, OVERLAPPING)
+
+
+def texts(root: ElementTree.Element) -> dict[str, ElementTree.Element]:
+    return {element.text or "": element for element in root.iter(SVG + "text")}
+
+
+def series_lines(root: ElementTree.Element) -> list[ElementTree.Element]:
+    return [element for element in root.iter() if element.get("id") in grader.LINE_IDS]
 
 
 # --- The family: its instances, what a trial is given, and the suite ---------------------------
@@ -177,6 +208,37 @@ def test_workers_that_were_not_alive_at_once_are_rejected(workers: tuple[Span, .
     assert failed(report) == {Property.WORKERS}
 
 
+def claude_output(*events: tuple[str, str]) -> str:
+    """Claude Code's output of workers starting and ending (`adapters.delegation` reads it)."""
+    return "\n".join(
+        json.dumps({"type": "system", "subtype": kind, "task_type": adapters.AGENT_TASK, "tool_use_id": call})
+        for kind, call in events
+    )
+
+
+@pytest.mark.parametrize(
+    ("events", "accepted"),
+    [
+        ([("task_started", "a"), ("task_started", "b"), ("task_notification", "a"), ("task_notification", "b")], True),
+        ([("task_started", "a"), ("task_notification", "a"), ("task_started", "b"), ("task_notification", "b")], False),
+    ],
+)
+def test_the_delegation_a_trial_read_is_graded(events: list[tuple[str, str]], accepted: bool) -> None:
+    evidence = adapters.delegation(claude_output(*events))
+
+    report = analysis.grade(EXEMPLAR, analysis.reference_artifacts(EXEMPLAR), evidence)
+
+    assert failed(report) == (set() if accepted else {Property.WORKERS})
+    beyond = adapters.Delegation(grader.MAX_WORKERS + 1, overlapped=True)
+    assert failed(analysis.grade(EXEMPLAR, analysis.reference_artifacts(EXEMPLAR), beyond)) == {Property.WORKERS}
+
+
+@pytest.mark.parametrize(("workers", "overlapped"), [(1, True), (-1, False)])
+def test_a_delegation_that_is_none_is_the_trusted_sides_error(workers: int, overlapped: bool) -> None:
+    with pytest.raises(ValueError, match="delegation"):
+        analysis.grade(EXEMPLAR, analysis.reference_artifacts(EXEMPLAR), adapters.Delegation(workers, overlapped))
+
+
 def test_overlap_is_found_among_serial_workers_and_up_to_the_bound() -> None:
     workers = (Span(0, 3), Span(4, 6), Span(5, 8)) + (Span(10, 11),) * (grader.MAX_WORKERS - 3)
 
@@ -209,6 +271,58 @@ def test_swapped_series_are_rejected(tmp_path: Path, instance_id: str) -> None:
     assert failed(analysis.grade(instance_id, csvs, OVERLAPPING)) == {Property.DATA}
     swapped_lines = chart(instance, lines=("series_b", "series_a"))
     assert failed(graded_with_figure(tmp_path / "svg", instance_id, swapped_lines)) == {Property.DATA}
+
+    def swap_legend(root: ElementTree.Element, instance: grader.Instance) -> None:
+        named = texts(root)
+        named[instance.name_a].text, named[instance.name_b].text = instance.name_b, instance.name_a
+
+    assert failed(graded_with_edit(tmp_path / "legend", instance_id, swap_legend)) == {Property.DATA}
+
+
+def test_a_legend_that_cannot_tell_the_lines_apart_is_rejected(tmp_path: Path) -> None:
+    def one_colour(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        for element in root.iter():
+            if element.get("stroke") == COLOURS[1]:
+                element.set("stroke", COLOURS[0])
+
+    assert failed(graded_with_edit(tmp_path, EXEMPLAR, one_colour)) == {Property.DATA}
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("display", "none"),
+        ("visibility", "hidden"),
+        ("stroke", "none"),
+        ("opacity", "0"),
+        ("style", "stroke-width: 0"),
+    ],
+)
+def test_a_series_that_is_not_drawn_is_rejected(tmp_path: Path, attribute: str, value: str) -> None:
+    def hide(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        for line in series_lines(root):
+            line.set(attribute, value)
+
+    assert failed(graded_with_edit(tmp_path, EXEMPLAR, hide)) == {Property.DATA}
+
+
+def test_a_path_of_points_not_joined_is_rejected(tmp_path: Path) -> None:
+    def unjoined(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        for line in series_lines(root):
+            line.tag = SVG + "path"
+            line.set("d", " ".join("M" + pair for pair in line.attrib.pop("points").split()))
+
+    assert failed(graded_with_edit(tmp_path, EXEMPLAR, unjoined)) == {Property.DATA}
+
+
+@pytest.mark.parametrize("instance_id", INSTANCE_IDS)
+def test_ticks_that_misstate_an_axis_are_rejected(tmp_path: Path, instance_id: str) -> None:
+    def tenfold(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        for element in root.iter(SVG + "text"):
+            if element.text and element.text.isdecimal():
+                element.text = str(10 * int(element.text))
+
+    assert failed(graded_with_edit(tmp_path, instance_id, tenfold)) == {Property.DATA}
 
 
 @pytest.mark.parametrize("instance_id", INSTANCE_IDS)
@@ -250,6 +364,18 @@ def test_an_equivalent_figure_is_accepted(tmp_path: Path, instance_id: str, figu
     assert report.accepted, report.faults
 
 
+def test_a_label_placed_by_its_tspan_is_accepted(tmp_path: Path) -> None:
+    def in_tspan(root: ElementTree.Element, instance: grader.Instance) -> None:
+        label = texts(root)[instance.x_label]
+        position = {key: label.attrib.pop(key) for key in ("x", "y")}
+        ElementTree.SubElement(label, SVG + "tspan", position).text = label.text
+        label.text = None
+
+    report = graded_with_edit(tmp_path, EXEMPLAR, in_tspan)
+
+    assert report.accepted, report.faults
+
+
 def test_an_axis_turned_around_is_rejected(tmp_path: Path) -> None:
     # The lines mirrored about their middle: y now grows downward.
     upside_down = chart(analysis.load_instance(EXEMPLAR), group="translate(0 400) scale(1 -1)")
@@ -277,7 +403,7 @@ def test_the_tolerances_of_a_series_a_plotted_point_and_the_comparison(tmp_path:
     assert graded("comparison", -0.004) == set()
     assert graded("comparison", 0.006) == {Property.COMPARISON}
     assert graded("plot", 0.009) == set()
-    assert graded("plot", 0.02) == {Property.DATA}
+    assert graded("plot", 0.011) == {Property.DATA}
 
 
 @pytest.mark.parametrize(
