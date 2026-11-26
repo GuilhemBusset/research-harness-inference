@@ -460,6 +460,9 @@ def test_the_usage_chunk_that_ends_a_chat_stream_is_the_answers_own_without_a_fi
     assert (attempt.outcome, attempt.output_counted) == (RequestOutcome.COMPLETED, True)
     assert attempt.usage is not None
     assert attempt.usage.output_tokens == 4
+    # A stop after that chunk is one the count came before: it may not hold the token that ended it.
+    stopped_later = replay(CHAT, (100, text(CHAT)), (200, final_usage + chat_stop(0) + last_event(CHAT, None)))
+    assert (stopped_later.outcome, stopped_later.output_counted) == (RequestOutcome.COMPLETED, False)
 
 
 @routes
