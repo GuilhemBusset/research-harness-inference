@@ -30,7 +30,10 @@ every conversation of a cell starts with the same bytes (`Trace.prefix`), a cell
 repetition, the warm-up and each opening start with others, and two treatments of one plan are
 sent the same bytes. Conversation `k` of slot `s` is number `s + k * slots` in the records. The
 text of a conversation is drawn under that number and the cell's, so no cell is sent the
-transcript an earlier cell of its repetition already left in an engine's cache.
+transcript an earlier cell of its repetition already left in an engine's cache. Their sizes are
+the plan's (`sizes_of`): its suite's `replay` section, which the plan's protocol digest covers, so
+the requests on the wire are the workload the digest names. A cell sent with other sizes, as a
+rehearsal against a local mock may be, is flagged `missing_evidence` and does not count.
 
 **When a cell sends, and when it stops.** What ends the sending depends on the phase:
 
@@ -47,8 +50,10 @@ transcript an earlier cell of its repetition already left in an engine's cache.
 Once the sending has ended no request is dispatched, and the streams still open have the cell's
 `drain_ms` to end; those open at that instant are cut, and their conversations are abandoned.
 `Stops.cancel` and `Stops.deadline_ms` stop a cell at once, whatever its phase: nothing more is
-sent, open streams are cut, and the cell is recorded incomplete. Cancelling the task that runs
-`run_cell` also stops every request before the cancellation goes on.
+sent, open streams are cut, and the cell is recorded incomplete. Each is read again at the
+instant of every dispatch, so a cell that starts cancelled, past its deadline or already finished
+sends nothing. Cancelling the task that runs `run_cell` also stops every request before the
+cancellation goes on.
 
 **The driver's lag.** A request is eligible at a time the plan and the answers fix; `sent_ms` is
 when the driver dispatched it, and the difference is the driver's own delay, whatever the server
@@ -59,19 +64,29 @@ does not count.
 
 **Keys and the fresh prefix.** `preflight` counts the keys a plan needs, for each cohort it is
 run with: a paired treatment on a reused engine takes a cohort of its own. Fewer distinct keys
-are refused before anything is sent (`Refusal.INSUFFICIENT_KEYS`), by `run_cell` as well. The
-first cell that replays under a prefix namespace must find it uncached. That is read from served
-usage: of each identity's first requests, those sent while none of that identity's had ended, one
+are refused before anything is sent (`Refusal.INSUFFICIENT_KEYS`), by `run_cell` as well; an
+empty entry is no key. The gateway keeps a cache salt for each student, so what one student left
+in a cache says nothing of another's: every student must find the prefix uncached the first time
+the plan has them replay under its namespace (`new_students`), in whichever cell that is. The
+plan fixes who must show it, and no caller waives it. It is read from served usage: of the
+student's first requests in that cell, those sent while none of that student's had ended, one
 must report a cached input of exactly zero. A count above zero, however small, may be the
 namespace read back and is not told apart from cached framing; no count is no evidence. The
-identity's other first request may report a cached input: it can read what its twin just wrote.
-A cell that does not show it is flagged `missing_evidence` and does not count.
+student's other first request may report a cached input: it can read what its twin just wrote.
+A cell that does not show it for each of them is flagged `missing_evidence` and does not count.
 
 **What is recorded** is ordinals, times on the run's clock, counts and labels: no key, no host,
 no text of a request or an answer. `Summary` tells the three kinds of traffic apart (`Segment`),
 and holds, beside the planned arrivals and coverage, what was observed of them. A request the
 driver cut is recorded as far as its stream had come, and `Summary.cut` names it. No finish reason
-is read here: `finish_reason` is written as missing.
+is read here: `finish_reason` is written as missing. Every request that was dispatched has its
+record: a record that cannot be written (`contracts.ContractError`, as for an ordinal past the
+last one) ends the cell, and `run_cell` raises it instead of returning a cell with a part of its
+requests.
+
+**The address** is the gateway stack's output, a host name, or an `https://` address
+(`common.gateway_address`): a canary key is sent over HTTPS only, and `Gateway` is not made for
+any other address.
 
 It needs `spikes` and `services/gateway` on the path, as `evaluate.streams` does, and what
 `spikes/common.py` imports.
@@ -91,7 +106,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 import httpx
 
 import loadgen
-from common import percentile
+from common import gateway_address, percentile
 from evaluate import traces
 from evaluate.contracts import (
     LIVE_PHASES,
@@ -122,6 +137,7 @@ class Refusal(StrEnum):
 
     INSUFFICIENT_KEYS = "insufficient-keys"
     UNBOUNDED_CELL = "unbounded-cell"
+    UNSUPPORTED_ROUTE = "unsupported-route"
 
 
 class ReplayError(Exception):
@@ -150,8 +166,9 @@ class Stop(StrEnum):
 
 
 class Fresh(StrEnum):
-    """Whether served usage showed the cell's prefix uncached at its start. A cell that goes on
-    under a namespace an earlier cell opened is not required to show it."""
+    """Whether served usage showed the cell's prefix uncached for each student who met it there
+    first. A cell whose students all replayed under its namespace in earlier cells has nothing to
+    show."""
 
     VERIFIED = "verified"
     UNVERIFIED = "unverified"
@@ -183,13 +200,17 @@ class RunClock:
 
 @dataclass(frozen=True)
 class Gateway:
-    """The student gateway at `endpoint`, the pool `model` names, and the clock of the run.
-    `transport` is what requests are sent through: httpx's own unless given."""
+    """The student gateway at `endpoint` (`common.gateway_address`), the pool `model` names, and
+    the clock of the run. `transport` is what requests are sent through: httpx's own unless given.
+    ValueError for an address that is not reached over HTTPS: no key is sent in the clear."""
 
     endpoint: str
     model: str
     clock: Clock
     transport: httpx.AsyncBaseTransport | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "endpoint", gateway_address(self.endpoint))
 
 
 @dataclass(frozen=True)
@@ -224,6 +245,10 @@ class Summary:
     cache_policy: CachePolicy
     # The hash of the bytes every conversation of the cell starts with; `None` with no slot to replay.
     prefix_hash: str | None
+    # Whether the conversations were drawn to the plan's sizes. A cell sent with others does not count.
+    sizes_planned: bool
+    # The students who had to find the prefix uncached in this cell, and whether usage showed it.
+    fresh_students: tuple[int, ...]
     fresh_prefix: Fresh
     arrivals: tuple[Arrival, ...]
     # Coverage: what the plan asked of the cell, and what the cell came to.
@@ -300,20 +325,53 @@ def keys_needed(plan: Plan, *, cohorts: int = 1) -> int:
     return cohorts * plan.canary_identities
 
 
+def _distinct(keys: Iterable[str]) -> tuple[str, ...]:
+    """The keys given, each once, in order. An empty entry is no key."""
+    return tuple(dict.fromkeys(key for key in keys if key.strip()))
+
+
 def preflight(plan: Plan, keys: Sequence[str], *, cohorts: int = 1) -> tuple[tuple[str, ...], ...]:
     """The cohorts the keys give the plan, disjoint, each with a key for every identity.
     `ReplayError` when the distinct keys are too few."""
-    distinct = tuple(dict.fromkeys(keys))
+    distinct = _distinct(keys)
     if len(distinct) < keys_needed(plan, cohorts=cohorts):
         raise ReplayError(Refusal.INSUFFICIENT_KEYS)
     each = plan.canary_identities
     return tuple(distinct[at * each : (at + 1) * each] for at in range(cohorts))
 
 
-def opens_namespace(plan: Plan, cell: PlannedCell) -> bool:
-    """Whether the cell is the first of the plan to replay under its prefix namespace."""
-    users = [one for one in plan.cells if one.prefix_namespace == cell.prefix_namespace and one.replay_slots]
-    return bool(users) and users[0] is cell
+def _students(plan: Plan, cell: PlannedCell) -> set[int]:
+    return {seat_of(plan, cell, slot) for slot in range(cell.replay_slots)}
+
+
+def new_students(plan: Plan, cell: PlannedCell) -> tuple[int, ...]:
+    """The students of the cell that no earlier cell of the plan has replay under its prefix
+    namespace: the gateway salts the cache for each student, so each of them meets the prefix
+    for the first time here, and must find it uncached."""
+    earlier = plan.cells[: cell.identity.cell]
+    met = [_students(plan, one) for one in earlier if one.prefix_namespace == cell.prefix_namespace]
+    return tuple(sorted(_students(plan, cell).difference(*met)))
+
+
+def _pair(held: Sequence[int]) -> tuple[int, int]:
+    low, high = held
+    return low, high
+
+
+def sizes_of(plan: Plan) -> traces.Sizes:
+    """The sizes the plan's conversations are drawn to: its suite's `replay` section, which is in
+    the plan's protocol digest. The turns of a conversation are spike S5's, as `evaluate.traces`
+    has them. `ReplayError` for a suite that replays on another route than Messages."""
+    table = plan.spec.protocol["replay"]
+    if table["route"] != ROUTE:
+        raise ReplayError(Refusal.UNSUPPORTED_ROUTE)
+    return traces.Sizes(
+        opening_tokens=table["opening_tokens"],
+        transcript_tokens=_pair(table["transcript_tokens"]),
+        turn_input_tokens=_pair(table["turn_input_tokens"]),
+        turn_output_tokens=table["turn_output_tokens"],
+        tool_delay_ms=_pair(table["tool_delay_ms"]),
+    )
 
 
 def prefix_was_fresh(requests: Sequence[RequestRecord], students: Iterable[int]) -> bool:
@@ -379,10 +437,8 @@ class _Drive:
         stops: Stops,
         sizes: traces.Sizes,
         first_request: int,
-        fresh_required: bool,
     ) -> None:
         self.plan, self.cell, self.gateway, self.keys, self.stops, self.sizes = plan, cell, gateway, keys, stops, sizes
-        self.fresh_required = fresh_required
         self.clock = gateway.clock
         self.rule = _RULES[cell.identity.phase]
         self.course = traces.read_course()
@@ -424,17 +480,28 @@ class _Drive:
             self.started_ms = clock.now_ms()
             if self.rule.window:
                 self.window_ends_ms = self.started_ms + self.cell.admissions_ms
-            tasks = [
+            slots = [
                 asyncio.ensure_future(self._slot(http, one, *conversation))
                 for one, conversation in zip(self.slots, first, strict=True)
             ]
+            supervisor = asyncio.ensure_future(self._supervise(slots))
             try:
-                stop, closed_ms = await self._supervise(tasks)
+                # Until the cell has ended, or a slot has failed: a cell does not go on past a
+                # request it could not record.
+                running = {supervisor, *slots}
+                while supervisor in running:
+                    done, running = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                    if any(not task.cancelled() and task.exception() is not None for task in done):
+                        break
             finally:
                 # Whatever ends the cell, a cancellation of this task included, stops every request.
-                for task in tasks:
+                for task in (supervisor, *slots):
                     task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(supervisor, *slots, return_exceptions=True)
+            for task in slots:
+                if not task.cancelled() and (failure := task.exception()) is not None:
+                    raise failure
+            stop, closed_ms = supervisor.result()
             return self._result(stop, closed_ms, clock.now_ms(), prefix)
 
     async def _supervise(self, tasks: list[asyncio.Task[None]]) -> tuple[Stop, int]:
@@ -474,15 +541,25 @@ class _Drive:
         while (wait := at_ms - self.clock.now_ms()) > 0:
             await self.clock.sleep_ms(wait)
 
+    def _stopped(self) -> bool:
+        """Whether the sending has ended, as read at this instant: the supervisor may not have
+        run since a signal was given, and a driver that wakes after its window sends nothing late."""
+        stops, now = self.stops, self.clock.now_ms()
+        if self.closed or (stops.cancel is not None and stops.cancel.is_set()):
+            return True
+        if stops.deadline_ms is not None and now >= stops.deadline_ms:
+            return True
+        if self.window_ends_ms is not None:
+            return now >= self.window_ends_ms
+        return stops.finished is not None and stops.finished.is_set()
+
     async def _reach(self, eligible_ms: int) -> bool:
-        """Waits for an eligible time. Whether a request may then be dispatched: none is once the
-        sending has ended, and a driver that wakes after its window sends nothing late."""
-        if self.closed:
+        """Waits for an eligible time. Whether a request may then be dispatched: none is once
+        the sending has ended."""
+        if self._stopped():
             return False
         await self._until(eligible_ms)
-        now, deadline = self.clock.now_ms(), self.stops.deadline_ms
-        late = self.window_ends_ms is not None and now >= self.window_ends_ms
-        return not (self.closed or late or (deadline is not None and now >= deadline))
+        return not self._stopped()
 
     async def _slot(self, http: httpx.AsyncClient, one: _Slot, number: int, trace: traces.Trace) -> None:
         """One slot: its conversation at its planned arrival, then, where the phase replaces, the next ones."""
@@ -572,13 +649,15 @@ class _Drive:
         lag_p95 = percentile(lags, 95) if lags else None
         tolerance = plan.spec.protocol["driver"]["scheduling_lag_p95_ms_max"]
         students = sorted({one.student for one in self.slots})
+        fresh_students = new_students(plan, cell)
         fresh = Fresh.NOT_REQUIRED
-        if self.fresh_required:
-            fresh = Fresh.VERIFIED if prefix_was_fresh(requests, students) else Fresh.UNVERIFIED
+        if fresh_students:
+            fresh = Fresh.VERIFIED if prefix_was_fresh(requests, fresh_students) else Fresh.UNVERIFIED
+        sizes_planned = self.sizes == sizes_of(plan)
         flags = set()
         if lag_p95 is not None and lag_p95 > tolerance:
             flags.add(InvalidFlag.DRIVER_SATURATION)
-        if fresh is Fresh.UNVERIFIED:
+        if fresh is Fresh.UNVERIFIED or not sizes_planned:
             flags.add(InvalidFlag.MISSING_EVIDENCE)
         # Planned and not started: a slot's first conversation, or a replacement that was eligible
         # before the sending ended.
@@ -606,6 +685,8 @@ class _Drive:
             stopped_by=stop,
             cache_policy=plan.spec.cache_policy,
             prefix_hash=prefix,
+            sizes_planned=sizes_planned,
+            fresh_students=fresh_students,
             fresh_prefix=fresh,
             arrivals=tuple(
                 Arrival(one.slot, one.student, self.started_ms + cell.arrivals_ms[one.slot], one.first_sent_ms)
@@ -635,26 +716,26 @@ async def run_cell(
     keys: Sequence[str],
     *,
     stops: Stops | None = None,
-    sizes: traces.Sizes = traces.S5,
+    sizes: traces.Sizes | None = None,
     first_request: int = 0,
-    fresh: bool | None = None,
 ) -> CellRun:
     """Drives cell `cell` of the plan on the gateway and returns what it left.
 
     `keys` are the canary students' keys of this treatment's cohort, one seat each, in order.
-    `sizes` are the sizes its conversations are drawn to, spike S5's unless given. `first_request`
-    is the ordinal of the first request it sends. `fresh` says whether the cell must find its
-    prefix uncached; left out, the first cell of the plan to replay under its namespace must.
+    `sizes` are the sizes its conversations are drawn to: the plan's (`sizes_of`) unless given,
+    and a cell sent with others does not count. `first_request` is the ordinal of the first
+    request it sends.
 
-    `ReplayError`, with nothing sent, for fewer distinct keys than the cell has identities, and
-    for a warm-up or a live cell that nothing would end.
+    `ReplayError`, with nothing sent, for fewer distinct keys than the cell has identities, for a
+    warm-up or a live cell that nothing would end, and for a suite that replays on another route.
+    `contracts.ContractError` for a request that cannot be recorded, once it has stopped the others.
     """
     planned = plan.cells[cell]
     stops = Stops() if stops is None else stops
-    seats = tuple(dict.fromkeys(keys))
+    seats = _distinct(keys)
     if len(seats) < planned.identities:
         raise ReplayError(Refusal.INSUFFICIENT_KEYS)
     if not _RULES[planned.identity.phase].window and stops.finished is None and stops.deadline_ms is None:
         raise ReplayError(Refusal.UNBOUNDED_CELL)
-    fresh = opens_namespace(plan, planned) if fresh is None else fresh
-    return await _Drive(plan, planned, gateway, seats, stops, sizes, first_request, fresh).run()
+    drawn = sizes_of(plan)
+    return await _Drive(plan, planned, gateway, seats, stops, drawn if sizes is None else sizes, first_request).run()

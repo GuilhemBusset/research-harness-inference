@@ -13,7 +13,7 @@ import heapq
 import itertools
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any
@@ -22,23 +22,46 @@ import httpx
 import pytest
 
 from evaluate import plan, replay, traces
-from evaluate.contracts import CellStatus, InvalidFlag, Phase, Profile, RequestOutcome, Shape, Traffic
+from evaluate.contracts import (
+    CellStatus,
+    ContractError,
+    InvalidFlag,
+    Phase,
+    Profile,
+    RequestOutcome,
+    Shape,
+    Traffic,
+)
 from evaluate.replay import Fresh, Refusal, Segment, Stop
 from rhi_common.keys import generate_key
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 
-SPEC = plan.load_suite()
+COURSE = plan.load_suite()
+
+
+def suite(**replayed: Any) -> plan.SuiteSpec:
+    """The course suite with a replay of short conversations, a few words to a request and short
+    pauses for tools, and with what is given of its replay beside."""
+    short = {
+        "opening_tokens": 8,
+        "transcript_tokens": [16, 32],
+        "turn_input_tokens": [2, 6],
+        "turn_output_tokens": 4,
+        "tool_delay_ms": [500, 1000],
+    }
+    return replace(COURSE, protocol=COURSE.protocol | {"replay": COURSE.protocol["replay"] | short | replayed})
+
+
+SPEC = suite()
 # A class of three: its sweep has cells of four slots, its live cells two seats of background.
 SCREEN = plan.expand(SPEC, Profile.SCREEN, 3)
 # Three repetitions.
 QUALIFY = plan.expand(SPEC, Profile.QUALIFY, 2)
 KEYS = [generate_key() for _ in range(2 * SCREEN.canary_identities)]
-# Short conversations: three requests, a few words each, and the suite's pauses for tools.
-SIZES = traces.Sizes(
-    opening_tokens=8, transcript_tokens=(16, 32), turn_input_tokens=(2, 6), turn_output_tokens=4, turns=2
-)
+# The sizes the plans froze.
+SIZES = replay.sizes_of(SCREEN)
 # The run is under way when a cell starts: its times are not counted from the cell.
 START = 7_000
 # Turns of the event loop that let every task go on until it waits on the clock.
@@ -151,6 +174,7 @@ class Pool(httpx.AsyncBaseTransport):
         self._cached: set[tuple[int, bytes]] = set()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.scheme == "https"
         student = self.keys.index(request.headers["authorization"].removeprefix("Bearer "))
         arrived = Arrived(self.clock.now_ms(), student, request.content)
         self.arrived.append(arrived)
@@ -197,15 +221,16 @@ def run(
     finished_at: int | None = None,
     cancel_at: int | None = None,
     deadline_ms: int | None = None,
-    sizes: traces.Sizes = SIZES,
-    fresh: bool | None = None,
+    sizes: traces.Sizes | None = None,
+    first_request: int = 0,
     **answers: Any,
 ) -> tuple[replay.CellRun, Pool]:
     """Drives a cell against a made-up gateway on a clock of the test: what it left, and what the
-    gateway saw. `finished_at` and `cancel_at` are the times the two signals are given at."""
+    gateway saw. `finished_at` and `cancel_at` are the times the two signals are given at: before
+    the cell starts, for a time that is not after its start."""
     clock = pool.clock if pool else Clock()
     pool = pool or Pool(clock, keys, **answers)
-    gateway = replay.Gateway("http://gateway.example.com", "coursework", Busy(clock, late_ms, stall), pool)
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", Busy(clock, late_ms, stall), pool)
 
     async def work() -> replay.CellRun:
         giving = []
@@ -220,11 +245,16 @@ def run(
                 await clock.sleep_ms(at_ms - clock.now_ms())
                 given.set()
 
-            giving.append(asyncio.ensure_future(give()))
+            if at_ms <= clock.now_ms():
+                given.set()
+            else:
+                giving.append(asyncio.ensure_future(give()))
             return given
 
         stops = replay.Stops(finished=signal(finished_at), cancel=signal(cancel_at), deadline_ms=deadline_ms)
-        return await replay.run_cell(planned, cell, gateway, keys, stops=stops, sizes=sizes, fresh=fresh)
+        return await replay.run_cell(
+            planned, cell, gateway, keys, stops=stops, sizes=sizes, first_request=first_request
+        )
 
     return clock.drive(work()), pool
 
@@ -303,8 +333,6 @@ def test_the_agents_of_a_seat_share_its_identity_and_each_seat_has_its_own(shape
     assert record.conversations_planned == record.conversations_started > 4
     assert record.conversations_completed + record.conversations_abandoned == record.conversations_started
     assert summary.tally.attempts == summary.tally.completed == len(pool.arrived) == len(ran.requests)
-    # It goes on under a namespace an earlier cell of the repetition opened.
-    assert summary.fresh_prefix is Fresh.NOT_REQUIRED
     assert ran.valid
 
 
@@ -353,11 +381,8 @@ def test_the_warm_up_is_sent_apart_until_the_hosts_show_work_and_is_refused_with
 def test_a_class_opening_starts_each_planned_conversation_once_at_its_seeded_time(shape: Shape) -> None:
     cell = cell_of(SCREEN, Phase.CLASS_OPENING, shape)
     planned = SCREEN.cells[cell]
-    # Conversations short enough that the first to start is over while others have not started.
-    quick = traces.Sizes(
-        opening_tokens=8, transcript_tokens=(16, 32), turn_input_tokens=(2, 6), tool_delay_ms=(500, 1000), turns=1
-    )
-    ran, pool = run(SCREEN, cell, sizes=quick)
+    # Answers quick enough that a conversation is over while the window lasts.
+    ran, pool = run(SCREEN, cell, answer_ms=lambda _student: 100)
 
     first_turns = [arrived.at_ms - START for arrived in pool.arrived if arrived.turn == 0]
     assert first_turns == list(planned.arrivals_ms)
@@ -371,8 +396,12 @@ def test_a_class_opening_starts_each_planned_conversation_once_at_its_seeded_tim
         (START + at, START + at) for at in planned.arrivals_ms
     ]
     assert (summary.slots_planned, summary.slots_started) == (planned.replay_slots, planned.replay_slots)
-    # An opening is traffic of its own, on a prefix that usage showed to be fresh.
-    assert (summary.segment, summary.fresh_prefix) == (Segment.OPENING, Fresh.VERIFIED)
+    # An opening is traffic of its own, on a prefix that usage showed to be fresh for each student.
+    assert (summary.segment, summary.fresh_students, summary.fresh_prefix) == (
+        Segment.OPENING,
+        (0, 1, 2),
+        Fresh.VERIFIED,
+    )
     assert ran.valid
 
 
@@ -495,8 +524,9 @@ def test_a_prefix_is_shared_in_its_cell_paired_across_treatments_and_apart_for_e
 def test_too_few_keys_are_refused_before_anything_is_sent() -> None:
     needed = SCREEN.canary_identities
     assert (replay.keys_needed(SCREEN), replay.keys_needed(SCREEN, cohorts=2)) == (needed, 2 * needed)
-    # A key given twice is one key, and a second cohort needs as many again.
-    short = [(KEYS[: needed - 1], 1), ([*KEYS[: needed - 1], KEYS[0]], 1), (KEYS[: 2 * needed - 1], 2)]
+    # A key given twice is one key, an empty entry is none, and a second cohort needs as many again.
+    few = KEYS[: needed - 1]
+    short = [(few, 1), ([*few, KEYS[0]], 1), ([*few, ""], 1), ([*few, " "], 1), (KEYS[: 2 * needed - 1], 2)]
     for keys, cohorts in short:
         with pytest.raises(replay.ReplayError) as refused:
             replay.preflight(SCREEN, keys, cohorts=cohorts)
@@ -506,38 +536,153 @@ def test_too_few_keys_are_refused_before_anything_is_sent() -> None:
     # A cell is not driven with fewer keys than it has identities.
     cell = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 16)
     idle = Pool(Clock(), KEYS)
-    with pytest.raises(replay.ReplayError) as refused:
-        run(SCREEN, cell, keys=KEYS[:15], pool=idle)
-    assert refused.value.reason is Refusal.INSUFFICIENT_KEYS
+    for keys in (KEYS[:15], [*KEYS[:15], ""]):
+        with pytest.raises(replay.ReplayError) as refused:
+            run(SCREEN, cell, keys=keys, pool=idle)
+        assert refused.value.reason is Refusal.INSUFFICIENT_KEYS
     assert idle.arrived == []
 
 
+# The second sweep cell of a class: one student replayed under its namespace in the cell before.
+FOUR_SEATS = (SCREEN, cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 4))
+# The cell that opens the last repetition's namespace: two students, the two agents of each at once.
+TWINS = (QUALIFY, cell_of(QUALIFY, Phase.CAPACITY_SWEEP, Shape.SEVERAL_AGENTS, 4, repetition=2))
+
+
 @pytest.mark.parametrize(
-    ("shape", "stale", "later", "fresh"),
+    ("of", "new", "stale", "later", "fresh"),
     [
-        # Each student's first request read nothing from the cache. Its twin, sent with it, may.
-        (Shape.SEVERAL_AGENTS, {}, 12, Fresh.VERIFIED),
+        # Each new student's first request read nothing from the cache. Its twin, sent with it, may.
+        (TWINS, (0, 1), {}, 12, Fresh.VERIFIED),
         # Both first requests of one student read a few tokens: fewer than the opening holds,
         # and still not shown fresh.
-        (Shape.SEVERAL_AGENTS, {1: 5}, 12, Fresh.UNVERIFIED),
+        (TWINS, (0, 1), {1: 5}, 12, Fresh.UNVERIFIED),
         # Nothing read later, once an answer has ended, says what the student's first request met.
-        (Shape.HANDS_ON, {1: 5}, 0, Fresh.UNVERIFIED),
+        (FOUR_SEATS, (1, 2, 3), {1: 5}, 0, Fresh.UNVERIFIED),
         # One student's first answer reported no usage.
-        (Shape.HANDS_ON, {1: None}, 12, Fresh.UNVERIFIED),
+        (FOUR_SEATS, (1, 2, 3), {3: None}, 12, Fresh.UNVERIFIED),
+        # The student of the cell before may read what that cell left: the others show it fresh.
+        (FOUR_SEATS, (1, 2, 3), {0: 5}, 12, Fresh.VERIFIED),
     ],
 )
-def test_a_cell_counts_only_when_usage_shows_its_prefix_was_fresh(
-    shape: Shape, stale: dict[int, int | None], later: int, fresh: Fresh
+def test_a_cell_counts_only_when_usage_shows_its_prefix_fresh_for_each_student_new_to_it(
+    of: tuple[plan.Plan, int], new: tuple[int, ...], stale: dict[int, int | None], later: int, fresh: Fresh
 ) -> None:
-    cell = cell_of(SCREEN, Phase.CAPACITY_SWEEP, shape, 4)
-    ran, pool = run(SCREEN, cell, fresh=True, stale=stale, later=later)
+    planned, cell = of
+    ran, pool = run(planned, cell, stale=stale, later=later)
 
     assert len(pool.arrived) > 4
-    assert ran.summary.fresh_prefix is fresh
+    assert (ran.summary.fresh_students, ran.summary.fresh_prefix) == (new, fresh)
     assert (InvalidFlag.MISSING_EVIDENCE in ran.record.invalid_flags) is (fresh is Fresh.UNVERIFIED)
     assert ran.valid is (fresh is Fresh.VERIFIED)
-    # Which cell must show it comes from the plan: the first to replay under its namespace.
-    opens = [replay.opens_namespace(SCREEN, one) for one in SCREEN.cells]
-    assert opens[0]
-    assert sum(opens) == len({one.prefix_namespace for one in SCREEN.cells})
-    assert not opens[cell]
+
+
+def test_a_student_who_joins_a_repetition_after_its_first_cell_must_find_the_prefix_fresh_too() -> None:
+    one_seat = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 1)
+    four_seats = FOUR_SEATS[1]
+    assert SCREEN.cells[one_seat].prefix_namespace == SCREEN.cells[four_seats].prefix_namespace
+
+    # The cells run one after the other on one engine. The first student's cache holds the prefix
+    # by the second cell, and that is no fault: the three who join there find it fresh.
+    pool = Pool(Clock(), KEYS)
+    first, _pool = run(SCREEN, one_seat, pool=pool)
+    second, _pool = run(SCREEN, four_seats, pool=pool)
+    assert (first.summary.fresh_students, second.summary.fresh_students) == ((0,), (1, 2, 3))
+    opening = [one for one in second.requests if one.sent_ms == second.record.started_ms]
+    assert [one.usage.cached_input_tokens for one in opening if one.usage] == [pool.later, 0, 0, 0]
+    assert (first.valid, second.summary.fresh_prefix, second.valid) == (True, Fresh.VERIFIED, True)
+
+    # What the first student showed in the first cell shows nothing for another student, whose
+    # cache has a salt of its own: one who joins and reads from the cache leaves the cell unverified.
+    pool = Pool(Clock(), KEYS, stale={1: 20})
+    first, _pool = run(SCREEN, one_seat, pool=pool)
+    second, _pool = run(SCREEN, four_seats, pool=pool)
+    assert (first.valid, second.summary.fresh_prefix, second.valid) == (True, Fresh.UNVERIFIED, False)
+    assert InvalidFlag.MISSING_EVIDENCE in second.record.invalid_flags
+
+    # Who must show it comes from the plan, and no caller says otherwise: each student of a
+    # namespace in the first cell that has them replay under it, and in no other.
+    for namespace in {one.prefix_namespace for one in SCREEN.cells}:
+        cells = [one for one in SCREEN.cells if one.prefix_namespace == namespace]
+        new = [student for one in cells for student in replay.new_students(SCREEN, one)]
+        students = {replay.seat_of(SCREEN, one, slot) for one in cells for slot in range(one.replay_slots)}
+        assert sorted(new) == sorted(students)
+
+
+@pytest.mark.parametrize("stale", [{0: None}, {2: 7}])
+def test_a_class_opening_never_counts_without_usage_that_shows_each_student_fresh(
+    stale: dict[int, int | None],
+) -> None:
+    ran, _pool = run(SCREEN, cell_of(SCREEN, Phase.CLASS_OPENING, Shape.HANDS_ON), stale=stale)
+    assert ran.summary.fresh_prefix is Fresh.UNVERIFIED
+    assert ran.record.invalid_flags == (InvalidFlag.MISSING_EVIDENCE,)
+    assert not ran.valid
+
+
+@pytest.mark.parametrize(
+    ("phase", "stop"),
+    [(Phase.CAPACITY_SWEEP, Stop.CANCELLED), (Phase.CAPACITY_SWEEP, Stop.DEADLINE), (Phase.WARM_UP, Stop.FINISHED)],
+)
+def test_a_cell_that_is_stopped_before_it_starts_sends_nothing(phase: Phase, stop: Stop) -> None:
+    # The signal is given, or the deadline has come, when the cell starts.
+    at = {given: START if given is stop else None for given in Stop}
+    ran, pool = run(
+        SCREEN,
+        cell_of(SCREEN, phase, Shape.HANDS_ON),
+        cancel_at=at[Stop.CANCELLED],
+        deadline_ms=at[Stop.DEADLINE],
+        finished_at=at[Stop.FINISHED],
+    )
+
+    assert pool.arrived == []
+    assert (ran.requests, ran.summary.stopped_by, ran.summary.slots_started) == ((), stop, 0)
+    assert ran.record.conversations_started == 0 < ran.record.conversations_planned
+    assert not ran.valid
+
+
+def test_a_request_that_cannot_be_recorded_ends_the_cell_instead_of_leaving_it_out() -> None:
+    cell = cell_of(SCREEN, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 4)
+    pool = Pool(Clock(), KEYS)
+    # The ordinals of requests end at 999,999: of the four requests of the start, three have none.
+    with pytest.raises(ContractError):
+        run(SCREEN, cell, pool=pool, first_request=999_999)
+
+    # The cell stopped when their answers ended: it sent nothing after them and left no stream open.
+    assert [arrived.at_ms for arrived in pool.arrived] == [START] * 4
+    assert pool.clock.at == START + ANSWER_MS
+    assert not any(pool.open.values())
+
+
+def test_the_requests_have_the_sizes_the_plan_froze_and_a_cell_sent_with_others_does_not_count() -> None:
+    # The course suite's replay is spike S5's.
+    assert replay.sizes_of(plan.expand(COURSE, Profile.SCREEN, 3)) == traces.S5
+
+    # A plan that freezes another output is sent with that one: it is in the plan's digest.
+    other = plan.expand(suite(turn_output_tokens=73), Profile.SCREEN, 3)
+    assert other.workload.protocol_digest != SCREEN.workload.protocol_digest
+    cell = cell_of(other, Phase.CAPACITY_SWEEP, Shape.HANDS_ON, 4)
+    ran, pool = run(other, cell)
+    assert {arrived.body["max_tokens"] for arrived in pool.arrived} == {73}
+    assert (ran.summary.sizes_planned, ran.valid) == (True, True)
+
+    # Sent with sizes the plan does not hold, as a rehearsal is, the cell is kept and does not count.
+    ran, pool = run(SCREEN, cell, sizes=replay.sizes_of(other))
+    assert {arrived.body["max_tokens"] for arrived in pool.arrived} == {73}
+    assert (ran.summary.sizes_planned, ran.record.invalid_flags) == (False, (InvalidFlag.MISSING_EVIDENCE,))
+    assert not ran.valid
+
+    # The conversations are Messages requests: a suite that replays on another route is refused.
+    idle = Pool(Clock(), KEYS)
+    with pytest.raises(replay.ReplayError) as refused:
+        run(plan.expand(suite(route="responses"), Profile.SCREEN, 3), cell, pool=idle)
+    assert refused.value.reason is Refusal.UNSUPPORTED_ROUTE
+    assert idle.arrived == []
+
+
+def test_a_gateway_is_reached_over_https_only() -> None:
+    # A key is not sent in the clear: no gateway is made for such an address.
+    for address in ("http://gateway.example.com", "ftp://gateway.example.com", ""):
+        with pytest.raises(ValueError, match="https"):
+            replay.Gateway(address, "coursework", Clock())
+    # The gateway stack's output is a host name.
+    assert replay.Gateway("gateway.example.com", "coursework", Clock()).endpoint == "https://gateway.example.com"
