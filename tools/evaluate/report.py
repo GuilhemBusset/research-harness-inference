@@ -46,10 +46,10 @@ under the run's tokenizer. And the recommendation.
 **The recommendation** is made for each shape at the class size, from runs that were measured:
 the run's observed host count is a candidate only when every scheduled repetition passed capacity
 (`ShapeVerdict.PASS`) sent from the class's seats (each student of the class, each with the
-shape's conversations side by side: `_seats_shown`), every required family/harness cell of the
+shape's conversations side by side, all the seats at once: `_seats_shown`), every required family/harness cell of the
 shape meets the absolute floor at class load, the paired relative check at class load passes, the
 class load was there (each live cell read at class load has every counted send as a row, a driver
-within its lag tolerance, a request of each trial, the live task alone on the first seat, and on
+within its lag tolerance, a request of each trial, one trial at a time, the live task alone on the first seat, and on
 every other seat its shape's conversations side by side through each trial, never idle longer
 than its schedule pauses, a trial that ends during such a pause included: `load_evidence`), and
 that host count served (requested and observed in the manifest, and the hosts each attempt the
@@ -69,7 +69,7 @@ requested. Observed settings that differ with their lever not declared changed a
 undeclared, setting by setting: a declared host count does not cover another instance type
 observed. A paired decision is withheld (inconclusive, `LOAD_UNSHOWN`) unless both runs show the
 load it is read at, the reference as much as the candidate: at low load, each live task alone,
-with nothing sent beside it.
+one trial after another, with nothing sent beside it.
 Two runs compare only when they are one planned workload: a changed floor (`objectives`) or sample
 budget (`sampling`) is refused by name, any other change of the workload as incompatible. Each
 lever that changed must be shown to have served, in both runs: the hosts and the release by the
@@ -624,7 +624,8 @@ def _seats_shown(plan: planning.Plan, planned: planning.PlannedCell, attempt: At
     """Whether a replayed cell ran as the plan's seats (`replay.seat_of`): its replay from each of
     the cell's students, no conversation shared by two, and each student's conversations side by
     side as many at once as the slots the plan gives that seat, one in hands-on, two in
-    several-agents. A repetition one student sent all of is no measure of a class."""
+    several-agents. And the seats ran together (`_seats_together`). A repetition one student sent
+    all of, or its students one after another, is no measure of a class."""
     if attempt is None:
         return False
     per = plan.spec.conversations[planned.identity.shape]
@@ -638,10 +639,34 @@ def _seats_shown(plan: planning.Plan, planned: planning.PlannedCell, attempt: At
     seats = range(planned.identities)
     if {student for student, _conversation in spans} != set(seats):
         return False
-    return all(
-        _peak(span for (student, _conversation), span in spans.items() if student == seat)
-        == sum(slot // per == seat for slot in range(planned.replay_slots))
+    slots = {seat: sum(slot // per == seat for slot in range(planned.replay_slots)) for seat in seats}
+    side_by_side = all(
+        _peak(span for (student, _conversation), span in spans.items() if student == seat) == slots[seat]
         for seat in seats
+    )
+    return side_by_side and _seats_together(plan, attempt, background, slots)
+
+
+def _seats_together(
+    plan: planning.Plan, attempt: Attempt, background: Sequence[RequestRecord], slots: Mapping[int, int]
+) -> bool:
+    """Whether every seat of a replayed cell held its conversations at once through the steady
+    samples: the plan starts every slot together, so from the first send of the cell, give or take
+    as long as a schedule may pause (`_longest_pause_ms`), until the last steady send, each seat
+    holds its slots side by side (`_background_gap`). Seats that each ran in turn never were a class
+    at once, however each ran alone."""
+    record = attempt.record
+    steady = [one.sent_ms for one in background if record.started_ms <= one.sent_ms <= record.admissions_ended_ms]
+    if not steady:
+        return False
+    pause = _longest_pause_ms(plan)
+    begin = min(one.eligible_ms for one in background) + pause
+    window = [(begin, max(steady))]
+    if begin >= window[0][1]:
+        return False
+    return all(
+        _background_gap([one for one in background if one.student == seat], window, pause, slots[seat]) is None
+        for seat in slots
     )
 
 
@@ -947,6 +972,7 @@ class LoadGap(StrEnum):
     BACKGROUND_SHORT = "background_short"
     BACKGROUND_IDLE = "background_idle"
     BACKGROUND_SERIAL = "background_serial"
+    TRIALS_OVERLAP = "trials_overlap"
     NOT_ALONE = "not_alone"
 
 
@@ -977,7 +1003,7 @@ def _merged(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
 
 
 def _background_gap(
-    background: Sequence[RequestRecord], windows: Sequence[tuple[int, int]], pause: float, conversations: int
+    background: Sequence[RequestRecord], windows: Sequence[tuple[float, float]], pause: float, conversations: int
 ) -> LoadGap | None:
     """Whether a seat's replay kept up its shape's load through each trial: `conversations` of the
     seat side by side at every instant of every trial's window. A conversation holds its place from
@@ -1010,6 +1036,19 @@ def _background_gap(
     return first_gap
 
 
+def _trials_overlap(trials: Sequence[TrialRecord], live: Sequence[RequestRecord]) -> bool:
+    """Whether two trials of a live cell ran at once: the seat runs one task at a time, so a trial
+    begins once the one before it, each run of it and every request of it, has ended. The requests
+    of one trial may run side by side."""
+    spans: dict[int, tuple[int, int]] = {}
+    edges = [(trial.trial, trial.started_ms, trial.ended_ms) for trial in trials]
+    edges += [(one.trial, one.sent_ms, one.ended_ms) for one in live if one.trial is not None]
+    for trial, start, end in edges:
+        before = spans.get(trial, (start, end))
+        spans[trial] = (min(before[0], start), max(before[1], end))
+    return any(after[0] < before[1] for before, after in pairwise(sorted(spans.values())))
+
+
 def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt | None) -> LoadGap | None:
     """What a live cell lacks to show the load it is read at, or `None`. Every send the scheduler
     counted must be a row (`capacity`'s reconciliation), the driver must have kept to its schedule
@@ -1028,6 +1067,8 @@ def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt 
     live = [request for request in attempt.requests if request.traffic is Traffic.LIVE]
     if any(trial.trial not in {request.trial for request in live} for trial in trials):
         return LoadGap.TRIAL_UNSENT
+    if _trials_overlap(attempt.trials, live):
+        return LoadGap.TRIALS_OVERLAP
     if planned.identity.phase is contracts.Phase.LIVE_LOW_LOAD:
         alone = len(live) == len(attempt.requests) and all(one.student == 0 for one in (*attempt.trials, *live))
         return None if alone else LoadGap.NOT_ALONE

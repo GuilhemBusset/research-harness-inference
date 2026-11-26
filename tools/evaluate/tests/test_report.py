@@ -701,6 +701,58 @@ def test_class_capacity_is_measured_from_each_seat_of_the_class(reference: Path,
     assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["capacity"] == "unknown"
 
 
+def test_seats_measured_one_after_another_are_no_class(reference: Path, tmp_path: Path):
+    def staggered(cell: plan.PlannedCell, rows: tuple[RequestRecord, ...]) -> Sequence[RequestRecord]:
+        if Role.CLASS_FLOOR not in cell.roles or cell.identity.shape.value != "hands_on":
+            return rows
+        start = min(row.eligible_ms for row in rows)
+        # Each student's whole replay before the next student's first send.
+        return tuple(shift(row, start + row.student * 420_000 + row.turn * 8000 - row.eligible_ms) for row in rows)
+
+    source = build(tmp_path / "source", replace(CANDIDATE, hands_on_ttft_ms=500))
+    assert compared(reference, source)["recommendation"]["shapes"]["hands_on"]["host_count"] == 2
+    candidate = requests_changed(source, tmp_path / "candidate", staggered)
+    assert json.loads(scorecard(candidate).summary)["capacity"]["hands_on"]["seats_shown"] == [False] * 3
+    hands_on = compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]
+    assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["capacity"] == "unknown"
+
+
+@pytest.mark.parametrize(("phase", "load"), [(Phase.LIVE_LOW_LOAD, "low_load"), (Phase.LIVE_CLASS_LOAD, "class_load")])
+def test_two_live_trials_at_once_on_the_live_seat_do_not_show_the_load(tmp_path: Path, phase: Phase, load: str):
+    failure = ("low_load", "optimization.t01.i01", "claude_code", 2)
+    reference = build(tmp_path / "reference", replace(REFERENCE, fails=REFERENCE.fails | {failure}))
+
+    def hands_on(comparison: dict) -> dict:
+        return next(one for one in comparison["decisions"] if (one["load"], one["shape"]) == (load, "hands_on"))
+
+    assert hands_on(compared(reference, FIXTURE))["outcome"] == "pass"
+    bundle = report.load(FIXTURE)
+    evidence = []
+    for attempt in bundle.attempts:
+        rows, trials = attempt.requests, attempt.trials
+        if bundle.plan.cells[attempt.record.cell].identity.phase is phase:
+            # The second trial, and its requests, started with the first.
+            first, second, *rest = trials
+            delta = first.started_ms - second.started_ms
+            moved = replace(second, started_ms=first.started_ms, ended_ms=second.ended_ms + delta)
+            trials = (first, moved, *rest)
+            rows = tuple(shift(row, delta) if row.trial == second.trial else row for row in rows)
+        point = attempt.checkpoint
+        observations = (*rows, *trials, *attempt.samples)
+        evidence.append(
+            report.Evidence(attempt.record, observations, point.tally, point.hosts, point.requested_launch_fingerprint)
+        )
+    candidate = tmp_path / "candidate"
+    report.write_evidence(candidate, bundle.manifest, evidence)
+    comparison = compared(reference, candidate)
+    assert (hands_on(comparison)["outcome"], hands_on(comparison)["reason"]) == ("inconclusive", report.LOAD_UNSHOWN)
+    gaps = {row["gap"] for row in json.loads(scorecard(candidate).summary)["class_load_evidence"]["hands_on"]}
+    # The recommendation is read at class load: a low-load pair withheld leaves it standing.
+    class_load = load == "class_load"
+    assert ("trials_overlap" in gaps) is class_load
+    assert comparison["recommendation"]["shapes"]["hands_on"]["host_count"] == (None if class_load else 2)
+
+
 def test_several_agents_class_load_needs_each_seats_conversations_side_by_side(reference: Path, tmp_path: Path):
     passing = build(tmp_path / "passing", replace(CANDIDATE, slow_several_agents_repetition=None))
     assert compared(reference, passing)["recommendation"]["shapes"]["several_agents"]["host_count"] == 2
