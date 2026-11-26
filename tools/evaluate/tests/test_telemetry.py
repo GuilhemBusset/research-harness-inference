@@ -427,6 +427,26 @@ def test_a_counter_that_restarted_is_counted_across_the_restart() -> None:
     assert (read.reasons, read.flags) == ((), ())
 
 
+def test_a_counter_far_into_its_engines_life_still_measures_the_windows_increase() -> None:
+    workspace = clean()
+    # The engine has counted 11 billion input tokens before the window: more than any count of a
+    # window may be, and no reason to doubt the 30 000 it adds.
+    workspace.find(INPUT, instance=HOST_A)[0].value = tokens(100, base=11_000_000_000)
+    read = reading(workspace)
+    measured = read.hosts[0].counters[HostMetric.INPUT_TOKENS_TOTAL]
+    assert (measured.increase, measured.coverage) == (30_000, Coverage.COMPLETE)
+    assert read.flags == ()
+    assert telemetry.preflight(workspace, POOL, VLLM, at=START).missing == ()
+
+    # An increase beyond that bound is no count of a window: not kept, and not complete evidence.
+    workspace.find(INPUT, instance=HOST_A)[0].value = tokens(100_000_000)
+    read = reading(workspace)
+    measured = read.hosts[0].counters[HostMetric.INPUT_TOKENS_TOTAL]
+    assert (measured.increase, measured.coverage) == (None, Coverage.INCOMPLETE)
+    assert read.pool.counters[HostMetric.INPUT_TOKENS_TOTAL] == 60_000
+    assert read.flags == (InvalidFlag.MISSING_EVIDENCE,)
+
+
 def test_a_host_with_no_preemption_series_reads_missing_and_the_cell_lacks_evidence() -> None:
     workspace = clean()
     workspace.drop(PREEMPTIONS, instance=HOST_B)
@@ -656,6 +676,33 @@ def test_an_identity_first_seen_after_the_gateways_closing_scrape_is_not_the_win
     assert (read.traffic.external_requests, read.reasons) == (1, (Reason.EXTERNAL_TRAFFIC,))
 
 
+def test_a_request_first_seen_after_the_closing_scrape_does_not_reconcile_the_window() -> None:
+    def missed_the_drain(after: int) -> telemetry.Reading:
+        # The task is scraped on the drain. The first identity is in every scrape but that one:
+        # it is done 30 seconds before the drain, and sends `after` requests two seconds after
+        # it, which its next sample is the first to show.
+        workspace = clean()
+        times = tuple(START + offset for offset in range(-30, 331, 15))
+        first, second = workspace.find(GATEWAY)
+        second.times = times
+        first.times = tuple(at for at in times if at != END)
+        first.value = lambda at: (
+            3 + int((24 - after) * within(at, START, END - 30) / (END - 30 - START)) + after * (at >= END + 2)
+        )
+        return reading(workspace)
+
+    # 39 requests of the window and one after it: the later sample says 40, and of when is unknown.
+    read = missed_the_drain(1)
+    assert not read.traffic.reconciled
+    assert read.traffic.coverage is Coverage.INCOMPLETE
+    assert Reason.GATEWAY_COVERAGE_INCOMPLETE in read.reasons
+    assert InvalidFlag.MISSING_EVIDENCE in read.flags
+
+    # A later sample that says what the series said last shows nothing happened in between.
+    read = missed_the_drain(0)
+    assert (read.traffic.cohort_requests, read.traffic.reconciled, read.reasons) == (40, True, ())
+
+
 def test_gateway_samples_that_are_no_numbers_are_missing_evidence_and_not_counted() -> None:
     workspace = clean()
     workspace.find(GATEWAY, alias=COHORT[0])[0].value = lambda _: float("inf")
@@ -821,6 +868,68 @@ def test_the_warm_up_of_an_engine_replaced_before_the_window_does_not_warm_its_r
         # The window itself had one engine, of the requested fingerprint, throughout.
         assert read.unverified == ()
         assert first.counters[HostMetric.OUTPUT_TOKENS_TOTAL].increase == 3_000
+
+
+def test_an_agent_that_names_its_engine_during_the_warm_up_names_no_engine_before() -> None:
+    def named_from_850(work: tuple[float, float]) -> telemetry.Host:
+        # The agent of the first host says no fingerprint to 850, and the requested one from then
+        # on. Its engine counts 300 tokens between the two times of `work`, with no restart.
+        workspace = clean()
+        workspace.find(LAUNCH, instance=HOST_A)[0].times = tuple(at for at in SCRAPES if at >= 850)
+        workspace.add(
+            LAUNCH,
+            lambda _: 1,
+            tuple(at for at in SCRAPES if at < 850),
+            instance=HOST_A,
+            settings_fingerprint="unavailable",
+        )
+        workspace.find(OUTPUT, instance=HOST_A)[0].value = lambda at: (
+            50 + 300 * within(at, *work) / (work[1] - work[0]) + 10 * within(at, START, END)
+        )
+        read = reading(workspace)
+        assert read.unverified == ()
+        return read.hosts[0]
+
+    host = named_from_850((870.0, 930.0))
+    assert (host.warm_up_output_tokens, host.engine_replaced, host.warmed) == (300, False, True)
+
+    # Work done before the agent named the engine is kept, and is not known to be that engine's.
+    host = named_from_850((822.0, 836.0))
+    assert (host.warm_up_output_tokens, host.engine_replaced, host.warmed) == (300, False, False)
+
+
+def test_work_the_warm_up_and_the_window_both_count_leaves_the_window_unqualified() -> None:
+    # The warm-up runs to the window's start: the scrapes at 988 and 1003 bound the end of the
+    # one and the start of the other. What a busy pool adds in the window's first three seconds
+    # is in that rise.
+    driver = replace(DRIVER, warm_up=Window(WARM_UP.started, START))
+    assert reading(clean(), driver=driver).reasons == (Reason.WARM_UP_OVERLAPS,)
+    # A warm-up that was over by the scrape at 988 shares no rise with the window.
+    assert reading(clean(), driver=replace(DRIVER, warm_up=Window(WARM_UP.started, 988.0))).reasons == ()
+
+    # Engines that count nothing in the window: no counter rises between the two scrapes.
+    workspace = clean()
+    for counter in (OUTPUT, INPUT, CACHED, BY_SOURCE):
+        for one in workspace.find(counter):
+            one.value = tokens(0)
+    read = reading(workspace, driver=driver)
+    assert (read.reasons, [host.warm_up_overlaps for host in read.hosts]) == ((), [False, False])
+
+    # The first host ends its warm-up with 100 tokens at 995, and generates nothing in the window.
+    workspace.find(OUTPUT, instance=HOST_A)[0].value = lambda at: tokens(0)(at) + 100 * (at >= 995)
+    read = reading(workspace, driver=driver)
+    first, second = read.hosts
+    # The window's increase holds them, and is marked as holding what may be the warm-up's.
+    assert first.counters[HostMetric.OUTPUT_TOKENS_TOTAL].increase == 100
+    assert (first.warm_up_overlaps, second.warm_up_overlaps) == (True, False)
+    assert read.reasons == (Reason.WARM_UP_OVERLAPS,)
+    assert read.flags == (InvalidFlag.MISSING_EVIDENCE,)
+    assert (first.warm_up_output_tokens, first.warmed) == (700, True)
+
+    # Tokens the window's scrapes count too are not shown to be the warm-up's: they warm nothing.
+    workspace.find(OUTPUT, instance=HOST_A)[0].value = lambda at: tokens(0, warm=0)(at) + 100 * (at >= 995)
+    first = reading(workspace, driver=driver).hosts[0]
+    assert (first.warm_up_output_tokens, first.warm_up_overlaps, first.warmed) == (100, True, False)
 
 
 def test_a_warm_up_is_shown_by_a_rise_its_scrapes_cover() -> None:

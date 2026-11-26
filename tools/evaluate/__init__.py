@@ -32,4 +32,10 @@ and what each ran, their engines' counters through the drain, and the gateway's 
 which treatments that evidence leaves unverified and why a window cannot qualify. It reads with
 spike S5's readers, by the names the services export, so it needs `spikes`, the services and
 `dashboards` on the path.
+
+`evaluate.replay` drives one cell of a plan on the student gateway: each slot's conversations as
+their seat's canary student, independently of the other seats, for the cell's admissions and a
+bounded drain, with a record of every request and of what the driver planned and observed. It
+sends the traces of `evaluate.traces` and reads their streams with `evaluate.streams`, so it needs
+the same paths.
 """
