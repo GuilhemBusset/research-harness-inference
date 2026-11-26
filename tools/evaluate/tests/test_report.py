@@ -824,6 +824,32 @@ def test_a_counted_retry_needs_requests_of_its_own(reference: Path, tmp_path: Pa
     assert comparison["recommendation"]["shapes"]["hands_on"]["host_count"] is None
 
 
+@pytest.mark.parametrize(("sent_before", "gap"), [(None, "trial_unsent"), (1, "sent_outside_run")])
+def test_requests_sent_before_their_trial_started_show_no_load(
+    reference: Path, tmp_path: Path, sent_before: int | None, gap: str
+):
+    """The first trial recorded as starting just after its first request (`sent_before`), or after
+    all of them had ended (`None`) with the replay kept from that start on: what was sent before
+    the trial started is no evidence of the load it was graded under."""
+
+    def started_late(live: Live) -> Live:
+        rows, trials, record = live
+        first, *rest = trials
+        own = [row for row in rows if row.trial == first.trial]
+        if sent_before is not None:
+            start = sorted(row.sent_ms for row in own)[sent_before - 1] + 1
+            return rows, (replace(first, started_ms=start), *rest), record
+        ended = max(row.ended_ms for row in own)
+        start = min(row.sent_ms for row in rows if row.traffic is Traffic.BACKGROUND and row.sent_ms > ended)
+        kept = tuple(row for row in rows if row.traffic is Traffic.LIVE or row.sent_ms >= start)
+        return kept, (replace(first, started_ms=start), *rest), record
+
+    candidate = class_load_changed(FIXTURE, tmp_path / "candidate", started_late)
+    gaps = {row["gap"] for row in json.loads(scorecard(candidate).summary)["class_load_evidence"]["hands_on"]}
+    assert gap in gaps
+    assert compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]["host_count"] is None
+
+
 @pytest.mark.parametrize(("phase", "load"), [(Phase.LIVE_LOW_LOAD, "low_load"), (Phase.LIVE_CLASS_LOAD, "class_load")])
 def test_two_live_trials_at_once_on_the_live_seat_do_not_show_the_load(tmp_path: Path, phase: Phase, load: str):
     failure = ("low_load", "optimization.t01.i01", "claude_code", 2)

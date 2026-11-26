@@ -985,6 +985,7 @@ class LoadGap(StrEnum):
     SENDS_UNACCOUNTED = "sends_unaccounted"
     DRIVER_LAG = "driver_lag"
     TRIAL_UNSENT = "trial_unsent"
+    SENT_OUTSIDE_RUN = "sent_outside_run"
     SEATS_UNPLANNED = "seats_unplanned"
     BACKGROUND_MISSING = "background_missing"
     BACKGROUND_SHORT = "background_short"
@@ -1063,12 +1064,13 @@ def _runs_by_trial(trials: Sequence[TrialRecord]) -> dict[int, list[TrialRecord]
 
 
 def _run_of(runs: Mapping[int, Sequence[TrialRecord]], request: RequestRecord) -> TrialRecord | None:
-    """The run a live request belongs to: the last run of its trial that had started when it was
-    sent, or the first run when it was sent before any. `None` for a request of no recorded run."""
+    """The run a live request belongs to: the last run of its trial that was running when it was
+    sent. `None` for a request of no recorded run, or one sent while no run of its trial was
+    running: before the first started, or between one run's end and the next one's start."""
     if request.trial is None or request.trial not in runs:
         return None
-    started = [run for run in runs[request.trial] if run.started_ms <= request.sent_ms]
-    return started[-1] if started else runs[request.trial][0]
+    running = [run for run in runs[request.trial] if run.started_ms <= request.sent_ms <= run.ended_ms]
+    return running[-1] if running else None
 
 
 def _trials_overlap(trials: Sequence[TrialRecord], live: Sequence[RequestRecord]) -> bool:
@@ -1113,6 +1115,10 @@ def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt 
     sent = {run.execution for one in live if (run := _run_of(runs, one)) is not None}
     if any(trial.execution not in sent for trial in trials):
         return LoadGap.TRIAL_UNSENT
+    # A request of a recorded trial sent while none of its runs was running is no evidence of the
+    # load any run was graded under: the records disagree, and the cell shows no load.
+    if any(one.trial in runs and _run_of(runs, one) is None for one in live):
+        return LoadGap.SENT_OUTSIDE_RUN
     if _trials_overlap(attempt.trials, live):
         return LoadGap.TRIALS_OVERLAP
     if planned.identity.phase is contracts.Phase.LIVE_LOW_LOAD:
