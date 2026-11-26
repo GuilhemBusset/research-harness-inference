@@ -5,11 +5,18 @@ the key, so a settings file that ends up in a commit gives nothing away (system 
 6.4, step 5).
 
 **Claude Code**, in its user settings (`settings.json` in `~/.claude`, or in the folder
-`CLAUDE_CONFIG_DIR` names), two members:
+`CLAUDE_CONFIG_DIR` names), three members:
 
 - `apiKeyHelper`: `rhi token`;
 - `env.ANTHROPIC_BASE_URL`: the endpoint. Claude Code sends `claude-` model names, which the
   gateway maps to the default pool, so no model is named here.
+- `env.CLAUDE_CODE_AUTO_COMPACT_WINDOW`: `AUTO_COMPACT_WINDOW`, 200,000 tokens. Claude Code
+  recognises its `claude-` names and, behind a custom base URL, gives a model that has one its 1M
+  window, so it would compact a session only near 967,000 tokens and the engine would refuse the
+  turn first. At 200,000, with the 32,000 tokens of output Claude Code asks for, a session stays
+  inside the 262,144 the coursework pool serves (system design, section 4.2). This is the setting
+  for every model; `CLAUDE_CODE_MAX_CONTEXT_TOKENS` applies to a recognised name only with
+  compaction off. The value is a plain number: a `k` suffix needs Claude Code 2.1.304 or later.
 
 **Codex**, in the profile `rhi`: the file `rhi.config.toml` in `~/.codex`, or in the folder
 `CODEX_HOME` names. `codex --profile rhi` reads it over `config.toml`, which a login never touches.
@@ -50,6 +57,8 @@ from typing import Any
 
 HELPER = ("rhi", "token")
 NAME = "rhi"
+# How full, in tokens, Claude Code lets a session's context get before it compacts it.
+AUTO_COMPACT_WINDOW = 200_000
 
 type Table = tuple[str, ...]
 
@@ -115,7 +124,8 @@ def configure_claude_code(endpoint: str) -> Path | None:
     environment = settings.get("env", {}) if isinstance(settings, dict) else None
     if not isinstance(environment, dict):
         raise HarnessError(f"{path} is not the JSON object Claude Code reads: it is left as it is.")
-    wanted = {**settings, "apiKeyHelper": " ".join(HELPER), "env": {**environment, "ANTHROPIC_BASE_URL": endpoint}}
+    owned = {"ANTHROPIC_BASE_URL": endpoint, "CLAUDE_CODE_AUTO_COMPACT_WINDOW": str(AUTO_COMPACT_WINDOW)}
+    wanted = {**settings, "apiKeyHelper": " ".join(HELPER), "env": {**environment, **owned}}
     if wanted == settings:
         return None
     _write(path, json.dumps(wanted, indent=2, ensure_ascii=False) + "\n")

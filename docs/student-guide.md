@@ -59,6 +59,12 @@ Your key expires at the end of the course.
 it sets the endpoint's address (`ANTHROPIC_BASE_URL`) and a key helper (`apiKeyHelper`) that runs
 `rhi token` whenever Claude Code needs the key. The key itself is not written into the file.
 
+It also sets the auto-compact window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`) to 200,000 tokens. Claude
+Code takes the endpoint's model for one of its own, with a window of a million tokens, and would
+only summarise ("compact") a long conversation near that size. The coursework model reads a
+little over 262,000 tokens, so a long session would end in an error first. With the setting,
+Claude Code compacts the conversation at 200,000 tokens and goes on. Leave it as it is.
+
 After the login, start Claude Code as usual:
 
 ```sh

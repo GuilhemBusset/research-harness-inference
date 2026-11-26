@@ -9,8 +9,8 @@ limit and workaround is read later, from the first real run's data, by an issue 
 (section 12). It posts no measurement event; what it observed is its log.
 
 **The harness** is the Claude Code `spikes/harnesses.py` pins, with its default settings, as spike
-S3's first part runs it (`s3_harness_task`): what `rhi login` writes, its key from `rhi token`, no
-model, effort or window of its own, through a forwarder that sends every request to the gateway
+S3's first part runs it (`s3_harness_task`): what `rhi login` writes, the auto-compact window
+included, its key from `rhi token`, no model, effort or window of its own, through a forwarder that sends every request to the gateway
 with the pool's name as its model and records each exchange. It runs with no one to ask, so the
 tools of the steps may be used without asking (`ALLOWED_TOOLS`).
 

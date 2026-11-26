@@ -361,7 +361,8 @@ def test_a_client_s_home_is_what_rhi_login_writes(tmp_path: Path) -> None:
         assert token.stdout == f"{key}\n"
         if client is Client.CLAUDE_CODE:
             settings = json.loads((home / ".claude" / "settings.json").read_text())
-            assert settings == {"apiKeyHelper": "rhi token", "env": {"ANTHROPIC_BASE_URL": endpoint}}
+            window = {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "200000"}
+            assert settings == {"apiKeyHelper": "rhi token", "env": {"ANTHROPIC_BASE_URL": endpoint, **window}}
         elif client in (Client.CODEX_DEFAULT, Client.CODEX_PROFILE):
             profiles[client] = (home / ".codex" / "rhi.config.toml").read_text()
     # A login writes no stream timeout, so Codex with its profile is Codex with its default timer.
