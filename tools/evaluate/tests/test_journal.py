@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -126,6 +128,45 @@ def measure(journal: Journal, cell: int, *observations: Document, flags: tuple[I
     return attempt
 
 
+# A driver that forks while it owns a run. The child inherits the handle and the lock's descriptor,
+# and tries a transition, an observation and a checkpoint; the parent then goes on with the run.
+# It exits 0 when the child was refused all three as a process that does not own the run.
+FORKING_DRIVER = """
+import os, sys
+from pathlib import Path
+from evaluate.contracts import CellRecord, CellStatus, HostMetric, HostSample, Unit
+from evaluate.journal import Action, Journal, JournalError, Refusal
+
+fingerprint = "sha256:" + "a" * 64
+sample = HostSample(cell=1, host=0, at_ms=0, metric=HostMetric.GPU_UTILIZATION, unit=Unit.RATIO, value=0.5)
+record = CellRecord(
+    cell=1, started_ms=0, admissions_ended_ms=1, ended_ms=2, status=CellStatus.COMPLETE, invalid_flags=(),
+    conversations_planned=0, conversations_started=0, conversations_completed=0, conversations_abandoned=0,
+    hosts_observed=None, driver_lag_p95_ms=None,
+)
+journal = Journal.create(Path(sys.argv[1]))
+journal.adopt_issue(12)
+attempt = journal.start_cell(1, fingerprint, fingerprint).ordinal
+child = os.fork()
+if child == 0:
+    refusals = 0
+    for change in (
+        lambda: journal.intend(Action.BOOK, {"minutes": 45}),
+        lambda: journal.append(attempt, sample),
+        lambda: journal.checkpoint_cell(attempt, record),
+    ):
+        try:
+            change()
+        except JournalError as error:
+            refusals += error.reason is Refusal.RUN_ALREADY_OWNED
+    os._exit(refusals)
+refusals = os.waitstatus_to_exitcode(os.waitpid(child, 0)[1])
+journal.checkpoint_cell(attempt, record)
+journal.intend(Action.DELIVER, {"body": "Run finished."})
+sys.exit(0 if refusals == 3 else 1)
+"""
+
+
 class Died(Exception):
     """Stands for the driver's death inside a write."""
 
@@ -145,6 +186,36 @@ def dies_in(call: str) -> Generator[None]:
     with pytest.MonkeyPatch.context() as patch, pytest.raises(Died):
         patch.setattr(os, call, die)
         yield
+
+
+def identity(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_dev, status.st_ino
+
+
+@contextlib.contextmanager
+def flushes() -> Generator[dict[tuple[int, int], int]]:
+    """What the journal flushes to disk meanwhile: each file or directory (`identity`), with the
+    size it had at its last flush. A machine that stops keeps that much of a file for certain."""
+    real = os.fsync
+    flushed: dict[tuple[int, int], int] = {}
+
+    def flush(descriptor: int) -> None:
+        real(descriptor)
+        status = os.fstat(descriptor)
+        flushed[status.st_dev, status.st_ino] = status.st_size
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os, "fsync", flush)
+        yield flushed
+
+
+def stop(journal: Journal, attempt: int, *, checkpointed: bool) -> None:
+    """The end of a running attempt: its checkpoint, or its interruption."""
+    if checkpointed:
+        journal.checkpoint_cell(attempt, cell_record(journal.attempts[attempt].cell))
+    else:
+        journal.interrupt(attempt)
 
 
 def restart(journal: Journal, root: Path) -> Journal:
@@ -258,6 +329,63 @@ def test_an_observation_cut_inside_its_line_is_left_out_and_the_ones_before_it_s
     assert last.observations(replacement) == (request(1, 2),)
 
 
+@pytest.mark.parametrize("checkpointed", [True, False])
+def test_a_write_that_failed_after_the_state_was_put_in_place_ends_the_handle(
+    tmp_path: Path, checkpointed: bool
+) -> None:
+    journal = Journal.create(tmp_path)
+    attempt = journal.start_cell(1, WORKLOAD, SERVED).ordinal
+    journal.append(attempt, request(1, 0))
+    real = os.fsync
+
+    def fail_on_the_run_directory(descriptor: int) -> None:
+        if os.path.samestat(os.fstat(descriptor), journal.directory.stat()):
+            raise OSError
+        real(descriptor)
+
+    with pytest.MonkeyPatch.context() as patch, pytest.raises(OSError):
+        patch.setattr(os, "fsync", fail_on_the_run_directory)
+        stop(journal, attempt, checkpointed=checkpointed)
+
+    # The file says the attempt stopped and the handle cannot know it: it writes nothing more.
+    with refused(Refusal.JOURNAL_CLOSED):
+        journal.append(attempt, request(1, 1))
+    with refused(Refusal.JOURNAL_CLOSED):
+        journal.adopt_issue(ISSUE)
+
+    again = restart(journal, tmp_path)
+    assert again.attempts[attempt].status is (AttemptStatus.COMPLETE if checkpointed else AttemptStatus.INTERRUPTED)
+    assert again.observations(attempt) == (request(1, 0),)
+
+
+@pytest.mark.parametrize("checkpointed", [True, False])
+def test_an_attempt_stops_with_observations_that_reached_the_disk(tmp_path: Path, checkpointed: bool) -> None:
+    journal = Journal.create(tmp_path)
+    attempt = journal.start_cell(1, WORKLOAD, SERVED).ordinal
+    with flushes() as flushed:
+        journal.append(attempt, request(1, 0))
+        stop(journal, attempt, checkpointed=checkpointed)
+
+    # The machine stops: a file keeps what was flushed of it, and its directory the flushed entry.
+    (file,) = (journal.directory / "observations").iterdir()
+    os.truncate(file, flushed.get(identity(file), 0))
+    assert identity(file.parent) in flushed
+
+    again = restart(journal, tmp_path)
+    assert again.observations(attempt) == (request(1, 0),)
+
+
+def test_a_new_run_is_flushed_into_its_root_and_the_root_into_what_holds_it(tmp_path: Path) -> None:
+    root = tmp_path / "eval" / "runs"
+    with flushes() as flushed, Journal.create(root) as journal:
+        pass
+
+    # The state in the run's directory, the run in the root, and each directory made for the root.
+    for holder in (journal.directory, root, root.parent, tmp_path):
+        assert identity(holder) in flushed
+    assert journals.runs(root) == (journal.run_id,)
+
+
 # --- One owner, and a private place ----------------------------------------------------------
 
 
@@ -273,6 +401,19 @@ def test_a_run_has_one_owner_at_a_time(tmp_path: Path) -> None:
         owner.intend(Action.BOOK, PAYLOADS[Action.BOOK])
     with Journal.open(tmp_path, owner.run_id) as successor:
         assert successor.issue_number == ISSUE
+
+
+def test_a_forked_process_does_not_own_the_run_of_its_parent(tmp_path: Path) -> None:
+    # In an interpreter of its own: a fork of the test runner would copy its threads with it.
+    environment = {**os.environ, "PYTHONPATH": str(REPOSITORY / "tools")}
+    driver = subprocess.run([sys.executable, "-c", FORKING_DRIVER, str(tmp_path)], env=environment, check=False)
+    assert driver.returncode == 0  # the child was refused each change, as a second owner is
+
+    # The run is as the parent wrote it, and the parent could go on with it after the fork.
+    (run_id,) = journals.runs(tmp_path)
+    with Journal.open(tmp_path, run_id) as journal:
+        assert [intent.action for intent in journal.intents] == [Action.DELIVER]
+        assert (journal.attempts[0].status, journal.attempts[0].observed) == (AttemptStatus.COMPLETE, 0)
 
 
 def test_a_run_is_kept_private_under_the_ignored_output_directory(tmp_path: Path) -> None:
@@ -335,6 +476,26 @@ def test_the_issue_number_is_journaled_before_a_booking_or_a_delivery(tmp_path: 
     assert again.intents[booking.ordinal].result == RESULTS[Action.BOOK]  # the exact booking returned
 
 
+def test_what_an_intent_saved_does_not_change_with_what_it_gave(tmp_path: Path) -> None:
+    journal = Journal.create(tmp_path)
+    journal.adopt_issue(ISSUE)
+    lost = journal.intend(Action.BOOK, PAYLOADS[Action.BOOK])
+    journal.confirm(lost.ordinal, RESULTS[Action.BOOK])
+    delivery = journal.intend(Action.DELIVER, PAYLOADS[Action.DELIVER])
+
+    for intent in (journal.pending().intent, journal.intents[delivery.ordinal]):
+        assert intent is not None
+        intent.payload["body"] = "Another comment."
+    booked = journal.intents[lost.ordinal].result
+    assert booked is not None
+    booked["instances"] = 9
+    journal.intend(Action.BOOK, PAYLOADS[Action.BOOK])  # another transition writes the state again
+
+    again = restart(journal, tmp_path)
+    assert again.intents[delivery.ordinal].payload == PAYLOADS[Action.DELIVER]
+    assert again.intents[lost.ordinal].result == RESULTS[Action.BOOK]
+
+
 def test_a_checkpoint_holds_the_whole_cell_and_its_fingerprints(tmp_path: Path) -> None:
     journal = Journal.create(tmp_path)
     attempt = measure(journal, 1, request(1, 0), request(1, 1))
@@ -349,6 +510,8 @@ def test_a_checkpoint_holds_the_whole_cell_and_its_fingerprints(tmp_path: Path) 
     file.write_bytes(file.read_bytes().splitlines(keepends=True)[0])
     with refused(Refusal.OBSERVATIONS_DAMAGED):
         again.observations(attempt)
+    with refused(Refusal.OBSERVATIONS_DAMAGED):  # nor counted by a resume as a cell that is measured
+        again.resume([(1, 10)], 60, WORKLOAD, SERVED)
 
 
 # --- Resuming --------------------------------------------------------------------------------
@@ -357,6 +520,8 @@ def test_a_checkpoint_holds_the_whole_cell_and_its_fingerprints(tmp_path: Path) 
 def test_a_completed_failure_stays_in_the_denominator_when_another_cell_is_incomplete(tmp_path: Path) -> None:
     journal = Journal.create(tmp_path)
     measured = measure(journal, 1, trial(0, TrialOutcome.PASSED), trial(1, TrialOutcome.FAILED))
+    with refused(Refusal.CELL_ALREADY_MEASURED):  # a second attempt would put the first result aside
+        journal.start_cell(1, WORKLOAD, SERVED)
     journal.append(journal.start_cell(2, WORKLOAD, SERVED).ordinal, trial(2, TrialOutcome.PASSED))
 
     again = restart(journal, tmp_path)  # cell 2 was running: it is interrupted

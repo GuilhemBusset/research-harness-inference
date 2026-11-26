@@ -17,17 +17,22 @@ of `evaluate.contracts`.
 
 **One owner.** `Journal.create` and `Journal.open` take an exclusive lock on the run for the life
 of the handle. A second handle on the same run, from this process or another, is refused with
-`Refusal.RUN_ALREADY_OWNED`. The lock is the operating system's, so it ends with the process that
-held it: a driver that died leaves nothing to clear.
+`Refusal.RUN_ALREADY_OWNED`. So is the handle itself in a process forked from its owner: a child
+inherits the lock's descriptor, and the run is still its parent's. The lock is the operating
+system's, so it ends with the process that held it: a driver that died leaves nothing to clear.
 
 **Transitions.** The state changes one transition at a time. Each is written whole: to a file
-beside the journal, flushed to disk, then renamed over it. A reader finds the state before or the
-state after, never half of one, and a transition whose write failed has not happened, in the file
-or in the handle.
+beside the journal, flushed to disk, then renamed over it, and the directory flushed. A reader
+finds the state before or the state after, never half of one. A transition whose write failed is
+not in the handle, and may or may not be in the file (the rename can have happened before the
+failure). The handle does not guess: it gives the run up, every later change through it is
+refused (`Refusal.JOURNAL_CLOSED`), and the next `open` reads what the file holds.
 
 **The run ID.** `create` makes it, and saves it before anything else exists. It is the name of the
-directory and is repeated in the state. `runs` lists the runs of a root: a directory whose first
-write never landed is not one.
+directory and is repeated in the state. The directory's entry is flushed into the root, and the
+entry of each directory `create` had to make into the one above it, before the handle is
+returned: a run the driver acts for can be found again. `runs` lists the runs of a root: a
+directory whose first write never landed is not one.
 
 **Intents.** Before an action outside the driver (`Action`: the creation of the issue, a booking,
 the delivery of a comment), `intend` saves what is about to be sent, with a marker that names the
@@ -36,7 +41,8 @@ comment. An intent that is still pending after a restart is an action that may o
 happened: the driver looks for its marker in the actual record, then confirms it or rules it out
 (`rule_out`). One intent of each action is pending at most, so a retry targets the same record.
 A booking or a delivery is refused until the issue number is journaled. `adopt_issue` journals the
-number of an issue the operator named.
+number of an issue the operator named. What an intent saved does not change afterwards: its
+payload and its result are given as copies, and a change to one changes nothing in the journal.
 
 `pending` is the one thing a restart does first, a member of `Step` and the saved intent it is
 about: create the issue, reconcile its creation, reconcile a booking, reconcile a delivery, or go
@@ -50,9 +56,12 @@ attempt with its `CellRecord`, in one transition, after its observations are flu
 checkpoint holds their count and digest, so a cell is saved whole or not at all.
 
 An attempt that was running when its owner died is marked interrupted by the next `open`
-(`interrupt` does the same for a driver that gives a cell up). No attempt is ever deleted. A new
-attempt of a cell supersedes the earlier ones of that cell, and each of them then names it in
-`replaced_by`. The attempt of a cell that counts is its last.
+(`interrupt` does the same for a driver that gives a cell up), with the count and digest of the
+observations it has, flushed to disk first as for a checkpoint. No attempt is ever deleted. A new
+attempt of a cell supersedes the earlier ones of that cell, which were interrupted or
+checkpointed invalid, and each of them then names it in `replaced_by`. The attempt of a cell that
+counts is its last. A cell whose checkpoint is valid for qualification is measured: a new attempt
+of it is refused (`Refusal.CELL_ALREADY_MEASURED`), so that no retry puts a result aside.
 
 **A write cut inside a line.** A driver can die halfway through an append, which leaves a last
 line with no end. A record is one once its newline is written: `observations` gives the whole
@@ -68,6 +77,9 @@ whole, in order, as long as the next one fits in what is left of the window; the
 another booking. A reusable checkpoint under another workload or serving fingerprint is not
 reused and not silently measured again: the selection is refused
 (`Refusal.INCOMPATIBLE_REUSE`), and so is a new attempt in a run that holds such a checkpoint.
+The same holds for a reusable checkpoint whose file of observations no longer has the count and
+digest it was saved with: its evidence cannot be counted, and the selection is refused
+(`Refusal.OBSERVATIONS_DAMAGED`).
 
 A refusal is one member of `Refusal`, a fixed vocabulary. It needs the standard library only, and
 Linux (the lock is `flock`).
@@ -122,6 +134,7 @@ class Refusal(StrEnum):
     INTENT_NOT_PENDING = "intent-not-pending"
     ATTEMPT_RUNNING = "attempt-running"
     ATTEMPT_NOT_RUNNING = "attempt-not-running"
+    CELL_ALREADY_MEASURED = "cell-already-measured"
     NOT_AN_OBSERVATION = "not-an-observation"
     OBSERVATION_UNFINISHED = "observation-unfinished"
     OBSERVATIONS_DAMAGED = "observations-damaged"
@@ -180,14 +193,23 @@ _RECONCILE = {
 @dataclass(frozen=True)
 class Intent:
     """An action outside the driver, saved before it is taken. `payload` is what is about to be
-    sent and `result` what came back; both are private."""
+    sent and `result` what came back; both are private. The intent holds each as its JSON text
+    and gives a new copy at every read, so nothing a reader does to one reaches the journal."""
 
     ordinal: int
     action: Action
     marker: str
-    payload: dict[str, Any]
     status: IntentStatus
-    result: dict[str, Any] | None
+    payload_json: str
+    result_json: str | None
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return json.loads(self.payload_json)
+
+    @property
+    def result(self) -> dict[str, Any] | None:
+        return None if self.result_json is None else json.loads(self.result_json)
 
 
 @dataclass(frozen=True)
@@ -253,6 +275,18 @@ def _sync(path: Path) -> None:
         os.close(fd)
 
 
+def _make_directory(path: Path) -> None:
+    """Makes the directory and the missing ones above it, each flushed into the one that holds
+    it."""
+    missing: list[Path] = []
+    while not path.is_dir():
+        missing.append(path)
+        path = path.parent
+    for one in reversed(missing):
+        one.mkdir(exist_ok=True)
+        _sync(one.parent)
+
+
 def _write_whole(path: Path, text: str) -> None:
     """Replaces the file by one that holds `text`, so that a reader finds the old or the new."""
     beside = path.with_name(path.name + ".tmp")
@@ -315,7 +349,17 @@ def _encode(state: _State) -> str:
         "schema_version": SCHEMA_VERSION,
         "run_id": state.run_id,
         "issue_number": state.issue_number,
-        "intents": [dataclasses.asdict(intent) for intent in state.intents],
+        "intents": [
+            {
+                "ordinal": intent.ordinal,
+                "action": intent.action,
+                "marker": intent.marker,
+                "status": intent.status,
+                "payload": intent.payload,
+                "result": intent.result,
+            }
+            for intent in state.intents
+        ],
         "attempts": attempts,
     }
     return json.dumps(saved, indent=2, sort_keys=True) + "\n"
@@ -328,22 +372,23 @@ def _decode(text: str) -> _State:
             raise JournalError(Refusal.JOURNAL_UNREADABLE)
         intents: list[Intent] = []
         for item in saved["intents"]:
-            read: dict[str, Any] = {**item, "action": Action(item["action"]), "status": IntentStatus(item["status"])}
-            intents.append(Intent(**read))
+            result = None if item["result"] is None else _private(item["result"])
+            action, status = Action(item["action"]), IntentStatus(item["status"])
+            intents.append(Intent(item["ordinal"], action, item["marker"], status, _private(item["payload"]), result))
         attempts: list[Attempt] = []
         for item in saved["attempts"]:
             record = None if item["record"] is None else contracts.loads(json.dumps(item["record"]), CellRecord)
-            read = {**item, "status": AttemptStatus(item["status"]), "record": record}
+            read: dict[str, Any] = {**item, "status": AttemptStatus(item["status"]), "record": record}
             attempts.append(Attempt(**read))
         return _State(saved["run_id"], saved["issue_number"], tuple(intents), tuple(attempts))
-    except (KeyError, TypeError, ValueError) as error:  # a `ContractError` is a `ValueError`
+    except (KeyError, TypeError, ValueError, JournalError) as error:  # a `ContractError` is a `ValueError`
         raise JournalError(Refusal.JOURNAL_UNREADABLE) from error
 
 
-def _private(value: Mapping[str, object]) -> dict[str, Any]:
-    """A payload or a result as the file will give it back: a JSON object."""
+def _private(value: Mapping[str, object]) -> str:
+    """A payload or a result as the journal keeps it: the text of a JSON object."""
     try:
-        return json.loads(json.dumps(dict(value), allow_nan=False))
+        return json.dumps(dict(value), allow_nan=False, sort_keys=True)
     except (TypeError, ValueError) as error:
         raise JournalError(Refusal.INVALID_VALUE) from error
 
@@ -368,12 +413,14 @@ class Journal:
     def __init__(self, directory: Path, lock: int, state: _State) -> None:
         self.directory = directory
         self._lock: int | None = lock
+        # The process that took the lock. A forked one inherits the descriptor, not the run.
+        self._owner = os.getpid()
         self._state = state
 
     @classmethod
     def create(cls, root: Path = DEFAULT_ROOT) -> Self:
         """A new run under `root`: its ID is made here and saved before the handle is returned."""
-        root.mkdir(parents=True, exist_ok=True)
+        _make_directory(root)
         run_id = secrets.token_hex(8)
         directory = root / run_id
         # Never an existing directory: an ID is one run's.
@@ -382,6 +429,9 @@ class Journal:
         journal = cls(directory, _lock(directory), _State(run_id))
         try:
             journal._transition()
+            # The run is found by its entry in the root: that entry is on disk before the driver
+            # is given a run to act for.
+            _sync(root)
         except BaseException:
             journal.close()
             raise
@@ -448,12 +498,25 @@ class Journal:
                 return Pending(_RECONCILE[action], waiting[action])
         return Pending(Step.RUN_CELLS, None)
 
-    def _transition(self, **changes: Any) -> None:
-        """One change of the state, saved whole before the handle shows it."""
+    def _own(self) -> None:
+        """Refuses a handle that gave the run up, and one in a process forked from its owner."""
         if self._lock is None:
             raise JournalError(Refusal.JOURNAL_CLOSED)
+        if os.getpid() != self._owner:
+            raise JournalError(Refusal.RUN_ALREADY_OWNED)
+
+    def _transition(self, **changes: Any) -> None:
+        """One change of the state, saved whole before the handle shows it. A write that fails
+        may or may not have put the change in the file: the handle gives the run up, so that
+        nothing more is written from a state the file may no longer hold."""
+        self._own()
         after = dataclasses.replace(self._state, **changes)
-        _write_whole(self.directory / _STATE, _encode(after))
+        text = _encode(after)
+        try:
+            _write_whole(self.directory / _STATE, text)
+        except BaseException:
+            self.close()
+            raise
         self._state = after
 
     # --- Intents ---
@@ -468,16 +531,16 @@ class Journal:
             raise JournalError(Refusal.ISSUE_NOT_JOURNALED)
         ordinal = len(self.intents)
         marker = f"{MARKER_PREFIX}{self.run_id}/{ordinal}"
-        intent = Intent(ordinal, action, marker, _private(payload), IntentStatus.PENDING, None)
+        intent = Intent(ordinal, action, marker, IntentStatus.PENDING, _private(payload), None)
         self._transition(intents=(*self.intents, intent))
         return intent
 
-    def _settle(self, ordinal: int, status: IntentStatus, result: dict[str, Any] | None, **changes: Any) -> Intent:
+    def _settle(self, ordinal: int, status: IntentStatus, result: str | None, **changes: Any) -> Intent:
         if type(ordinal) is not int or not 0 <= ordinal < len(self.intents):
             raise JournalError(Refusal.INTENT_NOT_PENDING)
         if self.intents[ordinal].status is not IntentStatus.PENDING:
             raise JournalError(Refusal.INTENT_NOT_PENDING)
-        settled = dataclasses.replace(self.intents[ordinal], status=status, result=result)
+        settled = dataclasses.replace(self.intents[ordinal], status=status, result_json=result)
         intents = (*self.intents[:ordinal], settled, *self.intents[ordinal + 1 :])
         self._transition(intents=intents, **changes)
         return settled
@@ -488,7 +551,7 @@ class Journal:
         saved = _private(result)
         known = type(ordinal) is int and 0 <= ordinal < len(self.intents)
         if known and self.intents[ordinal].action is Action.CREATE_ISSUE:
-            number = _whole_number(saved.get("number"), 1, contracts.MAX_COUNT)
+            number = _whole_number(json.loads(saved).get("number"), 1, contracts.MAX_COUNT)
             return self._settle(ordinal, IntentStatus.CONFIRMED, saved, issue_number=number)
         return self._settle(ordinal, IntentStatus.CONFIRMED, saved)
 
@@ -517,25 +580,35 @@ class Journal:
     def _file(self, attempt: Attempt) -> Path:
         return self.directory / _OBSERVATIONS / f"cell-{attempt.cell}-attempt-{attempt.ordinal}.jsonl"
 
-    def _compatible(self, workload: str, served: str, *, besides: int | None = None) -> None:
+    def _compatible(self, workload: str, served: str) -> None:
         """Refuses fingerprints other than those of a checkpoint a resume would reuse."""
         for attempt in self.attempts:
-            if (
-                attempt.reusable
-                and attempt.cell != besides
-                and (attempt.workload, attempt.served) != (workload, served)
-            ):
+            if attempt.reusable and (attempt.workload, attempt.served) != (workload, served):
                 raise JournalError(Refusal.INCOMPATIBLE_REUSE)
+
+    def _sealed(self, attempt: Attempt) -> tuple[int, str, bool]:
+        """The count and the digest of the attempt's whole observations, once they are on disk
+        (the file flushed, and its entry in the directory), and whether an unfinished line
+        follows them. What a transition then saves about them, a restart finds in the file."""
+        file = self._file(attempt)
+        if file.exists():
+            _sync(file)
+            _sync(file.parent)
+        lines, unfinished = _whole_lines(file)
+        return (*_seal(lines), unfinished)
 
     def start_cell(self, cell: int, workload: str, served: str) -> Attempt:
         """Opens a new attempt of `cell` under the two fingerprints. Cells run one at a time. The
-        earlier attempts of the cell are kept, and name this one as their replacement."""
+        earlier attempts of the cell are kept, and name this one as their replacement. A cell
+        that has a checkpoint a resume reuses is not attempted again: what it measured stays."""
         _whole_number(cell, 0, _MAX_CELL)
         if not all(isinstance(one, str) and _FINGERPRINT.fullmatch(one) for one in (workload, served)):
             raise JournalError(Refusal.INVALID_VALUE)
         if any(attempt.status is AttemptStatus.RUNNING for attempt in self.attempts):
             raise JournalError(Refusal.ATTEMPT_RUNNING)
-        self._compatible(workload, served, besides=cell)
+        if any(attempt.cell == cell and attempt.reusable for attempt in self.attempts):
+            raise JournalError(Refusal.CELL_ALREADY_MEASURED)
+        self._compatible(workload, served)
         new = Attempt(len(self.attempts), cell, workload, served, AttemptStatus.RUNNING, None, None, None, None)
         earlier = (
             dataclasses.replace(one, replaced_by=new.ordinal) if one.cell == cell and one.replaced_by is None else one
@@ -552,9 +625,8 @@ class Journal:
 
     def append(self, ordinal: int, observation: Document) -> None:
         """Adds an observation to a running attempt, as one line at the end of its file."""
+        self._own()
         attempt = self._attempt(ordinal, running=True)
-        if self._lock is None:
-            raise JournalError(Refusal.JOURNAL_CLOSED)
         # A request and a host sample say their cell; a trial's is the plan's to say.
         if type(observation) not in OBSERVATIONS or getattr(observation, "cell", attempt.cell) != attempt.cell:
             raise JournalError(Refusal.NOT_AN_OBSERVATION)
@@ -562,23 +634,20 @@ class Journal:
 
     def checkpoint_cell(self, ordinal: int, record: CellRecord) -> Attempt:
         """Ends a running attempt with its cell record: the cell is saved whole, or not at all."""
+        self._own()
         attempt = self._attempt(ordinal, running=True)
         if type(record) is not CellRecord or record.cell != attempt.cell:
             raise JournalError(Refusal.INVALID_VALUE)
-        file = self._file(attempt)
-        if file.exists():
-            _sync(file)
-            _sync(file.parent)
-        lines, unfinished = _whole_lines(file)
+        observed, digest, unfinished = self._sealed(attempt)
         if unfinished:
             raise JournalError(Refusal.OBSERVATION_UNFINISHED)
-        observed, digest = _seal(lines)
         return self._stop(attempt, status=AttemptStatus.COMPLETE, record=record, observed=observed, digest=digest)
 
     def interrupt(self, ordinal: int) -> Attempt:
         """Ends a running attempt that will have no checkpoint. Its whole observations stay."""
+        self._own()
         attempt = self._attempt(ordinal, running=True)
-        observed, digest = _seal(_whole_lines(self._file(attempt))[0])
+        observed, digest, _unfinished = self._sealed(attempt)
         return self._stop(attempt, status=AttemptStatus.INTERRUPTED, observed=observed, digest=digest)
 
     def observations(self, ordinal: int) -> tuple[Document, ...]:
@@ -599,7 +668,8 @@ class Journal:
     def resume(self, cells: Sequence[tuple[int, int]], window_ms: int, workload: str, served: str) -> Resumption:
         """What a resume under these fingerprints keeps and runs. `cells` are the plan's, in
         order, each with the time a booking keeps for it; `window_ms` is the time the authorized
-        window has for cells. It changes nothing."""
+        window has for cells. It changes nothing. A checkpoint is reused with its evidence: one
+        whose observations are not the ones it was saved with refuses the selection."""
         self._compatible(workload, served)
         last = {attempt.cell: attempt for attempt in self.attempts}
         reused: list[Attempt] = []
@@ -609,6 +679,7 @@ class Journal:
         for cell, reserved_ms in cells:
             attempt = last.get(cell)
             if attempt is not None and attempt.reusable:
+                self.observations(attempt.ordinal)
                 reused.append(attempt)
             elif not deferred and reserved_ms <= left:
                 selected.append(cell)
