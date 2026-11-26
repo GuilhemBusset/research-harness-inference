@@ -50,4 +50,10 @@ the same paths.
 the run's ID, its issue number, what it was about to book or deliver, and each attempt of a cell
 with its observations, held by one owner at a time. A restart reads from it what to reconcile and
 which whole cells are left to run. It needs the standard library only.
+
+`evaluate.quality` reads the course quality of a run from its public records: successes and the
+absolute floor for each family, harness and load, the weighted rates of the shapes, and the time
+and host cost of a successful task. It also decides a candidate against a reference of the same
+workload, with a seeded paired bootstrap. It reads nothing but the records it is given, and needs
+`spikes` on the path for the percentile the spikes share.
 """
