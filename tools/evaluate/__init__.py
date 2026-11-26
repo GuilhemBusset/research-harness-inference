@@ -66,4 +66,10 @@ absolute floor for each family, harness and load, the weighted rates of the shap
 and host cost of a successful task. It also decides a candidate against a reference of the same
 workload, with a seeded paired bootstrap. It reads nothing but the records it is given, and needs
 `spikes` on the path for the percentile the spikes share.
+
+`evaluate.report` reads a saved evidence bundle (its manifest, the checkpoint and observations of
+each attempt of a cell) and regenerates its `summary.json`, `report.md` and digest offline, with
+`capacity` and `quality`: capacity, quality and the replay against the live tasks by shape, harness
+and load, the requested and observed settings, and the recommendation. It compares two bundles,
+diff first, and exports a validated, scanned bundle under `docs/evaluations/`.
 """

@@ -28,8 +28,9 @@ refused, like a key the format does not have, so "no usage reported" and "zero t
 different records. Each count of a usage is missing on its own: a stream cut before its last
 usage event keeps the input it reported and has no output count.
 
-**Documents.** `Manifest`, `Suite`, `GraderOutcome`, `RequestRecord`, `TrialRecord`, `HostSample`
-and `CellRecord` are the documents. Each is written with its `kind` and the `schema_version`, as
+**Documents.** `Manifest`, `Suite`, `GraderOutcome`, `RequestRecord`, `TrialRecord`, `HostSample`,
+`CellRecord` and `Checkpoint` (the end of an attempt of a cell, with what the scheduler and the
+telemetry give beside its records) are the documents. Each is written with its `kind` and the `schema_version`, as
 one line of canonical JSON (`dumps`): keys sorted, no white space, a measurement always as a
 decimal. `content_hash` is the SHA-256 of those bytes. `loads` and `parse` read a document back
 and hold it to the same rules as its constructor, and read only the version of this module.
@@ -984,11 +985,71 @@ class CellRecord(Document):
         return self.status is CellStatus.COMPLETE and not self.invalid_flags and accounted
 
 
+# The fingerprint of the arguments an engine was launched with, as the lifecycle agent says it
+# (`rhi_common.launch_settings.fingerprint`): 64 hexadecimal digits, and nothing of the arguments.
+Fingerprint = Annotated[str, _Text(r"[0-9a-f]{64}", "a launch fingerprint, 64 hexadecimal digits")]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SendTally(Record):
+    """The scheduler's own count of the sends of an attempt of a cell (`streams.Tally`), kept apart
+    from the request rows so that a row that was never written cannot leave both sides of the
+    count. Each failed send is counted by its cause."""
+
+    attempts: Count
+    unfinished: Count
+    completed: Count
+    truncated_stream: Count
+    transport_error: Count
+    http_refusal: Count
+    error_event: Count
+    retries: Count
+    usage_missing: Count
+    eligible: Count
+
+    def check(self) -> None:
+        ended = self.completed + self.truncated_stream + self.transport_error + self.http_refusal + self.error_event
+        _fail(ended + self.unfinished != self.attempts, self, "every send is completed, failed or unfinished")
+
+
+@dataclass(frozen=True, kw_only=True)
+class HostLaunch(Record):
+    """A host that served an attempt of a cell: how long it was in service in the window, and the
+    one launch fingerprint it said (`None` when it said none, or more than one), and whether it
+    said it through all of its time in service."""
+
+    host: Ordinal
+    in_service_ms: Millis
+    launch_fingerprint: Fingerprint | None
+    launch_whole_window: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class Checkpoint(Document):
+    """The end of one attempt of a cell, as the driver's journal saves it: the cell's record, the
+    count and the digest of the attempt's observations (its file of request, trial and host-sample
+    lines), and what the telemetry and the scheduler give beside them: the scheduler's tally of its
+    sends, each serving host, and the launch fingerprint the requested release starts an engine
+    with."""
+
+    KIND = "checkpoint"
+    attempt: Ordinal
+    record: CellRecord
+    observations: Count
+    observations_digest: Digest
+    tally: SendTally | None
+    hosts: tuple[HostLaunch, ...]
+    requested_launch_fingerprint: Fingerprint | None
+
+    def check(self) -> None:
+        _fail(not _in_order([host.host for host in self.hosts]), self, "hosts are listed once each, in order")
+
+
 # --- Writing and reading ---------------------------------------------------------------------
 
 KINDS: dict[str, type[Document]] = {
     document.KIND: document
-    for document in (Manifest, Suite, GraderOutcome, RequestRecord, TrialRecord, HostSample, CellRecord)
+    for document in (Manifest, Suite, GraderOutcome, RequestRecord, TrialRecord, HostSample, CellRecord, Checkpoint)
 }
 
 
