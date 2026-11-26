@@ -129,7 +129,7 @@ import boto3
 from rhi_common.engine_metrics import ENGINES, MOCK
 from rhi_lifecycle import launch, metrics, release
 from rhi_lifecycle.canary import Canary
-from rhi_lifecycle.host import Host
+from rhi_lifecycle.host import EngineContainer, Host
 from rhi_lifecycle.launch import Launch, Outcome
 from rhi_lifecycle.serving import Serving
 from rhi_lifecycle.termination import TERMINATED, Termination
@@ -246,6 +246,9 @@ class _Host(Host):
 
     def engine_started(self) -> bool:
         return self._host.engine_started()
+
+    def engine_container(self, timeout: float | None = None) -> EngineContainer | None:
+        return self._host.engine_container(timeout=timeout)
 
     def begin_launch(self) -> None:
         self._host.begin_launch()

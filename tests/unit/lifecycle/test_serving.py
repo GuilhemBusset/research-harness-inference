@@ -25,22 +25,24 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 from botocore.exceptions import ClientError
-from prometheus_client import CollectorRegistry
+from prometheus_client import CollectorRegistry, generate_latest
 from prometheus_client.parser import text_string_to_metric_families
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from rhi_common import launch_settings
 from rhi_common.engine_metrics import MOCK, VLLM, Quantity, metric_names
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import launch, metrics, serving
-from rhi_lifecycle.host import Host
+from rhi_lifecycle.host import EngineContainer, Host, HostError
 from rhi_lifecycle.release import Release, Settings
 from rhi_mock_engine.app import Settings as MockSettings
 from rhi_mock_engine.app import create_app
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Coroutine
+    from pathlib import Path
 
     from starlette.requests import Request
 
@@ -66,6 +68,11 @@ SETTINGS = Settings(
     heartbeat_table="rhi-heartbeats",
     secret_id="rhi/coursework/engine",
 )
+# The arguments of a vllm pool's engine that the tests of the launch metric vary: the model, in a
+# bucket named after the placeholder account, and the step budget.
+BUCKET = "rhi-models-123456789012-us-east-1"
+MODEL = f"s3://{BUCKET}/coursework/{REVISION}/"
+STEP_BUDGET = "--max-num-batched-tokens"
 CHAT = "/v1/chat/completions"
 RUNNING = metric_names(MOCK)[Quantity.RUNNING_REQUESTS]
 WAITING = metric_names(MOCK)[Quantity.WAITING_REQUESTS]
@@ -180,6 +187,16 @@ class World(Host):
         self.app: Starlette | None = self.mock(engine or MockSettings(secret=SECRET))
         self.restarted = MockSettings(secret=SECRET)
         self.restarts = 0
+        # What docker holds of the engine's container: the flags it was started with, None when
+        # it gives none, as under a unit that does not label its container. Giving `launched` is
+        # a start: docker has another container from then on, whatever its flags. `reachable`
+        # says whether docker can be asked. A restart of the unit starts a container with `flags`,
+        # the ones the boot program wrote, unless docker refuses the start.
+        self.containers = 0
+        self.launched = SERVED.engine_flags
+        self.flags: tuple[str, ...] = SERVED.engine_flags
+        self.reachable = True
+        self.start_refused = False
         self.secret_readable = True
         self.tables: list[str] = []
         self.items: list[dict[str, Any]] = []
@@ -251,8 +268,27 @@ class World(Host):
 
     def restart_engine(self) -> None:
         self.restarts += 1
+        if self.start_refused:
+            # The unit stopped the engine, and docker ran no container in its place.
+            self.app, self.launched = DEAD, None
+            return
         self.app = self.mock(self.restarted)
         self.healthy_at = self.clock.now + self.restart_loads_for
+        self.launched = self.flags
+
+    @property
+    def launched(self) -> tuple[str, ...] | None:
+        return self._launched
+
+    @launched.setter
+    def launched(self, flags: tuple[str, ...] | None) -> None:
+        self._launched = flags
+        self.containers += 1
+
+    def engine_container(self, timeout: float | None = None) -> EngineContainer | None:
+        if not self.reachable:
+            raise HostError("inspect")
+        return None if self.launched is None else EngineContainer(f"{self.containers:064x}", self.launched)
 
     # The engine, where the agent opens a URL. The agent calls from a worker thread.
 
@@ -411,6 +447,244 @@ def test_the_release_metric_is_served_and_says_what_the_heartbeat_says(revision:
     # Where the node's collector scrapes: the agent starts the endpoint with these.
     where = inspect.signature(metrics.serve).parameters
     assert (where["host"].default, where["port"].default, metrics.ROUTE) == ("127.0.0.1", 9110, "/metrics")
+
+
+def labels(registry: CollectorRegistry, metric: str) -> list[dict[str, str]]:
+    """The labels of each sample the agent gives under the name `metric`."""
+    return [sample.labels for family in registry.collect() for sample in family.samples if sample.name == metric]
+
+
+def test_one_release_started_with_different_step_budgets_reports_different_launches() -> None:
+    async def scenario() -> None:
+        reported = []
+        for budget in ("4096", "8192"):
+            world = World()
+            world.launched = (MODEL, "--max-model-len", "65536", STEP_BUDGET, budget)
+            registry = CollectorRegistry()
+            await asyncio.to_thread(world.agent(registry=registry).check)
+            reported.append((labels(registry, serving.RELEASE_METRIC), labels(registry, serving.LAUNCH_METRIC)))
+
+        (release, small), (same_release, large) = reported
+        # The image digest and the model revision are the same on the two instances.
+        assert release == same_release == [{"image_digest": DIGEST, "model_revision": REVISION}]
+        # One sample each, with the one label, and the two differ.
+        assert [list(sample) for sample in small + large] == [["settings_fingerprint"]] * 2
+        (small_one,), (large_one,) = small, large
+        assert small_one != large_one
+        assert launch_settings.UNAVAILABLE not in (*small_one.values(), *large_one.values())
+
+    run(scenario)
+
+
+def test_a_release_that_is_only_wanted_does_not_relabel_the_engine_that_runs() -> None:
+    async def scenario() -> None:
+        world = World()
+        world.launched = flags = (MODEL, STEP_BUDGET, "4096")
+        started_with = [{"settings_fingerprint": launch_settings.fingerprint(flags)}]
+        registry = CollectorRegistry()
+        # The release the instance holds names another step budget than its engine was started with.
+        agent = world.agent(replace(SERVED, engine_flags=(MODEL, STEP_BUDGET, "8192")), registry)
+        assert not await asyncio.to_thread(agent.check)
+        assert labels(registry, serving.LAUNCH_METRIC) == started_with
+
+        # So do the flags the boot program wrote for the next start. A minute later the engine is
+        # the same one, and so is what the agent says of it.
+        world.flags = (MODEL, STEP_BUDGET, "8192")
+        await world.clock.advance(60)
+        assert not await asyncio.to_thread(agent.check)
+        assert labels(registry, serving.LAUNCH_METRIC) == started_with
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("start_refused", [False, True])
+def test_a_restarted_engine_has_no_fingerprint_until_it_answers_and_then_its_own(start_refused: bool) -> None:
+    async def scenario() -> None:
+        # After its restart the engine takes 100 seconds to load, as a model does.
+        world = World(restart_loads_for=100)
+        world.launched = flags = (MODEL, STEP_BUDGET, "4096")
+        world.flags = (MODEL, STEP_BUDGET, "8192")
+        world.start_refused = start_refused
+        registry = CollectorRegistry()
+        agent = world.agent(registry=registry)
+        assert not await asyncio.to_thread(agent.check)
+        assert labels(registry, serving.LAUNCH_METRIC) == [{"settings_fingerprint": launch_settings.fingerprint(flags)}]
+
+        # The engine dies, and the check restarts its unit, which takes the new flags. Whether or
+        # not docker ran a container with them, no engine has served with the new step budget yet.
+        world.app = DEAD
+        nothing = [{"settings_fingerprint": launch_settings.UNAVAILABLE}]
+        for _ in range(2):
+            await asyncio.to_thread(agent.check)
+            assert labels(registry, serving.LAUNCH_METRIC) == nothing
+            await world.clock.advance(60)
+        assert world.restarts == 1
+
+        # Two minutes after the restart the engine answers, when it was started at all.
+        await asyncio.to_thread(agent.check)
+        assert labels(registry, serving.LAUNCH_METRIC) == (
+            nothing if start_refused else [{"settings_fingerprint": launch_settings.fingerprint(world.flags)}]
+        )
+
+    run(scenario)
+
+
+@pytest.mark.parametrize("budget", ["4096", "8192"])
+def test_a_container_that_systemd_started_has_no_fingerprint_until_its_engine_answers(budget: str) -> None:
+    async def scenario() -> None:
+        world = World()
+        world.app = Busy(world.clock, answers=True).app
+        world.launched = flags = (MODEL, STEP_BUDGET, "4096")
+        served = [{"settings_fingerprint": launch_settings.fingerprint(flags)}]
+        nothing = [{"settings_fingerprint": launch_settings.UNAVAILABLE}]
+        registry = CollectorRegistry()
+        agent = world.agent(registry=registry)
+        assert not await minute(world, agent)
+        assert labels(registry, serving.LAUNCH_METRIC) == served
+
+        # The engine gets busy: it counts tokens and answers no completion in time. The container
+        # is the one that was shown to serve, and it runs: its fingerprint stays.
+        world.app = Busy(world.clock).app
+        assert not await minute(world, agent)
+        assert labels(registry, serving.LAUNCH_METRIC) == served
+
+        # The engine fails, and systemd starts its unit again by itself, with the same flags or
+        # with others. Docker says the new container runs while its engine still loads the model
+        # and answers nothing. The tokens the engine before it counted are recent, so the agent
+        # restarts nothing, and it gives no fingerprint for an engine that has not served.
+        world.launched = flags = (MODEL, STEP_BUDGET, budget)
+        world.app = DEAD
+        assert not await asyncio.to_thread(agent.check)
+        assert world.restarts == 0
+        assert labels(registry, serving.LAUNCH_METRIC) == nothing
+
+        # A minute later that engine answers: the fingerprint is its own.
+        world.app = Busy(world.clock, answers=True).app
+        await world.clock.advance(60)
+        assert not await asyncio.to_thread(agent.check)
+        assert labels(registry, serving.LAUNCH_METRIC) == [{"settings_fingerprint": launch_settings.fingerprint(flags)}]
+
+    run(scenario)
+
+
+def test_the_fingerprint_is_taken_back_when_the_duties_end() -> None:
+    async def scenario() -> None:
+        world = World()
+        world.launched = flags = (MODEL, STEP_BUDGET, "4096")
+        served = [{"settings_fingerprint": launch_settings.fingerprint(flags)}]
+        nothing = [{"settings_fingerprint": launch_settings.UNAVAILABLE}]
+        registry = CollectorRegistry()
+        agent = world.agent(registry=registry)
+        async with world.doing(agent.run()):
+            await until(lambda: labels(registry, serving.LAUNCH_METRIC) == served)
+
+        # Nothing reads the engine's container any more, as once the instance has drained.
+        assert labels(registry, serving.LAUNCH_METRIC) == nothing
+        # A check that was still under way in its thread when the duties ended says nothing more.
+        world.closed = False
+        assert not await asyncio.to_thread(agent.check)
+        assert len(world.asked) == 2
+        assert labels(registry, serving.LAUNCH_METRIC) == nothing
+
+    run(scenario)
+
+
+def test_a_docker_that_does_not_answer_delays_no_check_of_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The host's docker never says which container runs: the question does not end by itself.
+    program = tmp_path / "nsenter"
+    program.write_text("#!/bin/sh\nexec sleep 20\n")
+    program.chmod(0o755)
+    docker = Host(object(), nsenter=str(program))
+    monkeypatch.setattr(serving, "INSPECT_SECONDS", 0.3)
+
+    class Unanswered(World):
+        def engine_container(self, timeout: float | None = None) -> EngineContainer | None:
+            return docker.engine_container(timeout)
+
+    async def scenario() -> None:
+        world = Unanswered()
+        registry = CollectorRegistry()
+        agent = world.agent(registry=registry)
+        # The completion is sent and answered well before the question would have ended.
+        assert not await asyncio.wait_for(asyncio.to_thread(agent.check), timeout=10)
+        assert (len(world.asked), world.restarts) == (1, 0)
+        assert labels(registry, serving.LAUNCH_METRIC) == [{"settings_fingerprint": launch_settings.UNAVAILABLE}]
+
+    run(scenario)
+
+
+def no_container(world: World) -> None:
+    # As under a unit that does not label its container: the units of a release older than the label.
+    world.launched = None
+
+
+def no_answer(world: World) -> None:
+    world.reachable = False
+
+
+def unknown_argument(world: World) -> None:
+    world.launched = (MODEL, "--chat-template", "/srv/template.jinja")
+
+
+def unlisted_value(world: World) -> None:
+    # A short word in an option that is fingerprinted: it could be a deployment's own name.
+    world.launched = (MODEL, "--tool-call-parser", "ourparser")
+
+
+@pytest.mark.parametrize("missing", [no_container, no_answer, unknown_argument, unlisted_value])
+def test_without_launch_evidence_the_instance_serves_as_before_and_says_unavailable(
+    missing: Callable[[World], None],
+) -> None:
+    async def scenario() -> None:
+        world = World()
+        missing(world)
+        registry = CollectorRegistry()
+        agent = world.agent(registry=registry)
+        # Before the first check too: the series is there from the start.
+        assert labels(registry, serving.LAUNCH_METRIC) == [{"settings_fingerprint": launch_settings.UNAVAILABLE}]
+
+        assert not await asyncio.to_thread(agent.check)
+        assert await asyncio.to_thread(agent.beat)
+
+        assert labels(registry, serving.LAUNCH_METRIC) == [{"settings_fingerprint": launch_settings.UNAVAILABLE}]
+        # The engine was checked and not restarted, the heartbeat is written, and the release's
+        # series has the two labels it had.
+        assert (len(world.asked), world.restarts, len(world.rows)) == (1, 0, 1)
+        assert labels(registry, serving.RELEASE_METRIC) == [{"image_digest": DIGEST, "model_revision": REVISION}]
+
+    run(scenario)
+
+
+def test_no_value_of_the_deployment_among_the_arguments_reaches_a_sample_or_a_row() -> None:
+    async def scenario() -> None:
+        found = []
+        for account in ("123456789012", "111122223333"):
+            # A pool on download: the model's location is in two arguments, and its folder in two.
+            location = MODEL.replace("123456789012", account)
+            world = World()
+            world.launched = (
+                f"--rhi-fetch-model={location},/var/lib/rhi-model",
+                "/var/lib/rhi-model",
+                "--served-model-name=coursework",
+                *(STEP_BUDGET, "4096"),
+            )
+            registry = CollectorRegistry()
+            agent = world.agent(registry=registry)
+            assert not await asyncio.to_thread(agent.check)
+            assert await asyncio.to_thread(agent.beat)
+
+            written = generate_latest(registry).decode() + json.dumps(world.items, default=str)
+            private = (account, BUCKET.replace("123456789012", account), "us-east-1", "s3:", "rhi-model", location)
+            assert not [value for value in private if value in written]
+            (sample,) = labels(registry, serving.LAUNCH_METRIC)
+            found.append(sample["settings_fingerprint"])
+
+        # The step budget is fingerprinted, and the bucket is not: the two deployments say the same.
+        assert found[0] == found[1] != launch_settings.UNAVAILABLE
+
+    run(scenario)
 
 
 def test_no_row_is_written_while_the_engine_gives_no_load() -> None:
