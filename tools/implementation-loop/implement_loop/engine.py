@@ -2007,12 +2007,33 @@ class Engine:
 
     def _reproduction(self, wt: Path, command: str | None, cwd: str, probe: tuple[str, str] | None) -> Evidence | None:
         """The verifier's run of a reproduction (and an optional probe file) in a throwaway copy of
-        the head, or None when there is nothing to run or the probe's path is refused."""
+        the head, or None when there is nothing to run or the probe's path is refused.
+
+        The command runs as written. A run in which pytest could not load the verifier's result
+        plugin (`verify._notes`) ran no test and says nothing of the code: #766's examiner replaced
+        PYTHONPATH, every head failed, and its builder may not change the examiner's command. Then,
+        and only then, the command runs once more, in a fresh copy, with the PYTHONPATH it assigns
+        extended by the verifier's (`extended_pythonpath`), and that run is the verdict. A command
+        that ran is judged as written, so a module only the verifier's directory holds
+        (`implement_loop`) cannot make it pass."""
         if not command:
             return None
         if probe and not self._inside(Path("/nonexistent-root"), probe[0]):
             self.store.event("probe_path_refused", path=str(probe[0])[:200])
             return None
+        ran = self._run_reproduction(wt, command, cwd, probe)
+        if ran is None:
+            return None
+        ev, cases = ran
+        extended = extended_pythonpath(command)
+        if cases is None and extended != command and verify._notes(None, ev.output_tail):
+            ran = self._run_reproduction(wt, extended, cwd, probe)
+        return ran[0] if ran is not None else None
+
+    def _run_reproduction(self, wt: Path, command: str, cwd: str,
+                          probe: tuple[str, str] | None) -> tuple[Evidence, dict | None] | None:
+        """One run of `command` in a throwaway copy of the head with the probe written into it:
+        what `verify.run_check` returns, or None when the probe's path leads out of the copy."""
         with self.ws.disposable(wt) as scratch:
             if probe:
                 target = scratch / probe[0]
@@ -2021,10 +2042,9 @@ class Engine:
                     return None
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(probe[1])
-            spec = CheckSpec(criterion="repro", command=extended_pythonpath(command), cwd=cwd)
-            ev, _ = verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
-                                     self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch))
-        return ev
+            spec = CheckSpec(criterion="repro", command=command, cwd=cwd)
+            return verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
+                                    self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch))
 
     @staticmethod
     def _replace_file(target: Path, text: str) -> None:
@@ -3715,32 +3735,29 @@ RUN_OUTPUT = 1500               # the characters of a run's output a builder is 
 FAILED_RUNS = 4                 # the failed commands of one verification whose output a builder is given
 
 
-# A PYTHONPATH value the engine can extend: plain characters and quoted strings, with no expansion,
-# escape or substitution, so the word ends where the pattern says. `$PYTHONPATH` is an expansion:
-# a command that names it already extends the verifier's.
-_PLAIN_VALUE = r"""(?:[^\s'"\\;&|<>()`$]|'[^']*'|"[^"\\`$]*")*"""
+# A value the engine extends: literal path characters only. A quote, an escape, an expansion
+# (`$PYTHONPATH` among them), a substitution (`<(...)`), a glob, a brace or a tilde is left as
+# written: where such a word ends, and what it holds, is the shell's to say.
+_LITERAL = r"[A-Za-z0-9_./:@+,%-]*"
 _SETS_PYTHONPATH = re.compile(
-    r"^\s*(?:env(?:[ \t]+(?:-u[ \t]*|--unset[= \t][ \t]*)[A-Za-z_]\w*)*[ \t]+|export[ \t]+)?"
-    rf"(?:[A-Za-z_]\w*={_PLAIN_VALUE}[ \t]+)*PYTHONPATH=(?P<value>{_PLAIN_VALUE})(?=[\s;&|<>()]|$)")
+    r"^\s*(?:env(?:[ \t]+(?:-u[ \t]*|--unset[= \t][ \t]*)[A-Za-z_][A-Za-z0-9_]*)*[ \t]+|export[ \t]+)?"
+    rf"(?:[A-Za-z_][A-Za-z0-9_]*={_LITERAL}[ \t]+)*PYTHONPATH=(?P<value>{_LITERAL})(?=[ \t\n;&|]|$)")
 
 
 def extended_pythonpath(command: str) -> str:
     """`command` with the PYTHONPATH its first simple command assigns extended by the verifier's
-    instead of replacing it. The verifier loads its result plugin through PYTHONPATH: a pytest run
-    that replaces it cannot load the plugin and fails whatever the code does (`verify._notes`), so
-    a finding with such a reproduction never closes, and its builder may not change the examiner's
-    command (#766). `[env [-u NAME]... | export] [NAME=value]... PYTHONPATH=<value>` at the head
-    of the command becomes `PYTHONPATH=<value>:"$PYTHONPATH"`; bash expands it to the verifier's
-    value when the check runs (`verify.run_check` runs the command with `bash -c`, and the sandbox
-    keeps the environment it is given). Left as written: a value with an expansion, an escape or
-    a substitution (one that names `$PYTHONPATH` already extends it), and a PYTHONPATH set anywhere
-    else in the command, where a `PYTHONPATH=` word may be an argument (`grep PYTHONPATH=src`)
-    that only a shell parser could tell from an assignment."""
+    instead of replacing it, for the second run of a reproduction (`Engine._reproduction`).
+    `[env [-u NAME]... | export] [NAME=value]... PYTHONPATH=<value>` at the head of the command,
+    every value literal, becomes `PYTHONPATH=<value>:"$PYTHONPATH"`: `verify.run_check` runs the
+    command with `bash -c`, and the sandbox keeps the environment it is given, so bash expands it
+    to the verifier's value. Anything else is left as written: a value that is not literal, and a
+    PYTHONPATH set anywhere else in the command, where a `PYTHONPATH=` word may be an argument
+    (`grep PYTHONPATH=src`) that only a shell parser could tell from an assignment."""
     m = _SETS_PYTHONPATH.match(command)
     if not m:
         return command
     # An empty entry is the current directory, which an empty value did not ask for.
-    tail = '"$PYTHONPATH"' if m.group("value") in ("", "''", '""') else ':"$PYTHONPATH"'
+    tail = ':"$PYTHONPATH"' if m.group("value") else '"$PYTHONPATH"'
     return command[:m.end()] + tail + command[m.end():]
 
 

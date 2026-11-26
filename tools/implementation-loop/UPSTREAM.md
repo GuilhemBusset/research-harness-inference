@@ -33,13 +33,13 @@ A local patch, not in upstream. The verifier loads its pytest result plugin thro
 the code did. A finding closes only when its reproduction passes, and the builder may not change
 an examiner's command: the findings stayed open, the builder answered that it had fixed them, and
 the issue went round until it would fail `no_progress`. The engine's version stays 1.2.22: a
-finding still open is run again, rewritten, at its issue's next verification.
+finding still open is run again at its issue's next verification.
 
 | File | What changed |
 | --- | --- |
-| `implement_loop/engine.py` | `_reproduction` runs `extended_pythonpath(command)`: a `PYTHONPATH=<value>` at the head of the command (after `env`, its `-u NAME` options or `export`, and other assignments) becomes `PYTHONPATH=<value>:"$PYTHONPATH"`, which the verifier's `bash -c` expands to its own value. A value with an expansion, an escape or a substitution, `$PYTHONPATH` among them, and a PYTHONPATH set anywhere else in the command are left as written. The rule that a finding closes only when its reproduction passes is unchanged. |
-| `prompts/examine.md` | A reproduction or probe command that runs pytest extends `PYTHONPATH`, never replaces or unsets it; the engine extends only an assignment that opens the command. |
-| `tests/test_reproduction_pythonpath.py` | New: #766's finding, a pytest probe whose command replaces PYTHONPATH, closes once the code passes; the rewrite, run through bash, extends the forms above, quoted values included; any other command is left as written. |
+| `implement_loop/engine.py` | `_reproduction` runs the command as written. Only when pytest could not load the verifier's plugin in that run (no pytest record, and `verify._notes` finds the import error in its output) does it run the command once more, in a fresh copy, through `extended_pythonpath`, and judge the finding on that run. A command that ran is judged as written, so a module only the verifier's directory holds (`implement_loop`) cannot make it pass. `extended_pythonpath` turns a `PYTHONPATH=<value>` at the head of the command (after `env`, its `-u NAME` options or `export`, and other assignments), every value literal path characters, into `PYTHONPATH=<value>:"$PYTHONPATH"`, which the verifier's `bash -c` expands to its own value. A quote, an escape, an expansion (`$PYTHONPATH` among them), a substitution (`<(...)`), a glob, a brace or a tilde, and a PYTHONPATH set anywhere else in the command, are left as written. The rule that a finding closes only when its reproduction passes is unchanged. |
+| `prompts/examine.md` | A reproduction or probe command that runs pytest extends `PYTHONPATH`, never replaces or unsets it; the engine extends only a plain assignment that opens the command, and only when pytest could not load the plugin. |
+| `tests/test_reproduction_pythonpath.py` | New: #766's finding, a pytest probe whose command replaces PYTHONPATH, closes once the code passes; such a run is judged on its extended run, passing or failing; a command that fails on its own (`import implement_loop`) is judged as written; a process substitution is left as written and still fails; the forms above, run through bash, print the extended value; any other command is left as written. |
 
 ## The tests' repositories run none of git's background maintenance (2026-11-26)
 

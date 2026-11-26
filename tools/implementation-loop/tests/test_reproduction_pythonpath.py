@@ -3,10 +3,11 @@
 The verifier loads its result plugin through PYTHONPATH. The examiner's probes ran
 `env PYTHONPATH=tools:tools/evaluate/tests uv run --locked pytest -q ...`: pytest could not load
 the plugin, so every run failed whatever the code did, the findings "still reproduced" on every
-head the builder made, and the builder may not change an examiner's command. The engine now runs
-a reproduction with the PYTHONPATH its first command assigns extended by the verifier's.
+head the builder made, and the builder may not change an examiner's command. The engine runs a
+reproduction as written and, only when pytest could not load the plugin there, once more with the
+PYTHONPATH its first command assigns extended by the verifier's.
 
-The engine run is real (git, the verifier, real pytest, squash merges into a bare remote); the
+The engine runs are real (git, the verifier, real pytest, squash merges into a bare remote); the
 agents and GitHub are the fakes."""
 
 import os
@@ -80,8 +81,49 @@ def test_a_finding_whose_reproduction_sets_pythonpath_closes_once_the_code_passe
     assert len([c for c in agents.calls if c[0] == "build"]) == 2
 
 
+@pytest.fixture
+def engine(repo):
+    """An engine with what running a reproduction needs, on the repository's coordination worktree."""
+    made = L.engine.Engine.__new__(L.engine.Engine)
+    made.ws = L.workspace.Workspace(repo.work, EPIC, SHIP, base_dir=repo.loop_dir)
+    made.store = L.state.RunStore.for_root(repo.work, EPIC)
+    made.caps, made.check_env = L.config.Caps(), {}
+    return made
+
+
+def reproduces(engine, command: str, probe: str) -> bool | None:
+    """The engine's verdict on a finding whose probe `checks/probe_x.py` holds `probe`."""
+    return engine._reproduces(engine.ws.coord(), command, ".", ("checks/probe_x.py", probe))
+
+
+PASSES, FAILS = "def test_x():\n    pass\n", "def test_x():\n    assert 1 == 2\n"
+
+
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+@pytest.mark.parametrize(("probe", "holds"), [(PASSES, False), (FAILS, True)])
+def test_a_pytest_run_that_cannot_load_the_plugin_is_judged_on_the_extended_run(engine, probe, holds):
+    assert reproduces(engine, f"env PYTHONPATH=lib {PY} -m pytest -q checks/probe_x.py", probe) is holds
+
+
+def test_a_command_that_fails_on_its_own_is_judged_as_written(engine):
+    """Codex's review of the first version, which always extended: the verifier's directory holds
+    `implement_loop`, so a command that fails because it cannot import it passed once extended,
+    and its finding would have closed on a command other than the one the examiner wrote."""
+    command = f"env PYTHONPATH=lib {PY} -S checks/probe_x.py"
+    assert reproduces(engine, command, "import implement_loop\n") is True
+    assert reproduces(engine, command, "import os\n") is False
+
+
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+def test_a_value_that_is_not_literal_is_run_as_written_only(engine):
+    """The first version split `PYTHONPATH=lib:<(true)` before the process substitution."""
+    command = f"PYTHONPATH=lib:<(true) {PY} -m pytest -q checks/probe_x.py"
+    assert extended(command) == command
+    assert reproduces(engine, command, PASSES) is True, "it still cannot load the plugin: the examiner's to fix"
+
+
 def run(command: str) -> str:
-    """What `command`, rewritten, prints where the verifier's PYTHONPATH is `/verifier`: bash
+    """What `command`, extended, prints where the verifier's PYTHONPATH is `/verifier`: bash
     expands it as the verifier's own run does (`verify._run`)."""
     env = {"PATH": os.environ["PATH"], "PYTHONPATH": "/verifier"}
     return subprocess.run(["bash", "-c", extended(command)], env=env, capture_output=True, text=True,
@@ -92,17 +134,14 @@ def run(command: str) -> str:
     ("env PYTHONPATH=tools:tools/evaluate/tests printenv PYTHONPATH", "tools:tools/evaluate/tests:/verifier"),
     ("PYTHONPATH=src printenv PYTHONPATH", "src:/verifier"),
     ("env -u VIRTUAL_ENV PYTHONPATH=client printenv PYTHONPATH", "client:/verifier"),
-    ("FOO=1 PYTHONPATH=src printenv PYTHONPATH", "src:/verifier"),
+    ("CI=true PYTHONPATH=src printenv PYTHONPATH", "src:/verifier"),
     ("PYTHONPATH=src; printenv PYTHONPATH", "src:/verifier"),
+    ("PYTHONPATH=src&&printenv PYTHONPATH", "src:/verifier"),
     ("export PYTHONPATH=src && printenv PYTHONPATH", "src:/verifier"),
-    # quoted values are extended as they are, spaces kept
-    ('PYTHONPATH="a b" printenv PYTHONPATH', "a b:/verifier"),
-    ("env PYTHONPATH='a b':src printenv PYTHONPATH", "a b:src:/verifier"),
     # an empty value adds no empty entry, which is the current directory
     ("PYTHONPATH= printenv PYTHONPATH", "/verifier"),
-    ('PYTHONPATH="" printenv PYTHONPATH', "/verifier"),
 ])
-def test_a_pythonpath_the_first_command_assigns_extends_the_verifiers(command, printed):
+def test_a_literal_pythonpath_the_first_command_assigns_extends_the_verifiers(command, printed):
     assert extended(command) != command
     assert run(command) == printed
 
@@ -116,9 +155,18 @@ def test_a_pythonpath_the_first_command_assigns_extends_the_verifiers(command, p
     "MYPYTHONPATH=src pytest -q tests",
     # removes it on purpose, as the examiner's prompt says for the type checker
     "env -u PYTHONPATH scripts/check.sh types",
-    # a value with an expansion or an escape: where its word ends is the shell's to say
-    "PYTHONPATH=$HOME/src pytest -q tests",
+    # a value that is not literal: where its word ends, and what it holds, is the shell's to say
+    "PYTHONPATH=src:<(true) pytest -q tests",
+    "PYTHONPATH=src>(cat) pytest -q tests",
+    'PYTHONPATH="a b" pytest -q tests',
+    "env PYTHONPATH='a b' pytest -q tests",
     "PYTHONPATH=a\\ b pytest -q tests",
+    "PYTHONPATH=$HOME/src pytest -q tests",
+    "PYTHONPATH=`pwd` pytest -q tests",
+    "PYTHONPATH=~/src pytest -q tests",
+    "env PYTHONPATH=src/* pytest -q tests",
+    "env PYTHONPATH={a,b} pytest -q tests",
+    "X='a b' PYTHONPATH=src pytest -q tests",
     # later in the command, where a `PYTHONPATH=` word may be an argument
     "cd services && PYTHONPATH=src pytest -q tests",
     "uv run --locked env PYTHONPATH=src pytest -q tests",

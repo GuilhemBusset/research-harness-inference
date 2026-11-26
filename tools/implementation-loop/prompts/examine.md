@@ -77,8 +77,9 @@ Return, in **one** pass:
   directory, which the type checker reads; `env -u PYTHONPATH` in front of it runs it as CI does).
   The verifier loads its own pytest plugin through that `PYTHONPATH`: a reproduction or probe
   command that runs pytest extends it (`PYTHONPATH=src:$PYTHONPATH`), never replaces or unsets
-  it, or pytest fails on every commit. The engine extends a `PYTHONPATH=` assignment that opens
-  the command; it does not touch one anywhere else in the command.
+  it, or pytest fails on every commit. When pytest could not load the plugin, the engine runs the
+  command once more with a plain `PYTHONPATH=<paths>` that opens it extended; it extends nothing
+  else.
 - `probes`: optional, only to reproduce a finding (the finding names it in `probe`). No item needs
   a probe, and no probe is ever committed: the engine keeps it with its finding and writes it into
   its own copy of each later head, until it passes. There is no test file per issue or per
