@@ -532,6 +532,22 @@ def test_a_repository_github_does_not_have_for_the_driver_is_not_admitted(
     assert host.admitted() == [] and host.counts() == (0, 0, 0)
 
 
+def test_a_repository_the_driver_reads_but_cannot_open_an_issue_in_is_admitted_and_ends_invalid_unbooked(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Admission only reads: a refused issue creation is the admitted run's, before its booking.
+    github = host.services.fake.github
+    routed = github._route
+    monkeypatch.setattr(github, "_route", lambda method, path, body: (403, {}) if method == "POST" else routed(method, path, body))
+    host.start()
+    sid = submission()
+    answer = host.call(op="submit", submission=sid, run=RUN)
+    assert answer["ok"] and answer["run_id"]
+    shown = host.settled(sid)
+    assert shown["run_id"] == answer["run_id"] and shown["exit"] == controller.Exit.INCOMPLETE
+    assert shown.get("issue") is None and host.counts() == (1, 0, 0)
+
+
 @pytest.mark.parametrize("operator_hosts", [None, 1], ids=["no-session", "another-host-count"])
 def test_a_designated_session_the_pool_does_not_hold_for_the_hosts_is_not_admitted(
     host: Host, operator_hosts: int | None

@@ -1541,11 +1541,27 @@ def _capacity_relative(reference: Verdict | None, candidate: Verdict | None) -> 
     return publisher.Relative.BETTER if candidate is Verdict.PASS else publisher.Relative.WORSE
 
 
+def _limit(summary: Mapping[str, Any], shape: Shape) -> publisher.Limit | None:
+    """The shape's limiting capacity row as the run's report graded it, `None` with no floor read."""
+    found = summary.get("capacity", {}).get(shape.value)
+    row = found.get("limiting_row") if isinstance(found, dict) else None
+    if not isinstance(row, dict):
+        return None
+    return publisher.Limit(
+        floor=publisher.Floor(row["floor"]),
+        missed=row["missed"],
+        headroom=row["headroom"],
+        repetition=row["repetition"],
+    )
+
+
 def comparison_of(compared: Mapping[str, Any], reference_run: str, candidate_run: str) -> publisher.Comparison:
-    """The comparison's comment fields: capacity by shape from the two scorecards, quality by
-    shape from the paired decision at class load."""
+    """The comparison's comment fields: capacity by shape from the two scorecards, with each
+    shape's limiting row in both runs; quality by shape from the paired decision at class load,
+    with the reason of one that decides nothing."""
     ours, theirs = scorecard(compared["candidate"]), scorecard(compared["reference"])
     quality: dict[Shape, publisher.Relative] = {}
+    undecided: dict[Shape, publisher.Undecided] = {}
     for decision in compared.get("decisions", []):
         if decision.get("load") != "class_load" or decision.get("shape") is None:
             continue
@@ -1553,13 +1569,20 @@ def comparison_of(compared: Mapping[str, Any], reference_run: str, candidate_run
         lower = decision.get("lower_points")
         if relative is publisher.Relative.NO_DIFFERENCE and isinstance(lower, int | float) and lower > 0:
             relative = publisher.Relative.BETTER
-        quality[Shape(decision["shape"])] = relative
+        shape = Shape(decision["shape"])
+        quality[shape] = relative
+        if relative is publisher.Relative.INCONCLUSIVE and decision.get("reason") is not None:
+            undecided[shape] = publisher.Undecided(decision["reason"])
     return publisher.Comparison(
         reference_run=reference_run,
         candidate_run=candidate_run,
         capacity={shape: _capacity_relative(theirs.capacity.get(shape), ours.capacity.get(shape)) for shape in Shape},
         quality=quality,
         bundle_digest=report.digest_of(report.dump(compared)),
+        limits={
+            shape: (_limit(compared["reference"], shape), _limit(compared["candidate"], shape)) for shape in Shape
+        },
+        undecided=undecided,
     )
 
 

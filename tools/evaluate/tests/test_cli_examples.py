@@ -185,8 +185,10 @@ def reference_bundle(directory: Path) -> Path:
 
 
 def test_the_documented_comparison_reproduces_exported_scorecards_and_digests_in_a_clean_checkout(tmp_path: Path):
-    checkout = clean_checkout(tmp_path / "checkout")
-    runs = checkout / ".cache" / "eval" / "runs"
+    # The operator exports from a checkout of their own, which holds the private runs. A reader
+    # checks out the exported folders alone, with no run cache, and regenerates and compares them.
+    operator, reader = clean_checkout(tmp_path / "operator"), clean_checkout(tmp_path / "reader")
+    runs = operator / ".cache" / "eval" / "runs"
     sources = {
         "one-host": reference_bundle(runs / REFERENCE_RUN / "bundle"),
         "two-hosts": Path(shutil.copytree(FIXTURE, runs / CANDIDATE_RUN / "bundle")),
@@ -200,7 +202,7 @@ def test_the_documented_comparison_reproduces_exported_scorecards_and_digests_in
     # The locked environment already synced, and no network for uv to reach.
     offline = {"UV_OFFLINE": "1", "UV_PROJECT_ENVIRONMENT": sys.prefix}
 
-    def script(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    def script(checkout: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:
         command = [str(checkout / PROGRAM), *arguments]
         return subprocess.run(command, cwd=checkout, env=kept | absent | offline, capture_output=True, text=True, check=False)
 
@@ -210,26 +212,29 @@ def test_the_documented_comparison_reproduces_exported_scorecards_and_digests_in
     compares = [line for line in documented if line.startswith(f"{PROGRAM} compare docs/evaluations/")]
     assert len(exports) == len(reports) == len(compares) == 1
     rate, source = cli._example()[1], cli.Source.EXAMPLE
+    derived = {}
     for name, bundle in sources.items():
-        run = bundle.parent.name
-        exported = script(argv(exports[0], VALUES | {"$run_id": run, "$name": name}))
+        exported = script(operator, argv(exports[0], VALUES | {"$run_id": bundle.parent.name, "$name": name}))
         assert exported.returncode == 0, exported.stderr
-        target = checkout / "docs" / "evaluations" / name
-        derived = report.regenerate(report.load(bundle), usd_per_host_hour=rate, rate_source=source)
-        assert exported.stdout.strip() == f"exported: {derived.digest}"
+        derived[name] = report.regenerate(report.load(bundle), usd_per_host_hour=rate, rate_source=source)
+        assert exported.stdout.strip() == f"exported: {derived[name].digest}"
+        shutil.copytree(operator / "docs" / "evaluations" / name, reader / "docs" / "evaluations" / name)
+    assert not (reader / ".cache").exists()
+    for name in sources:
+        target = reader / "docs" / "evaluations" / name
         before = {path: path.read_bytes() for path in target.rglob("*") if path.is_file()}
-        regenerated = script(argv(reports[0], VALUES | {"$name": name}))
+        regenerated = script(reader, argv(reports[0], VALUES | {"$name": name}))
         assert regenerated.returncode == 0, regenerated.stderr
         # The scorecard and its digest, regenerated, are those the export wrote.
         assert {path: path.read_bytes() for path in target.rglob("*") if path.is_file()} == before
-        assert (target / report.DIGEST).read_text().strip() == derived.digest == report.digest_of(derived.summary)
-        assert regenerated.stdout == derived.report
-    assert (checkout / "docs/evaluations/two-hosts" / report.DIGEST).read_text() == (FIXTURE / report.DIGEST).read_text()
+        assert (target / report.DIGEST).read_text().strip() == derived[name].digest == report.digest_of(derived[name].summary)
+        assert regenerated.stdout == derived[name].report
+    assert (reader / "docs/evaluations/two-hosts" / report.DIGEST).read_text() == (FIXTURE / report.DIGEST).read_text()
     arguments = argv(compares[0], VALUES)
-    printed = script(arguments)
+    printed = script(reader, arguments)
     assert printed.returncode == 0, printed.stderr
     assert printed.stdout.startswith("treatment diff")
-    as_json = script([*arguments, "--json"])
+    as_json = script(reader, [*arguments, "--json"])
     assert as_json.returncode == 0, as_json.stderr
     expected = report.compare(
         report.load(sources["one-host"]), report.load(sources["two-hosts"]), usd_per_host_hour=rate, rate_source=source

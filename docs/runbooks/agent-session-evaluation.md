@@ -58,8 +58,11 @@ issue, a pull request or a chat.
    the time left, and leaves its lifetime to you.
 2. **The scoped prerequisites of the driver**, which only the operator holds:
    - an AWS session of your own in the driver's shell. It must be able to read the pools stack's
-     scaler, the pool's release parameter, the outputs of the gateway and observability stacks,
-     the spikes' canary keys and the metrics workspace, and to book, invoke the scaler for and
+     scaler, two Parameter Store parameters, the outputs of the gateway and observability stacks,
+     the spikes' canary keys and the metrics workspace. The two parameters are the pool's release
+     (`/rhi/pools/<pool>/release`) and the deployment's session limit
+     (`/rhi/config/session_max_hours`). Admission reads the limit to check `--for`; when it is not
+     set, the default applies. The session must also be able to book, invoke the scaler for and
      stop the selected pool's session. Agents never receive it.
    - canary students with keys in the spikes' secret. Reissuing them revokes the old keys, so it
      is an owner setup operation done ahead of time, not a step of a run.
@@ -299,4 +302,8 @@ issue, a pull request or a chat.
    (`not-comparable`) and posts nothing. On the issue, the final comparison comment names both
    run IDs and gives the candidate's capacity and quality verdict for each shape against the
    reference: `candidate-better`, `no-difference`, `candidate-worse`, or `inconclusive` where the
-   evidence does not decide. It also gives the comparison's bundle digest.
+   evidence does not decide. Under the capacity verdicts, each shape has its limiting row in both
+   runs: the floor with the least headroom (such as `speed_p10`), `met` or `missed`, its headroom
+   and its repetition, or `no floor read` where a run has no evidence for that shape. Under the
+   quality verdicts, a shape that decides nothing gives the reason (such as `missing-pairs` or
+   `load-unshown`). It also gives the comparison's bundle digest.

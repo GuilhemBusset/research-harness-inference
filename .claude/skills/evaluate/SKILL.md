@@ -38,8 +38,16 @@ carries it. Use, in this order:
 git remote get-url origin | sed -E 's#\.git$##; s#^.*[:/]([^/]+/[^/]+)$#\1#'
 ```
 
-Pass it as `--repository "$repository"`, which is a repository name and never a credential. The
-driver refuses a repository its own token cannot write to (`not-admitted`).
+Pass it as `--repository "$repository"`, which is a repository name and never a credential.
+
+Admission and the issue's creation are two steps. Admission only reads. It answers
+`refused: not-admitted`, with no run ID, when the driver's token cannot read the repository or the
+repository has no issues. It also refuses a selected issue that is missing or records another
+workload, or hosts or a `--for` the pool cannot hold. Nothing is created then. The issue is created
+after admission, by the admitted run, before any booking. If GitHub refuses that write (the token
+can read the repository but not open issues in it), `submit` has already returned a run ID.
+`inspect --submission <submission-id>` then shows no `issue`, `running: false` and `exit: 2`, and
+nothing was booked.
 
 ## The commands
 
@@ -85,7 +93,9 @@ or `--issue <number>`, and optionally `--suite`, `--question`, `--target`, `--in
    `ending`, `exit`, `publication`, `cancel_requested`, `running`.
 2. Until `issue:` appears or `running` is `false`, run `inspect --submission <submission-id>` again
    about every 30 seconds, for at most 10 minutes. The issue is created and confirmed before any
-   host is booked, and the preflight may first build the trial image.
+   host is booked, and the preflight may first build the trial image. If `running` is `false` with
+   no `issue`, the run ended before its issue existed and booked nothing. Report its `exit` and
+   `step`, and tell the operator to check the driver token's access to the repository's issues.
 3. Report to the operator:
    - the experiment issue's URL. It is where the run's terminal comment will be;
    - the run ID and the submission ID;
