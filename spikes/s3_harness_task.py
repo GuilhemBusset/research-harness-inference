@@ -88,8 +88,9 @@ count or a side query is in the per-request lines, not here), and among them tho
 cause that names the model's context once the session had grown (`window_refusals_of`). When it
 neither compacted nor had such a turn refused, the window was not shown to be reached: a refusal of
 another kind, a budget's on the first request among them, shows nothing of the window. The gateway
-answers `request_refused` for a body above its limits and for any other body its filter refuses,
-`engine_error` both for an engine that refused a prompt too long and for one it lost, and a body
+answers `context_length_exceeded` for an engine's refusal of a prompt too long, a cause that names
+the model's context. It answers `request_refused` for a body above its limits and for any other
+body its filter refuses, `engine_error` for an engine it lost or that failed otherwise, and a body
 too large (413) counts bytes, not tokens, so a grown turn refused so is counted apart
 (`undetermined_refusals`), with the status of every refused turn.
 
@@ -268,13 +269,15 @@ KNOWN_CAUSES = frozenset(
         "server_error",
     }
 )
-# The causes that name the model's context and nothing else, should the engine's error pass through.
+# The causes that name the model's context and nothing else: the gateway's for an engine's refusal of a
+# prompt too long, which is also OpenAI's code for it.
 LENGTH_CAUSES = frozenset({"context_length_exceeded"})
 # A refusal whose cause a length may explain, among other things, so that it leaves undetermined
 # whether the window was reached: the gateway answers `request_refused` (400) for a body above its
 # limits and for every other body its filter refuses (a media reference that is not inline data, a
-# field outside its allow-list); `engine_error` (502) both for an engine that refused a prompt
-# longer than its context and for an engine it lost the connection to; the formats' own validation
+# field outside its allow-list); `engine_error` (502) for an engine it lost the connection to or that
+# failed otherwise, while it answers `context_length_exceeded` (400, in `LENGTH_CAUSES`) for an
+# engine's refusal of a prompt longer than its context; the formats' own validation
 # errors name no more than a request that was not valid; and a body too large to take (413, or
 # `request_too_large`) counts bytes on the wire, which an image or a field can fill as well as
 # tokens can.

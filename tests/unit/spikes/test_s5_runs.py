@@ -253,17 +253,17 @@ def test_the_counts_by_cause_and_without_a_cause_add_up_to_the_failed_requests()
     named = [failure(cause.status, cause.value) for cause in Cause]
     unnamed = [failure(None), failure(403), failure(502, "another_cause")]
     seen = s5.experience_of([record(True, 1.0), *named, *unnamed, record(False, 1.0)])
-    assert (seen.requests, seen.failed) == (14, 12)
+    assert (seen.requests, seen.failed) == (15, 13)
     label = s5.Label("coursework", ("g7e.2xlarge",), "8bit", "baseline", s5.Shape.HANDS_ON, 1, 1, None)
     figures = s5.figures_of(s5.Measured(label, 600.0, seen, None))
     by_cause = {cause.value: figures[s5.Figure(f"failed_{cause.value}")] for cause in Cause}
-    assert by_cause == dict.fromkeys(by_cause, 1) and len(by_cause) == 9
+    assert by_cause == dict.fromkeys(by_cause, 1) and len(by_cause) == 10
     # The job names a number for each cause of the shared list and for no other.
     other = {s5.Figure.FAILED_REQUESTS, s5.Figure.FAILED_SHARE, s5.Figure.FAILED_IN_STREAM, s5.Figure.FAILED_WITHOUT_CAUSE}
     by_name = {figure for figure in s5.Figure if figure.value.startswith("failed_")} - other
     assert by_name == set(s5.FAILED_BY_CAUSE.values())
     assert figures[s5.Figure.FAILED_WITHOUT_CAUSE] == 3
-    assert figures[s5.Figure.FAILED_REQUESTS] == 9 + 3
+    assert figures[s5.Figure.FAILED_REQUESTS] == 10 + 3
     # None was answered 200, and a run with no request has no share to post.
     assert figures[s5.Figure.FAILED_IN_STREAM] is None
     assert s5.figures_of(s5.Measured(label, 600.0, s5.experience_of([]), None))[s5.Figure.FAILED_SHARE] is None

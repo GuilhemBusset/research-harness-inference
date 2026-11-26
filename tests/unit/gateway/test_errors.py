@@ -25,6 +25,7 @@ DESIGN = {
     "no_session": (503, None),
     "engine_error": (502, None),
     "time_limit": (504, None),
+    "context_length_exceeded": (400, None),
 }
 FORMATS = ("messages", "responses", "chat_completions")
 EVERY_CAUSE_IN_EVERY_FORMAT = [(name, wire) for name in DESIGN for wire in FORMATS]
@@ -51,7 +52,7 @@ def read_event(raw: bytes) -> tuple[str | None, object]:
 
 def test_statuses_are_the_designs() -> None:
     assert {cause.value: (cause.status, cause.retry_after) for cause in Cause} == DESIGN
-    assert len(Cause) == 9
+    assert len(Cause) == 10
 
     for name, (status, seconds) in DESIGN.items():
         for wire in FORMATS:
