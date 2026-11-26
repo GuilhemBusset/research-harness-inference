@@ -56,8 +56,10 @@ a 200) or before (a transport error, an HTTP refusal), over every attempt sent: 
 its Wilson 95% interval (a descriptive interval over requests) and the count by cause. With no
 failure the share is an observed floor. Requests that reported no usage are counted apart. In a
 steady cell, a request tagged as warm-up traffic is accounted for and left out of every reading:
-it is not steady state. The drain lets admitted work finish: a conversation that opens after
-admissions closed is in the attempts and the failures, and gives no time to first output or speed.
+it is not steady state. The drain lets admitted work finish: a request sent after admissions
+closed (a later turn of a conversation opened before, or a conversation that opens in the drain) is
+in the attempts and the failures, and gives no time to first output or speed; a request sent before
+they closed is a sample, wherever it ends inside the window.
 
 **Hosts.** A host of a cell is an ordinal its samples carry: telemetry keeps one for each host
 across the run, so a cell's hosts need not start at 0. A counter is read over the window, from its
@@ -279,9 +281,9 @@ class CellReading:
     """The floors what was observed falls outside of, whether or not it has its samples."""
     warm_up_requests: int
     """Requests tagged as warm-up traffic in a steady cell: accounted for, and in no reading."""
-    opened_in_drain_requests: int
-    """Requests of conversations that opened after admissions closed: failed attempts if they
-    failed, and no sample of time to first output or speed."""
+    sent_in_drain_requests: int
+    """Requests sent after admissions closed: failed attempts if they failed, and no sample of
+    time to first output or speed."""
     ttft_samples_min: int
     stream_samples_min: int
     driver_lag_p95_ms: float | None
@@ -632,15 +634,10 @@ def _lag(requests: Sequence[RequestRecord]) -> float | None:
 
 
 def _admitted(requests: Sequence[RequestRecord], record: CellRecord) -> list[RequestRecord]:
-    """The requests of conversations admitted before admissions closed. The drain lets admitted work
-    finish: a conversation that opened in it (its first turn eligible after admissions ended) is
-    accounted for and gives no sample."""
-    late = {
-        (one.student, one.conversation)
-        for one in requests
-        if one.turn == 0 and one.eligible_ms > record.admissions_ended_ms
-    }
-    return [one for one in requests if (one.student, one.conversation) not in late]
+    """The requests sent at or before the close of admissions. The drain lets them finish; a request
+    sent in it, a later turn of an admitted conversation or the opening of a new one, is accounted
+    for and gives no sample."""
+    return [one for one in requests if one.sent_ms <= record.admissions_ended_ms]
 
 
 def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_per_host_hour: float) -> CellReading:
@@ -683,7 +680,7 @@ def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_p
         floors=floors,
         observed_misses=observed_misses,
         warm_up_requests=len(requests) - len(read),
-        opened_in_drain_requests=len(read) - len(sampled),
+        sent_in_drain_requests=len(read) - len(sampled),
         ttft_samples_min=ttft_min,
         stream_samples_min=stream_min,
         driver_lag_p95_ms=lag,

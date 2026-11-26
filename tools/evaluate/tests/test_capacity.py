@@ -467,19 +467,23 @@ def test_exactly_one_short_of_the_minimum_is_insufficient(budget, needed):
     assert floors[Floor.SPEED_P50] is floors[Floor.SPEED_P10] is Check.INSUFFICIENT
 
 
-def test_a_conversation_opened_in_the_drain_is_accounted_for_and_gives_no_sample():
+def test_a_request_sent_in_the_drain_is_accounted_for_and_gives_no_sample():
     planned = floor_cell()
     at = planned.identity.cell
-    # 100 later turns and 99 streams when admissions close; a conversation then opens 10 s into the
-    # drain (request 9,090 is eligible at 1,010 s) and streams its first turn.
-    rows = [*requests(at, 99), request(at, 99, tokens=1)]
+    # 99 later turns and 99 streams sent before admissions close, beside an opening that does not
+    # stream; then, 10 s into the drain (request 9,090 is eligible at 1,010 s), either a new
+    # conversation opens or that opened conversation sends a later turn.
+    opening = request(at, 98, turn=0)
+    rows = [*requests(at, 98), opening, request(at, 99, tokens=1)]
     for outcome, failed in ((RequestOutcome.COMPLETED, 0), (RequestOutcome.ERROR_EVENT, 1)):
-        late = request(at, 9090, turn=0, outcome=outcome)
-        assert late.eligible_ms == ADMITTED + 10_000
-        cell = read_one(evidence(planned, [*rows, late]))
-        assert (cell.failures.attempts, cell.failures.failed, cell.opened_in_drain_requests) == (101, failed, 1)
-        assert (cell.speeds.count, cell.first_turns.count) == (99, 0)
-        assert cell.verdict is not Verdict.PASS
+        new = request(at, 9090, turn=0, outcome=outcome)
+        later = replace(request(at, 9090, outcome=outcome), student=opening.student, conversation=opening.conversation)
+        for late in (new, later):
+            assert late.sent_ms == ADMITTED + 10_000
+            cell = read_one(evidence(planned, [*rows, late]))
+            assert (cell.failures.attempts, cell.failures.failed, cell.sent_in_drain_requests) == (101, failed, 1)
+            assert (cell.later_turns.count, cell.speeds.count, cell.first_turns.count) == (99, 99, 1)
+            assert cell.verdict is Verdict.INSUFFICIENT_EVIDENCE
 
 
 # --- Repetitions -------------------------------------------------------------------------------------
