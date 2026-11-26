@@ -668,13 +668,7 @@ def _sent_otherwise(planned: plan.Plan) -> plan.Plan:
     ("planned", "versions"),
     [
         (PLAN, VERSIONS | {"claude": "2.1.999 (Claude Code)"}),
-        (
-            replace(
-                PLAN,
-                spec=replace(PLAN.spec, protocol=PLAN.spec.protocol | {"replay_fixture_digest": "sha256:" + "0" * 64}),
-            ),
-            VERSIONS,
-        ),
+        (replace(PLAN, spec=replace(PLAN.spec, replay_fixture_digest="sha256:" + "0" * 64)), VERSIONS),
         (_other_grader(PLAN), VERSIONS),
         (_sent_otherwise(PLAN), VERSIONS),
     ],
@@ -717,7 +711,7 @@ def test_the_manifest_resolves_what_is_installed() -> None:
         phases.installed_versions(trial_image(VERSIONS))[PLAN.workload.harnesses[0].harness]
         == PLAN.workload.harnesses[0].version
     )
-    assert PLAN.spec.protocol["replay_fixture_digest"] == plan.file_digest(plan.REPLAY_FIXTURE)
+    assert PLAN.spec.replay_fixture_digest == plan.file_digest(plan.REPLAY_FIXTURE)
 
 
 # --- Faults that leave a cell unable to qualify ---------------------------------------------------

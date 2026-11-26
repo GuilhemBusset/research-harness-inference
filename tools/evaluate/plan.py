@@ -12,10 +12,13 @@ give the same plan on any machine.
 **The workload.** The hash `plan` prints is `contracts.workload_identity` of that workload, the
 `workload_id` of every manifest built on it. The arrivals and the rest of what is planned for a
 cell are in it through the workload's `arrival_digest` and `protocol_digest`. So is the course
-fixture the replay builds its requests from (`REPLAY_FIXTURE`), by its digest in the protocol: a
-changed fixture is another workload. It pins the harnesses its trials run on and no other: a
-screen, which runs the anchor only, is the same workload whatever version another harness is at. The number of hosts is a treatment and is not in
-it: one and two hosts are planned the same workload.
+fixture the replay builds its requests from (`REPLAY_FIXTURE`): a changed fixture is another
+workload. The protocol names its digest only when it is not `FIRST_REPLAY_FIXTURE`, the fixture
+every workload was planned on before the protocol named one, so that those workloads, and the
+evidence saved under them, keep their identity. It pins the harnesses its trials run on and no
+other: a screen, which runs the anchor only, is the same workload whatever version another harness
+is at. The number of hosts is a treatment and is not in it: one and two hosts are planned the same
+workload.
 
 **The order.** The warm-up first, then one round for each repetition: the capacity sweep, the live
 tasks at low load, the live tasks at class size, the class opening. The cells of a round start a
@@ -88,6 +91,8 @@ if TYPE_CHECKING:
 SUITES = Path(__file__).resolve().parent / "suites"
 # The course fixture the replay draws its tool turns from (`traces.COURSE`), by its bytes.
 REPLAY_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "replay" / "course.json"
+# Its digest when workloads did not name it: a workload on it leaves it out of its protocol.
+FIRST_REPLAY_FIXTURE = "sha256:d2869cbc3755f734ad8bc2341b28838a3c5b5aa7bf3053c14f383afd080b277f"
 DEFAULT_SUITE = "course-v1"
 HOUR_MS = 3_600_000
 # Several-agents doubles the slots of a class, and a cell has 1024 at most.
@@ -181,6 +186,8 @@ class SuiteSpec:
     profiles: dict[Profile, ProfileSpec]
     estimates: Estimates
     protocol: dict[str, Any]
+    # The digest of the course fixture the replay sends from, as it was when the suite was read.
+    replay_fixture_digest: str
 
     def pairs(self, profile: Profile) -> list[tuple[Task, str, Harness]]:
         """The instance/harness pairs the profile requires, each with its task."""
@@ -426,7 +433,8 @@ def _read(name: str, raw: dict[str, Any]) -> SuiteSpec:
         opening_window_ms=_whole(raw["opening"]["window_ms"], 1),
         profiles={profile: _profile(raw["profiles"][profile]) for profile in Profile},
         estimates=Estimates(**{key: _whole(value) for key, value in raw["estimates"].items()}),
-        protocol={key: raw[key] for key in _PROTOCOL} | {"replay_fixture_digest": file_digest(REPLAY_FIXTURE)},
+        protocol={key: raw[key] for key in _PROTOCOL},
+        replay_fixture_digest=file_digest(REPLAY_FIXTURE),
     )
 
 
@@ -542,6 +550,8 @@ def _digests(spec: SuiteSpec, profile: Profile, cells: Sequence[PlannedCell]) ->
         "core": sorted(spec.core),
         "cells": [cell.planned() for cell in cells],
     }
+    if spec.replay_fixture_digest != FIRST_REPLAY_FIXTURE:
+        protocol["replay_fixture_digest"] = spec.replay_fixture_digest
     arrivals = _digest([list(cell.arrivals_ms) for cell in cells])
     return contracts.content_hash(spec.suite), arrivals, _digest(protocol)
 

@@ -385,7 +385,7 @@ def resolve_manifest(plan_: Plan, artifacts: Artifacts, requested: Settings) -> 
             computed = (module.fixture_digest(instance.instance_id), module.grader_digest(instance.instance_id))
             if computed != (instance.fixture_digest, instance.grader_digest):
                 raise PhaseError(Refusal.ARTIFACT_MISMATCH)
-    if plan_.spec.protocol.get("replay_fixture_digest") != plan.file_digest(traces.COURSE):
+    if plan_.spec.replay_fixture_digest != plan.file_digest(traces.COURSE):
         raise PhaseError(Refusal.ARTIFACT_MISMATCH)
     if not plan.digests_hold(plan_):
         raise PhaseError(Refusal.ARTIFACT_MISMATCH)
