@@ -19,7 +19,7 @@ best, each with its source ID and, where it has them, its page and table number;
 Write `answer.json` in the working directory, a JSON object of two parts.
 
 `evidence` is the evidence table: a list with one row for each fact that `instance.json` names
-under `facts`. A row gives:
+under `facts`, and no other row. A row gives:
 
 - `fact`: the fact's identifier, as `instance.json` names it;
 - `value`: the value the source gives, as a JSON number;
@@ -28,10 +28,10 @@ under `facts`. A row gives:
 - `page` and `table`: where in that source it is printed. Give the page number of a PDF, the
   table number of a table, or both. A text source has no pages.
 
-`conclusion` is the result the question asks for. It gives:
+`conclusion` is the result the question asks for. It gives these fields and no other (no
+sentence of prose: the answer's sentence is written from them):
 
 - `fact`: the result's identifier, as `instance.json` names it under `result`;
-- `statement`: one or two sentences that answer the question;
 - `value` and `unit`: the result, as a JSON number and its unit;
 - `citations`: for each fact the result is computed from, an object with that `fact`, its
   `source` and its `page` or `table`, as in the evidence table.

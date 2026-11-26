@@ -200,9 +200,9 @@ background = "several_agents"
 features = ["local_search", "pdf_reading"]
 harnesses = ["claude_code"]
 instances = [
-    { id = "research.t01.i01", fixture_digest = "sha256:7d49c725f0930fede4466c1738fc7b3807d1eabcce7907c464daa7b4ff03275e", grader_digest = "sha256:7758fab1e57f158c76b7e79be167a5ff8bcc8f35af695e9a74688d8cc71ecc06" },
-    { id = "research.t01.i02", fixture_digest = "sha256:d74d51e4e22cd460ae4e7b4e30260243ad29e419a65fe1e4eba2bc849f7df5a2", grader_digest = "sha256:78100e1ee07802c76852d6b3ddfc7dcbd0bc1a5ac389dc110436d9116e63cb83" },
-    { id = "research.t01.i03", fixture_digest = "sha256:bfa648abab5d62366a62444440c798ea8aa2de03ba52b823c21284485d618514", grader_digest = "sha256:108a5bd1444fdab8c2e67f52c8ea8ecede263cd7302e3338d185e300c5da4d82" },
+    { id = "research.t01.i01", fixture_digest = "sha256:d2fc78f5105e68446857f94f8c7bd65349a502d4c58423090fe3335efe2c2959", grader_digest = "sha256:361b14a403957b33e9b7a6c5d384cd29be6493e5825626402900e9e8dee0cbd2" },
+    { id = "research.t01.i02", fixture_digest = "sha256:f6819ae6bbe4807c16cea7329849e4f68ac89ea903a16833fcd2f825b149d9a3", grader_digest = "sha256:2feb077d323ce88a141661a4d3091d164ec7f5220fa0d07531f0576caeabe5e6" },
+    { id = "research.t01.i03", fixture_digest = "sha256:77f06619114d3aa0c11db6d4049b13d86af34ad5d71df44bf193f5f4bd64fc6e", grader_digest = "sha256:ea8dbc9fe97fb3ebeee6f78f1d1b01d170bcbd84aeaa3e94775bb347dec4437b" },
 ]
 
 # Not part of the workload: what a booking is sized with. The design fixes none of these. With

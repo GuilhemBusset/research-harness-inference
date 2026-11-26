@@ -232,6 +232,9 @@ def test_a_plausible_wrong_location_is_rejected_on_the_location_alone(
         lambda answer: answer["evidence"][1].update(unit="kg/m²"),
         # The thermal resistance's unit, for the result.
         lambda answer: answer["conclusion"].update(unit="m²·K/W"),
+        # Kelvin multiplied, not divided: the signs that group a unit count.
+        lambda answer: answer["evidence"][0].update(unit="(W/m)·K"),
+        lambda answer: answer["evidence"][0].update(unit="W·K/m"),
     ],
 )
 def test_a_wrong_unit_is_rejected_on_the_unit_alone(
@@ -264,6 +267,31 @@ def test_a_property_is_answered_on_its_own(
     assert failed(report) == {broken}
 
 
+def test_a_row_of_a_fact_the_question_does_not_name_is_rejected_and_its_source_held_to_the_packet(
+    tmp_path: Path,
+) -> None:
+    def add_a_row(answer: dict[str, Any]) -> None:
+        answer["evidence"].append(
+            {"fact": "density.cork.nominal", "value": 120, "unit": "kg/m³", "source": "S9", "table": "1"}
+        )
+
+    report = research.grade(EXEMPLAR, written(tmp_path, changed(EXEMPLAR, add_a_row)))
+
+    assert failed(report) == {Property.FACT, Property.SOURCE}
+
+
+def test_the_conclusion_shown_is_written_from_what_was_graded_and_no_prose_of_it_is_taken(tmp_path: Path) -> None:
+    accepted = research.grade(EXEMPLAR, research.reference_artifacts(EXEMPLAR))
+    with_prose = changed(
+        EXEMPLAR,
+        lambda answer: answer["conclusion"].update(statement="One square metre needs 110 kg of oven-dry panel."),
+    )
+
+    assert accepted.conclusion is not None
+    assert accepted.conclusion.startswith("mass_per_area.cork.dry = 11 kg/m²")
+    assert failed(research.grade(EXEMPLAR, written(tmp_path, with_prose))) == {Property.FACT}
+
+
 def test_a_conclusion_that_cites_nothing_for_a_fact_it_rests_on_is_rejected(tmp_path: Path) -> None:
     uncited = changed(EXEMPLAR, lambda answer: answer["conclusion"]["citations"].pop())
 
@@ -287,6 +315,12 @@ def test_a_missing_or_unreadable_answer_is_a_rejection_of_every_property(tmp_pat
     assert failed(research.grade(EXEMPLAR, tmp_path)) == set(PROPERTIES)
 
 
+def test_a_page_that_is_no_number_is_a_rejection_not_an_error(tmp_path: Path) -> None:
+    superscript = changed(EXEMPLAR, lambda answer: answer["evidence"][0].update(page="³"))
+
+    assert not research.grade(EXEMPLAR, written(tmp_path, superscript)).accepted
+
+
 def test_a_key_the_packet_does_not_bear_out_is_refused() -> None:
     raw = json.loads((research.KEYS / "i01.json").read_text(encoding="utf-8"))
     raw["facts"]["conductivity.cork.dry"]["locations"] = [{"page": 2, "table": "2"}]
@@ -305,6 +339,26 @@ def in_other_units_and_notations(answer: dict[str, Any]) -> None:
     density |= {"value": density["value"] / 1000, "unit": "g/cm^3"}
     answer["conclusion"] |= {"value": round(answer["conclusion"]["value"] * 1000, -1), "unit": "g/m²"}
     answer["conclusion"]["citations"][0] = {"fact": conductivity["fact"], "source": "S1", "page": "2"}
+
+
+@pytest.mark.parametrize(
+    ("row", "unit"),
+    [
+        (1, "kg·m^−3"),  # a minus sign, U+2212
+        (1, "kg m-3"),
+        (1, "g/L"),
+        (0, "W·m⁻¹·K⁻¹"),
+        (0, "W / (m K)"),
+        (0, "W/m/K"),
+        (0, "W/mK"),
+    ],
+)
+def test_a_unit_in_another_notation_is_the_same_unit(tmp_path: Path, row: int, unit: str) -> None:
+    report = research.grade(
+        EXEMPLAR, written(tmp_path, changed(EXEMPLAR, lambda answer: answer["evidence"][row].update(unit=unit)))
+    )
+
+    assert report.accepted, report.faults
 
 
 def test_an_equivalent_answer_in_other_units_and_notations_is_accepted(tmp_path: Path) -> None:

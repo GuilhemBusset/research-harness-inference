@@ -18,7 +18,6 @@
   ],
   "conclusion": {
     "fact": "mass_per_area.wood_fibre.dry",
-    "statement": "A thermal resistance of 3 m²·K/W needs 114 mm of the wood fibre panel (3 × 0.038), which at 160 kg/m³ weighs 18.24 kg per square metre of wall.",
     "value": 18.24,
     "unit": "kg/m²",
     "citations": [

@@ -7,8 +7,11 @@ unit; a row cites the source and the page or table it takes the value from, and 
 cites, for each fact it rests on, where that fact is. The grade answers the four properties of
 `PROPERTIES`, in that order, each on its own, over the evidence table and the conclusion alike:
 
-- *fact*: every fact of the question has a row, every row of it states the key's value, and the
-  conclusion states the result the question asks for (its identifier) with the key's value;
+- *fact*: every fact of the question has a row, every row of it states the key's value, no row
+  states a fact the question does not name, and the conclusion states the result the question
+  asks for (its identifier) with the key's value, and nothing else: a conclusion is its checked
+  fields, and the sentence a reader is shown is written from them (`Conclusion.sentence`), so
+  that no prose of a run can say what its grade does not;
 - *unit*: every row and the conclusion give a unit of the fact's quantity;
 - *source*: every row, and the conclusion for every fact it rests on, cites the packet's source
   that holds the fact;
@@ -61,30 +64,136 @@ PROPERTIES = tuple(Property)
 
 # --- Units -----------------------------------------------------------------------------------
 #
-# A unit is read in the spelling `spelling` reduces it to: no space, no multiplication sign, no
-# parenthesis, no caret, and superscripts as digits. W/(m·K), W/m·K and W m^-1 K^-1 are then
-# W/mK, W/mK and Wm-1K-1. Each spelling here is a unit of one quantity, with its factor to the
-# quantity's first unit.
+# A unit is parsed into the powers of its base units and a factor to them, so that W/(m·K),
+# W/m/K, W m^-1 K^-1 and W·m⁻¹·K⁻¹ are one unit and (W/m)·K another. A product is written with a
+# space, `·`, `⋅`, `*`, `×` or `.`, or with nothing between two symbols (`kgm-3`); a power with or
+# without a caret, in digits or superscripts, its minus a hyphen, `−` or `⁻`. What follows a `/`
+# up to the next `/` or the end of its parenthesis divides: W/m·K is read as W/(m·K), as the
+# sources print it. A unit of a quantity of `QUANTITIES` is known; any other is no unit here.
 
-_SUPERSCRIPTS = str.maketrans("⁻¹²³", "-123")
-_NOT_A_UNIT_SIGN = re.compile(r"[\s·⋅*.()^{}]")
-
-UNITS: Mapping[str, tuple[str, float]] = {
-    **dict.fromkeys(("W/mK", "W/m/K", "Wm-1K-1"), ("thermal conductivity", 1.0)),
-    **dict.fromkeys(("mW/mK", "mW/m/K", "mWm-1K-1"), ("thermal conductivity", 1e-3)),
-    **dict.fromkeys(("kg/m3", "kgm-3", "g/L", "g/l"), ("density", 1.0)),
-    **dict.fromkeys(("g/cm3", "gcm-3", "kg/L", "kg/l"), ("density", 1e3)),
-    **dict.fromkeys(("kg/m2", "kgm-2"), ("mass per area", 1.0)),
-    **dict.fromkeys(("g/m2", "gm-2"), ("mass per area", 1e-3)),
+# Each symbol: its factor to the base units, and its powers of them.
+SYMBOLS: Mapping[str, tuple[float, Mapping[str, int]]] = {
+    "W": (1.0, {"W": 1}),
+    "mW": (1e-3, {"W": 1}),
+    "K": (1.0, {"K": 1}),
+    "kg": (1.0, {"kg": 1}),
+    "g": (1e-3, {"kg": 1}),
+    "m": (1.0, {"m": 1}),
+    "cm": (1e-2, {"m": 1}),
+    "mm": (1e-3, {"m": 1}),
+    "L": (1e-3, {"m": 3}),
+    "l": (1e-3, {"m": 3}),
 }
 
+QUANTITIES: Mapping[str, Mapping[str, int]] = {
+    "thermal conductivity": {"W": 1, "m": -1, "K": -1},
+    "density": {"kg": 1, "m": -3},
+    "mass per area": {"kg": 1, "m": -2},
+}
 
-def spelling(unit: str) -> str:
-    return _NOT_A_UNIT_SIGN.sub("", unit.translate(_SUPERSCRIPTS))
+_SIGNS = str.maketrans({"⁻": "-", "−": "-", "–": "-", "¹": "1", "²": "2", "³": "3", "⋅": "·", "×": "·"})
+_TOKEN = re.compile(
+    r"(?P<space>\s+)|(?P<sign>[·*./()])"
+    r"|(?P<symbol>" + "|".join(sorted(map(re.escape, SYMBOLS), key=len, reverse=True)) + r")"
+    r"(?:\^?(?P<power>-?[0-9]+))?"
+)
+
+
+class _NoUnit(Exception):
+    """A text that is no unit the grader reads."""
+
+
+def _tokens(unit: str) -> list[str | tuple[float, dict[str, int]]]:
+    """The unit's factors and signs, a product written out as `·`."""
+    text, at = unit.translate(_SIGNS).strip(), 0
+    tokens: list[str | tuple[float, dict[str, int]]] = []
+    while at < len(text):
+        matched = _TOKEN.match(text, at)
+        if matched is None:
+            raise _NoUnit(unit)
+        at = matched.end()
+        token: str | tuple[float, dict[str, int]]
+        if matched["symbol"]:
+            factor, powers = SYMBOLS[matched["symbol"]]
+            power = int(matched["power"] or 1)
+            token = (factor**power, {base: exponent * power for base, exponent in powers.items()})
+        elif matched["sign"]:
+            token = "·" if matched["sign"] in "*." else matched["sign"]
+        else:
+            continue  # a space: a product between two factors (below), nothing next to a sign
+        # Two factors side by side, with a space or nothing between them, are a product.
+        if (
+            tokens
+            and (not isinstance(tokens[-1], str) or tokens[-1] == ")")
+            and (not isinstance(token, str) or token == "(")
+        ):
+            tokens.append("·")
+        tokens.append(token)
+    return tokens
+
+
+def _parse(unit: str) -> tuple[float, dict[str, int]]:
+    """The factor of a unit to its base units, and its powers of them."""
+    tokens = _tokens(unit)
+    at = 0
+
+    def product() -> tuple[float, dict[str, int]]:
+        nonlocal at
+        factor, powers = factor_of()
+        while at < len(tokens) and tokens[at] == "·":
+            at += 1
+            more = factor_of()
+            factor, powers = factor * more[0], _times(powers, more[1], 1)
+        return factor, powers
+
+    def quotient() -> tuple[float, dict[str, int]]:
+        nonlocal at
+        factor, powers = product()
+        while at < len(tokens) and tokens[at] == "/":
+            at += 1
+            divisor = product()
+            factor, powers = factor / divisor[0], _times(powers, divisor[1], -1)
+        return factor, powers
+
+    def factor_of() -> tuple[float, dict[str, int]]:
+        nonlocal at
+        if at >= len(tokens):
+            raise _NoUnit(unit)
+        token = tokens[at]
+        at += 1
+        if token == "(":
+            inner = quotient()
+            if at >= len(tokens) or tokens[at] != ")":
+                raise _NoUnit(unit)
+            at += 1
+            return inner
+        if isinstance(token, str):
+            raise _NoUnit(unit)
+        return token
+
+    whole = quotient()
+    if at != len(tokens):
+        raise _NoUnit(unit)
+    return whole
+
+
+def _times(powers: Mapping[str, int], more: Mapping[str, int], sign: int) -> dict[str, int]:
+    together = dict(powers)
+    for base, exponent in more.items():
+        together[base] = together.get(base, 0) + sign * exponent
+    return {base: exponent for base, exponent in together.items() if exponent}
 
 
 def _unit(unit: str) -> tuple[str, float] | None:
-    return UNITS.get(spelling(unit))
+    """The quantity a unit measures and its factor to the quantity's base unit, or None."""
+    try:
+        factor, powers = _parse(unit)
+    except (_NoUnit, OverflowError, ZeroDivisionError, ValueError):
+        return None
+    for quantity, base in QUANTITIES.items():
+        if powers == base:
+            return quantity, factor
+    return None
 
 
 # --- The packet and the key ------------------------------------------------------------------
@@ -202,10 +311,19 @@ class Row:
 @dataclass(frozen=True)
 class Conclusion:
     fact_id: str
-    statement: str
     value: float
     unit: str
     citations: tuple[Citation, ...]
+    # The fields of the conclusion that are none of the above, such as a sentence of prose.
+    unchecked: tuple[str, ...] = ()
+
+    def sentence(self) -> str:
+        """The conclusion as a reader is shown it: written from the fields the grader checks."""
+        cited = "; ".join(f"{one.fact_id}: {one.source}, {_where(one.location)}" for one in self.citations)
+        return f"{self.fact_id} = {self.value:g} {self.unit}" + (f" ({cited})" if cited else "")
+
+
+CONCLUSION_FIELDS = frozenset({"fact", "value", "unit", "citations"})
 
 
 @dataclass(frozen=True)
@@ -219,6 +337,8 @@ class Report:
     """What the grader found: each fault with the property it breaks."""
 
     faults: tuple[tuple[Property, str], ...]
+    # The conclusion as a reader is shown it (`Conclusion.sentence`), when the answer was read.
+    conclusion: str | None = None
 
     def holds(self, one: Property) -> bool:
         return all(broken is not one for broken, _fault in self.faults)
@@ -253,13 +373,31 @@ def grade(key: Key, packet: Packet, artifacts: Path) -> Report:
             what = f"the row of {fact.fact_id}"
             faults += _value_faults(what, row.value, row.unit, fact.value, fact.unit)
             faults += _citation_faults(what, row.citation, fact, packet)
+    # A row of a fact the question does not name is evidence the key cannot bear out.
+    for row in answer.evidence:
+        if row.fact_id not in key.facts:
+            faults.append(
+                (Property.FACT, f"the evidence table states {row.fact_id!r}, which the question does not name")
+            )
+            if row.citation.source not in packet.sources:
+                faults.append(
+                    (
+                        Property.SOURCE,
+                        f"the row of {row.fact_id!r} cites {row.citation.source!r}, no source of the packet",
+                    )
+                )
     faults += _conclusion_faults(answer.conclusion, key, packet)
-    return Report(tuple(faults))
+    return Report(tuple(faults), conclusion=answer.conclusion.sentence())
 
 
 def _conclusion_faults(conclusion: Conclusion, key: Key, packet: Packet) -> list[tuple[Property, str]]:
     result = key.result
-    faults: list[tuple[Property, str]] = []
+    # The conclusion a reader is shown is written from its checked fields; any other field, such
+    # as a sentence of prose, could say what the grade does not, so it is not taken.
+    faults: list[tuple[Property, str]] = [
+        (Property.FACT, f"the conclusion gives `{field}`, which the task does not ask for and no grade checks")
+        for field in conclusion.unchecked
+    ]
     if conclusion.fact_id != result.fact_id:
         faults.append(
             (Property.FACT, f"the conclusion states {conclusion.fact_id}, and the question asks {result.fact_id}")
@@ -324,6 +462,7 @@ def _where(location: Location) -> str:
 # --- Reading the answer ----------------------------------------------------------------------
 
 _TABLE = re.compile(r"(?:table|tab\.?)?\s*([0-9A-Za-z]{1,8})", re.IGNORECASE)
+_PAGE = re.compile(r"[0-9]{1,6}")
 
 
 def _text(raw: Mapping[str, Any], field: str, where: str) -> str:
@@ -349,7 +488,8 @@ def _number(raw: Mapping[str, Any], field: str, where: str) -> float:
 
 def _location(raw: Mapping[str, Any], where: str) -> Location:
     page, table = raw.get("page"), raw.get("table")
-    if isinstance(page, str) and page.strip().isdigit():
+    # Digits in ASCII only: `str.isdigit` also takes a superscript, which no `int` reads.
+    if isinstance(page, str) and _PAGE.fullmatch(page.strip()):
         page = int(page)
     if page is not None and (isinstance(page, bool) or not isinstance(page, int)):
         raise _Unreadable(f"{ANSWER}: {where} has a `page` that is no page number")
@@ -397,9 +537,9 @@ def _read_answer(path: Path) -> Answer:
         evidence=tuple(rows),
         conclusion=Conclusion(
             fact_id=_text(conclusion, "fact", "the conclusion"),
-            statement=_text(conclusion, "statement", "the conclusion"),
             value=_number(conclusion, "value", "the conclusion"),
             unit=_text(conclusion, "unit", "the conclusion"),
             citations=citations,
+            unchecked=tuple(sorted(str(field) for field in conclusion if field not in CONCLUSION_FIELDS)),
         ),
     )
