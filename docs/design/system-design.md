@@ -219,7 +219,7 @@ Students choose a pool by model name. Moving to another model is a new pool entr
 
 | The model must | Because |
 | --- | --- |
-| Serve at least 232,000 tokens of context | Claude Code assumes a 200,000-token window for a model it does not know, and asks for up to 32,000 tokens of output. When a prompt is too long, vLLM's error is not one Claude Code recognises, so the session cannot compact itself and is lost |
+| Serve at least 232,000 tokens of context | Claude Code assumes a 200,000-token window for a model it does not know, and asks for up to 32,000 tokens of output. When a prompt is too long, the gateway answers vLLM's refusal with the cause `context_length_exceeded` (section 6.2, step 8), a 400 whose message begins with Anthropic's own words for it, on which Claude Code compacts the session and sends the turn again |
 | Call tools through a parser that vLLM ships, on nested schemas | vLLM turns a model's tool calls into the wire format with one parser per model family `[E4]`. Claude Code sends about 25 tools with deeply nested schemas on every request; Codex sends its own on the Responses route |
 | Accept its own reasoning back in the history | Claude Code returns earlier reasoning blocks with each request. A model whose template rejects them fails, and one whose template drops them loses its thread in the middle of a tool loop |
 | Read images | Claude Code reads screenshots and plots; the paper-writing pack's drafting agent reads the figures it writes about |
@@ -618,6 +618,7 @@ vLLM serves all three `[E3]`; the gateway does not convert one into another. Fou
    | `capacity_unavailable` | 503 with `Retry-After` | The pool's session is active, and no instance is in service or starting: the pool waits for capacity (section 5.4) |
    | `engine_error` | 502 | The engine failed, or ended a response early. On a stream that has started, this is that format's error event |
    | `time_limit` | 504 | The request reached the 30-minute limit. On a stream, that format's error event |
+   | `context_length_exceeded` | 400 | The engine refused the prompt as longer than the pool's context. Its sentence begins "prompt is too long", Anthropic's words for it, on which Claude Code compacts the session |
 
    `Retry-After` is 30 seconds for `warming`, 60 for `capacity_unavailable` and 5 for `concurrency_limit`. `no_session` carries none: the gateway does not know when the next session starts.
 
