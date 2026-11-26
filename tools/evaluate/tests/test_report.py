@@ -601,33 +601,88 @@ def test_a_host_count_the_evidence_does_not_show_serving_is_not_recommended(tmp_
     assert [one["checks"]["host_count"] for one in hands_on["tested"]] == ["unknown", "unknown"]
 
 
-@pytest.mark.parametrize("missing", [Traffic.BACKGROUND, Traffic.LIVE])
-def test_class_load_quality_needs_the_class_load_it_was_measured_under(
-    reference: Path, tmp_path: Path, missing: Traffic
-):
-    bundle = report.load(FIXTURE)
+type Live = tuple[tuple[RequestRecord, ...], tuple[TrialRecord, ...], CellRecord]
+
+
+def class_load_changed(source: Path, target: Path, change: Callable[[Live], Live], *, recount: bool = True) -> Path:
+    """A copy of a bundle with each live cell at class load changed: its requests, its trials and
+    its record. The scheduler's tally is counted again over the rows unless `recount` is false."""
+    bundle = report.load(source)
     evidence = []
     for attempt in bundle.attempts:
-        rows, sent = attempt.requests, attempt.checkpoint.tally
-        if bundle.manifest.workload.cells[attempt.record.cell].phase is Phase.LIVE_CLASS_LOAD:
-            rows = tuple(row for row in rows if row.traffic is not missing)
-            # Without the other seat every send is still accounted for; without the live rows the
-            # scheduler still counts the sends they were.
-            sent = tally(rows) if missing is Traffic.BACKGROUND else sent
+        rows, trials, record, sent = attempt.requests, attempt.trials, attempt.record, attempt.checkpoint.tally
+        if bundle.manifest.workload.cells[record.cell].phase is Phase.LIVE_CLASS_LOAD:
+            rows, trials, record = change((rows, trials, record))
+            sent = tally(rows) if recount else sent
         checkpoint = attempt.checkpoint
-        observations = (*rows, *attempt.trials, *attempt.samples)
+        observations = (*rows, *trials, *attempt.samples)
         evidence.append(
-            report.Evidence(
-                attempt.record, observations, sent, checkpoint.hosts, checkpoint.requested_launch_fingerprint
-            )
+            report.Evidence(record, observations, sent, checkpoint.hosts, checkpoint.requested_launch_fingerprint)
         )
-    report.write_evidence(tmp_path / "candidate", bundle.manifest, evidence)
-    hands_on = compared(reference, tmp_path / "candidate")["recommendation"]["shapes"]["hands_on"]
+    report.write_evidence(target, bundle.manifest, evidence)
+    return target
+
+
+def without(traffic: Traffic) -> Callable[[Live], Live]:
+    return lambda live: (tuple(row for row in live[0] if row.traffic is not traffic), live[1], live[2])
+
+
+def idle_during_trials(live: Live) -> Live:
+    """The other seat's replay: one turn as the first trial starts and the next once the last one
+    ended, every send of it accounted for."""
+    rows, trials, record = live
+    first, last = min(trial.started_ms for trial in trials), max(trial.ended_ms for trial in trials)
+    template = next(row for row in rows if row.traffic is Traffic.BACKGROUND)
+    before = shift(template, first - 500 - template.eligible_ms)
+    after = shift(replace(before, request=before.request + 1, turn=1), last - first + 1000)
+    return (*(row for row in rows if row.traffic is Traffic.LIVE), before, after), trials, record
+
+
+def one_seat(live: Live) -> Live:
+    """The live task and the replay both on the second seat of the class."""
+    rows, trials, record = live
+    return tuple(replace(row, student=1) for row in rows), tuple(replace(one, student=1) for one in trials), record
+
+
+def lagging(live: Live) -> Live:
+    return live[0], live[1], replace(live[2], driver_lag_p95_ms=10_000.0)
+
+
+@pytest.mark.parametrize(
+    ("change", "recount", "gap"),
+    [
+        # Without the other seat every send is still accounted for.
+        (without(Traffic.BACKGROUND), True, "background_missing"),
+        # Without the live rows the scheduler still counts the sends they were.
+        (without(Traffic.LIVE), False, "sends_unaccounted"),
+        (idle_during_trials, True, "background_idle"),
+        (one_seat, True, "seats_unplanned"),
+        # Past the protocol's 250 ms tolerance, what was sent is not the schedule.
+        (lagging, True, "driver_lag"),
+    ],
+)
+def test_class_load_quality_needs_the_class_load_it_was_measured_under(
+    reference: Path, tmp_path: Path, change: Callable[[Live], Live], recount: bool, gap: str
+):
+    candidate = class_load_changed(FIXTURE, tmp_path / "candidate", change, recount=recount)
+    hands_on = compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]
     assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["class_load_evidence"] == "unknown"
-    gaps = {
-        row["gap"] for row in json.loads(scorecard(tmp_path / "candidate").summary)["class_load_evidence"]["hands_on"]
-    }
-    assert gaps == {"background_missing" if missing is Traffic.BACKGROUND else "sends_unaccounted"}
+    gaps = {row["gap"] for row in json.loads(scorecard(candidate).summary)["class_load_evidence"]["hands_on"]}
+    assert gaps == {gap}
+
+
+def test_an_unloaded_reference_qualifies_no_candidate(tmp_path: Path):
+    reference = class_load_changed(
+        build(tmp_path / "original", REFERENCE), tmp_path / "reference", without(Traffic.BACKGROUND)
+    )
+    comparison = compared(reference, FIXTURE)
+    decision = next(one for one in comparison["decisions"] if (one["load"], one["shape"]) == ("class_load", "hands_on"))
+    assert (decision["outcome"], decision["reason"], decision["load_unshown"]) == (
+        "inconclusive",
+        report.LOAD_UNSHOWN,
+        ["reference"],
+    )
+    assert comparison["recommendation"]["shapes"]["hands_on"]["host_count"] is None
 
 
 # --- Comparing ---------------------------------------------------------------------------------
@@ -738,6 +793,30 @@ def test_a_flags_only_treatment_needs_every_serving_host_and_the_gateway_observe
     assert (refused.value.reason, refused.value.lever) == (Refusal.UNVERIFIED_TREATMENT, report.Lever.LAUNCH_SETTINGS)
 
 
+def test_a_declared_host_count_does_not_cover_other_hardware_observed(reference: Path, tmp_path: Path):
+    runs = shutil.copytree(reference, tmp_path / "reference"), build(tmp_path / "candidate")
+    for run in runs:
+        manifest_edited(run, lambda manifest: manifest["requested"].update(instance_type=None, gpus_per_host=None))
+    manifest_edited(
+        runs[1], lambda manifest: manifest["observed"].update(instance_type="g7e.24xlarge", gpus_per_host=4)
+    )
+    with pytest.raises(ReportError) as refused:
+        compared(*runs)
+    assert (refused.value.reason, refused.value.lever) == (Refusal.UNDECLARED_TREATMENT, report.Lever.HOSTS)
+
+
+def test_a_refused_json_comparison_logs_its_diff_before_the_refusal(tmp_path: Path):
+    """Both streams into one log, as an operator redirects them, with stdout buffered."""
+    candidate = build(tmp_path / "candidate", Variant(objectives={"ttft_p95_ms_max": 6000.0}))
+    env = {name: value for name, value in os.environ.items() if name not in ("VIRTUAL_ENV", "PYTHONUNBUFFERED")}
+    command = [str(FIXTURE.parents[3] / "scripts" / "evaluate.sh"), "compare", str(FIXTURE), str(candidate), "--json"]
+    logged = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, check=False)
+    assert logged.returncode == 2
+    diff, refusal = logged.stdout.index('"diff"'), logged.stdout.index("refused: changed-floor")
+    assert diff < refusal
+    assert json.loads(logged.stdout[:refusal])["refused"] == "changed-floor"
+
+
 def test_a_setting_observed_other_than_requested_withholds_the_attribution(
     reference: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ):
@@ -825,6 +904,24 @@ def test_the_replay_drivers_own_rows_give_its_scheduled_tool_pauses(tmp_path: Pa
     delays = json.loads(scorecard(tmp_path / "driven").summary)["distributions"]["hands_on"]["replay"]["tool_delay_ms"]
     low, high = driven.SIZES.tool_delay_ms
     assert delays["count"] > 0 and low <= delays["p50"] <= high
+
+
+def test_a_live_turn_of_unknown_finish_gives_no_tool_wait(tmp_path: Path):
+    def unknown(text: str) -> str:
+        rows = [json.loads(line) for line in text.splitlines()]
+        for row in rows:
+            if row.get("traffic") == "live":
+                row["finish_reason"] = None
+        return "".join(json.dumps(row) + "\n" for row in rows)
+
+    copy = tmp_path / "unknown"
+    shutil.copytree(FIXTURE, copy, ignore=shutil.ignore_patterns(*report.DERIVED))
+    for path in (copy / report.OBSERVATIONS).glob("*.jsonl"):
+        path.write_text(unknown(path.read_text()))
+    reseal(copy)
+    sides = json.loads(scorecard(copy).summary)["distributions"]["hands_on"]
+    assert (sides["live"]["tool_delay_ms"]["count"], sides["live"]["tool_delay_ms"]["p50"]) == (0, None)
+    assert sides["replay"]["tool_delay_ms"]["count"] > 0
 
 
 # --- The public export -------------------------------------------------------------------------

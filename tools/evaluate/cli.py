@@ -284,6 +284,8 @@ def _evidence(args: argparse.Namespace, example_rate: float) -> int:
     except report.ReportError as refused:
         if args.command == "compare" and args.json and diff is not None:
             print(report.dump_first({"diff": diff, "refused": str(refused)}, "diff"), end="")
+        # What was printed, the diff first, reaches a log both streams share before the refusal.
+        sys.stdout.flush()
         print(f"refused: {refused}", file=sys.stderr)
         return 2
     return 0

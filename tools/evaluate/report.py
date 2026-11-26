@@ -47,9 +47,10 @@ under the run's tokenizer. And the recommendation.
 the run's observed host count is a candidate only when every scheduled repetition passed capacity
 (`ShapeVerdict.PASS`), every required family/harness cell of the shape meets the absolute floor at
 class load, the paired relative check at class load passes, the class load was there (each live
-cell read at class load has every counted send as a row, a request of each trial, and the
-background of every other seat from before its first trial until after its last: `class_load`),
-and that host count served (requested and observed in the manifest, and the hosts each attempt the
+cell read at class load has every counted send as a row, a driver within its lag tolerance, a
+request of each trial, the live task alone on the first seat, and the replay of every other seat
+from before its first trial until after its last, never idle longer than its schedule pauses:
+`load_evidence`), and that host count served (requested and observed in the manifest, and the hosts each attempt the
 shape is read on observed and accounted for). A low-load miss is shown in its own rows and decides
 nothing at class size. A run with no paired decision of its own is never recommended: one read
 alone, and the reference of a comparison, the baseline the change is measured from. The smallest
@@ -63,7 +64,9 @@ that differ, any setting a run observed other than it requested, the run's setti
 and the lever each changed setting belongs to (`Lever`). A run whose observed settings contradict
 its requested ones is refused (`CONTRADICTED_SETTING`): no change can be attributed to what it
 requested. Observed settings that differ with their lever not declared changed are refused as
-undeclared.
+undeclared, setting by setting: a declared host count does not cover another instance type
+observed. A paired decision is withheld (inconclusive, `LOAD_UNSHOWN`) unless both runs show the
+load it is read at, the reference as much as the candidate.
 Two runs compare only when they are one planned workload: a changed floor (`objectives`) or sample
 budget (`sampling`) is refused by name, any other change of the workload as incompatible. Each
 lever that changed must be shown to have served, in both runs: the hosts and the release by the
@@ -751,14 +754,16 @@ def _peak(intervals: Iterable[tuple[int, int]]) -> int:
 
 def _tool_delays(groups: Iterable[Sequence[RequestRecord]]) -> list[float]:
     """Within each conversation, the wait from the end of a turn to the time the next turn was
-    eligible: the tool's own time. A turn that ended its answer (a stop, a length cut) or failed
-    is followed by no tool; the replay driver writes no finish reason, and the pause it scheduled
-    between two turns is read from their times alone."""
+    eligible: the tool's own time. Only a turn that asked for a tool is followed by one: a live
+    turn whose finish reason is anything else, or unknown, gives no tool wait. The replay driver
+    writes no finish reason and pauses for a tool between every two turns of its schedule, so
+    for its own rows that pause is read from their times alone."""
     delays = []
     for requests in groups:
         ordered = sorted(requests, key=lambda one: one.turn)
         for before, after in pairwise(ordered):
-            tool = before.finish_reason in (FinishReason.TOOL_USE, None) and not before.failed
+            scheduled = before.traffic is Traffic.BACKGROUND and before.finish_reason is None
+            tool = (before.finish_reason is FinishReason.TOOL_USE or scheduled) and not before.failed
             if tool and after.turn == before.turn + 1:
                 delays.append(float(max(0, after.eligible_ms - before.ended_ms)))
     return delays
@@ -896,52 +901,93 @@ LIVE_PHASES = (contracts.Phase.LIVE_LOW_LOAD, contracts.Phase.LIVE_CLASS_LOAD)
 
 
 class LoadGap(StrEnum):
-    """Why a live cell read at class load does not show that load."""
+    """Why a live cell does not show the load it is read at."""
 
     NOT_MEASURED = "not_measured"
     SENDS_UNACCOUNTED = "sends_unaccounted"
+    DRIVER_LAG = "driver_lag"
     TRIAL_UNSENT = "trial_unsent"
+    SEATS_UNPLANNED = "seats_unplanned"
     BACKGROUND_MISSING = "background_missing"
     BACKGROUND_SHORT = "background_short"
+    BACKGROUND_IDLE = "background_idle"
+
+
+# What `capacity` finds in a live cell that keeps it from showing its load: a send that is no row,
+# or a driver that lagged past the protocol's tolerance, so that what was sent is not the schedule.
+_LOAD_REASONS = {
+    capacity.Reason.ATTEMPTS_UNACCOUNTED: LoadGap.SENDS_UNACCOUNTED,
+    capacity.Reason.DRIVER_LAG: LoadGap.DRIVER_LAG,
+}
+
+
+def _longest_pause_ms(plan: planning.Plan) -> float:
+    """The longest a replay seat is idle by its schedule: the longest tool pause, which is also the
+    longest pause before a replacement conversation, and the driver's tolerated lag on top."""
+    protocol = plan.spec.protocol
+    return float(protocol["replay"]["tool_delay_ms"][1]) + float(protocol["driver"]["scheduling_lag_p95_ms_max"])
+
+
+def _background_gap(background: Sequence[RequestRecord], first: int, last: int, pause: float) -> LoadGap | None:
+    """Whether a seat's replay kept up its load from the first trial's start to the last one's
+    end: a request of the seat open or due (from the time it was eligible until it ended) at the
+    first start and at the last end, and no idle stretch between them longer than its schedule
+    pauses."""
+    if not background:
+        return LoadGap.BACKGROUND_MISSING
+    spans = sorted((one.eligible_ms, one.ended_ms) for one in background)
+    if spans[0][0] > first:
+        return LoadGap.BACKGROUND_SHORT
+    reach = spans[0][1]
+    for start, end in spans[1:]:
+        if reach >= last:
+            break
+        if start > first and start - reach > pause:
+            return LoadGap.BACKGROUND_IDLE
+        reach = max(reach, end)
+    return LoadGap.BACKGROUND_SHORT if reach < last else None
 
 
 def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt | None) -> LoadGap | None:
-    """What a live cell read at class load lacks to show it ran under that load, or `None`. Every
-    send the scheduler counted must be a row (`capacity`'s reconciliation), every trial that counts
-    must have sent its own requests, and each seat the plan gives the background (all but the live
-    task's first) must have sent background traffic from before the first trial started until
-    after the last one ended."""
+    """What a live cell lacks to show the load it is read at, or `None`. Every send the scheduler
+    counted must be a row (`capacity`'s reconciliation), the driver must have kept to its schedule
+    within the protocol's tolerance, and every trial that counts must have sent its own requests.
+    At class load the live task runs alone on the first seat, each other seat the plan gives the
+    background sends replay and nothing else, and each kept up its load from before the first trial
+    started until after the last one ended, never idle longer than its schedule pauses."""
     if attempt is None:
         return LoadGap.NOT_MEASURED
     cell = next(one for one in reading.capacity.cells if one.identity.cell == planned.identity.cell)
-    if capacity.Reason.ATTEMPTS_UNACCOUNTED in cell.reasons:
-        return LoadGap.SENDS_UNACCOUNTED
+    for reason, gap in _LOAD_REASONS.items():
+        if reason in cell.reasons:
+            return gap
     trials = [trial for trial in attempt.trials if trial.counts_as_attempt]
-    sent = {request.trial for request in attempt.requests if request.traffic is Traffic.LIVE}
-    if any(trial.trial not in sent for trial in trials):
+    live = [request for request in attempt.requests if request.traffic is Traffic.LIVE]
+    if any(trial.trial not in {request.trial for request in live} for trial in trials):
         return LoadGap.TRIAL_UNSENT
     if planned.identity.phase is not contracts.Phase.LIVE_CLASS_LOAD or not trials:
         return None
+    seats = range(1, planned.identities)
+    background = [request for request in attempt.requests if request.traffic is Traffic.BACKGROUND]
+    if any(one.student != 0 for one in (*attempt.trials, *live)) or any(one.student not in seats for one in background):
+        return LoadGap.SEATS_UNPLANNED
     first, last = min(trial.started_ms for trial in trials), max(trial.ended_ms for trial in trials)
-    for seat in range(1, planned.identities):
-        background = [
-            request for request in attempt.requests if request.traffic is Traffic.BACKGROUND and request.student == seat
-        ]
-        if not background:
-            return LoadGap.BACKGROUND_MISSING
-        if min(one.sent_ms for one in background) > first or max(one.ended_ms for one in background) < last:
-            return LoadGap.BACKGROUND_SHORT
+    pause = _longest_pause_ms(reading.bundle.plan)
+    for seat in seats:
+        gap = _background_gap([one for one in background if one.student == seat], first, last, pause)
+        if gap is not None:
+            return gap
     return None
 
 
-def class_load(reading: Reading, shape: Shape) -> list[dict[str, Any]]:
-    """Each live cell of a shape read at class load, and whether its evidence shows that load."""
+def load_evidence(reading: Reading, shape: Shape, load: Load = Load.CLASS) -> list[dict[str, Any]]:
+    """Each live cell of a shape read at a load, and whether its evidence shows that load."""
     measured = {attempt.record.cell: attempt for attempt in _measured(reading.bundle)}
     workload = reading.manifest.workload
     rows = []
     for planned in reading.bundle.plan.cells:
         identity = planned.identity
-        if identity.shape is not shape or Load.CLASS not in quality.loads_of(workload, identity.cell):
+        if identity.shape is not shape or load not in quality.loads_of(workload, identity.cell):
             continue
         attempt = measured.get(identity.cell)
         gap = _load_gap(reading, planned, attempt)
@@ -1001,7 +1047,7 @@ def _checks(reading: Reading, shape: Shape, relative: Outcome | str) -> dict[str
         paired = UNKNOWN
     else:
         paired = {Outcome.PASS: MET, Outcome.FAIL: MISSED}.get(Outcome(relative), UNKNOWN)
-    loaded = class_load(reading, shape)
+    loaded = load_evidence(reading, shape)
     return {
         "capacity": capacity_check,
         "absolute_quality": absolute,
@@ -1079,7 +1125,7 @@ def scorecard(reading: Reading, *, usd_per_host_hour: float, rate_source: str) -
         "conditions": _conditions(manifest),
         "capacity": _capacity(reading),
         "capacity_sweep": _sweep(reading),
-        "class_load_evidence": {shape.value: class_load(reading, shape) for shape in Shape},
+        "class_load_evidence": {shape.value: load_evidence(reading, shape) for shape in Shape},
         "capacity_by_harness": _by_harness(reading),
         "quality": _quality(reading),
         "distributions": _distributions(reading),
@@ -1288,12 +1334,15 @@ def check_comparable(reference: Bundle, candidate: Bundle) -> dict[str, Any]:
     for lever, names in sorted(changed.items()):
         if not (_served(reference, lever, names) and _served(candidate, lever, names)):
             raise ReportError(Refusal.UNVERIFIED_TREATMENT, lever)
-    seen_apart = {
-        Lever(row["lever"]) for row in diff["observed"] if row["reference"] is not None and row["candidate"] is not None
-    }
-    undeclared = sorted(seen_apart - set(changed))
+    declared = {row["setting"] for row in diff["settings"]}
+    undeclared = sorted(
+        LEVERS[row["setting"]]
+        for row in diff["observed"]
+        if row["reference"] is not None and row["candidate"] is not None and row["setting"] not in declared
+    )
     if undeclared:
-        # The two observed different settings that neither requested apart.
+        # The two observed a setting different that neither requested apart: it is a change of its
+        # own, even beside a declared one of its lever (another instance beside another count).
         raise ReportError(Refusal.UNDECLARED_TREATMENT, undeclared[0])
     fingerprints = (_launch_fingerprint(reference), _launch_fingerprint(candidate))
     if Lever.LAUNCH_SETTINGS in changed and fingerprints[0] == fingerprints[1]:
@@ -1331,12 +1380,30 @@ def _realized(reading: Reading) -> dict[str, Any]:
     return found
 
 
-def _decision(decision: quality.Decision) -> dict[str, Any]:
+# Why a paired decision is withheld: a run of the pair does not show the load it is read at.
+LOAD_UNSHOWN = "load-unshown"
+
+
+def _load_shown(reading: Reading, load: Load, shape: Shape | None) -> bool:
+    """Whether every live cell a paired decision reads, of its shape (or of both, for the
+    combined one) at its load, shows that load (`load_evidence`)."""
+    shapes = list(Shape) if shape is None else [shape]
+    rows = [row for one in shapes for row in load_evidence(reading, one, load)]
+    return bool(rows) and all(row["status"] == MET for row in rows)
+
+
+def _decision(decision: quality.Decision, unshown: Sequence[str]) -> dict[str, Any]:
+    """A paired decision as the comparison shows it. One whose load a run of the pair does not
+    show (`unshown`, the names of those runs) is withheld: inconclusive, whatever its interval."""
+    outcome, reason = decision.outcome.value, None if decision.reason is None else decision.reason.value
+    if unshown:
+        outcome, reason = Outcome.INCONCLUSIVE.value, LOAD_UNSHOWN
     return {
         "load": decision.load.value,
         "shape": None if decision.shape is None else decision.shape.value,
-        "outcome": decision.outcome.value,
-        "reason": None if decision.reason is None else decision.reason.value,
+        "outcome": outcome,
+        "reason": reason,
+        "load_unshown": list(unshown),
         "difference_points": _n(decision.difference_points),
         "lower_points": _n(decision.lower_points),
         "upper_points": _n(decision.upper_points),
@@ -1354,12 +1421,28 @@ def compare(reference: Bundle, candidate: Bundle, *, usd_per_host_hour: float, r
     theirs = read(reference, usd_per_host_hour=usd_per_host_hour)
     ours = read(candidate, usd_per_host_hour=usd_per_host_hour)
     paired = quality.compare(ours.records, theirs.records)
-    relative = {shape: paired.of(Load.CLASS, shape).outcome for shape in Shape}
+    # A pair is compared at a load only where both runs show it: an unloaded reference does not
+    # qualify a loaded candidate, nor the other way round.
+    decisions = [
+        _decision(
+            decision,
+            [
+                name
+                for name, run in (("reference", theirs), ("candidate", ours))
+                if not _load_shown(run, decision.load, decision.shape)
+            ],
+        )
+        for decision in paired.decisions
+    ]
+    relative = {
+        shape: Outcome(next(one for one in decisions if one["load"] == Load.CLASS and one["shape"] == shape)["outcome"])
+        for shape in Shape
+    }
     return {
         "kind": "comparison",
         "summary_version": SUMMARY_VERSION,
         "diff": diff,
-        "decisions": [_decision(decision) for decision in paired.decisions],
+        "decisions": decisions,
         "realized": {"reference": _realized(theirs), "candidate": _realized(ours)},
         "tokenizers": {"reference": _tokenizer(theirs), "candidate": _tokenizer(ours)},
         "recommendation": recommend([("reference", theirs, BASELINE), ("candidate", ours, relative)]),
@@ -1673,7 +1756,7 @@ def render_comparison(comparison: Mapping[str, Any]) -> str:
                 one["load"],
                 one["shape"] or "combined",
                 one["outcome"],
-                one["reason"],
+                one["reason"] if not one["load_unshown"] else f"{one['reason']} ({', '.join(one['load_unshown'])})",
                 one["difference_points"],
                 f"{_cell(one['lower_points'])} to {_cell(one['upper_points'])}",
                 one["margin_points"],
