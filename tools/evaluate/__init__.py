@@ -72,4 +72,10 @@ each attempt of a cell) and regenerates its `summary.json`, `report.md` and dige
 `capacity` and `quality`: capacity, quality and the replay against the live tasks by shape, harness
 and load, the requested and observed settings, and the recommendation. It compares two bundles,
 diff first, and exports a validated, scanned bundle under `docs/evaluations/`.
+
+`evaluate.publisher` persists the results on GitHub as the driver: one issue per experiment,
+created or selected before any booking, and a terminal comment per run and per paired comparison,
+rendered from allow-listed fields, scanned before each write and queued in the run's journal. It
+reconciles a lost answer by its marker against the driver's own records and resumes delivery from
+the journal alone. It needs the standard library, `evaluate.journal` and the hygiene scanner only.
 """

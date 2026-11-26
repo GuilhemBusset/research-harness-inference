@@ -46,6 +46,10 @@ run. After it, `confirm` saves what came back: the issue's number, the exact boo
 comment. An intent that is still pending after a restart is an action that may or may not have
 happened: the driver looks for its marker in the actual record, then confirms it or rules it out
 (`rule_out`). One intent of each action is pending at most, so a retry targets the same record.
+An action that has to wait for the pending one is saved with `queue`, its marker made then: it is
+not sent, and `dequeue` makes it the pending one once nothing else of its action is, in the order
+they were queued. A comment that is ready while the one before it is still in doubt is saved
+whole, so that a restart delivers both, in order.
 A booking or a delivery is refused until the issue number is journaled. `adopt_issue` journals the
 number of an issue the operator named. What an intent saved does not change afterwards: its
 payload and its result are given as copies, and a change to one changes nothing in the journal.
@@ -138,6 +142,7 @@ class Refusal(StrEnum):
     ISSUE_ALREADY_JOURNALED = "issue-already-journaled"
     ACTION_PENDING = "action-pending"
     INTENT_NOT_PENDING = "intent-not-pending"
+    INTENT_NOT_QUEUED = "intent-not-queued"
     ATTEMPT_RUNNING = "attempt-running"
     ATTEMPT_NOT_RUNNING = "attempt-not-running"
     CELL_ALREADY_MEASURED = "cell-already-measured"
@@ -166,6 +171,8 @@ class Action(StrEnum):
 class IntentStatus(StrEnum):
     # Saved, and not known to have happened or not.
     PENDING = "pending"
+    # Saved, and not sent: it waits for the pending one of its action to settle.
+    QUEUED = "queued"
     CONFIRMED = "confirmed"
     # Looked for in the actual record and not there: it did not happen.
     RULED_OUT = "ruled-out"
@@ -548,19 +555,44 @@ class Journal:
 
     # --- Intents ---
 
-    def intend(self, action: Action, payload: Mapping[str, object]) -> Intent:
-        """Saves that `action` is about to be taken with `payload`, and gives its marker."""
-        if any(intent.action is action and intent.status is IntentStatus.PENDING for intent in self.intents):
-            raise JournalError(Refusal.ACTION_PENDING)
+    def _new_intent(self, action: Action, payload: Mapping[str, object], status: IntentStatus) -> Intent:
         if action is Action.CREATE_ISSUE and self.issue_number is not None:
             raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
         if action is not Action.CREATE_ISSUE and self.issue_number is None:
             raise JournalError(Refusal.ISSUE_NOT_JOURNALED)
         ordinal = len(self.intents)
         marker = f"{MARKER_PREFIX}{self.run_id}/{ordinal}"
-        intent = Intent(ordinal, action, marker, IntentStatus.PENDING, _private(payload), None)
+        intent = Intent(ordinal, action, marker, status, _private(payload), None)
         self._transition(intents=(*self.intents, intent))
         return intent
+
+    def _refuse_pending(self, action: Action) -> None:
+        if any(intent.action is action and intent.status is IntentStatus.PENDING for intent in self.intents):
+            raise JournalError(Refusal.ACTION_PENDING)
+
+    def intend(self, action: Action, payload: Mapping[str, object]) -> Intent:
+        """Saves that `action` is about to be taken with `payload`, and gives its marker."""
+        self._refuse_pending(action)
+        return self._new_intent(action, payload, IntentStatus.PENDING)
+
+    def queue(self, action: Action, payload: Mapping[str, object]) -> Intent:
+        """Saves `payload` and its marker for an `action` that is not taken yet: it waits behind
+        the pending intent of its action, whether or not there is one, until `dequeue`."""
+        return self._new_intent(action, payload, IntentStatus.QUEUED)
+
+    def dequeue(self, ordinal: int) -> Intent:
+        """Makes a queued intent the pending one of its action, with the marker it was queued
+        with. The first queued of its action goes first."""
+        if type(ordinal) is not int or not 0 <= ordinal < len(self.intents):
+            raise JournalError(Refusal.INTENT_NOT_QUEUED)
+        queued = self.intents[ordinal]
+        first = next(one for one in self.intents if one.action is queued.action and one.status is queued.status)
+        if queued.status is not IntentStatus.QUEUED or first.ordinal != ordinal:
+            raise JournalError(Refusal.INTENT_NOT_QUEUED)
+        self._refuse_pending(queued.action)
+        pending = dataclasses.replace(queued, status=IntentStatus.PENDING)
+        self._transition(intents=(*self.intents[:ordinal], pending, *self.intents[ordinal + 1 :]))
+        return pending
 
     def _settle(self, ordinal: int, status: IntentStatus, result: str | None, **changes: Any) -> Intent:
         if type(ordinal) is not int or not 0 <= ordinal < len(self.intents):

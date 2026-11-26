@@ -510,6 +510,26 @@ def test_the_issue_number_is_journaled_before_a_booking_or_a_delivery(tmp_path: 
     assert again.intents[booking.ordinal].result == RESULTS[Action.BOOK]  # the exact booking returned
 
 
+def test_a_queued_delivery_waits_behind_the_pending_one_with_its_marker(tmp_path: Path) -> None:
+    journal = Journal.create(tmp_path)
+    journal.adopt_issue(ISSUE)
+    first = journal.intend(Action.DELIVER, PAYLOADS[Action.DELIVER])
+    second = journal.queue(Action.DELIVER, {"body": "Comparison finished."})
+    third = journal.queue(Action.DELIVER, {"body": "A later note."})
+    assert journal.pending() == Pending(Step.RECONCILE_DELIVERY, first)  # the queued ones are not in doubt
+    with refused(Refusal.ACTION_PENDING):
+        journal.dequeue(second.ordinal)
+
+    again = restart(journal, tmp_path)
+    assert again.intents[second.ordinal] == second
+    again.confirm(first.ordinal, RESULTS[Action.DELIVER])
+    with refused(Refusal.INTENT_NOT_QUEUED):  # in the order they were queued
+        again.dequeue(third.ordinal)
+    sent = again.dequeue(second.ordinal)
+    assert (sent.status, sent.marker, sent.payload) == (IntentStatus.PENDING, second.marker, second.payload)
+    assert again.pending() == Pending(Step.RECONCILE_DELIVERY, sent)
+
+
 def test_what_an_intent_saved_does_not_change_with_what_it_gave(tmp_path: Path) -> None:
     journal = Journal.create(tmp_path)
     journal.adopt_issue(ISSUE)
