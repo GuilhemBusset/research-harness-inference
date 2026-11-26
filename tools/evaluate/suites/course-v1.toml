@@ -141,6 +141,9 @@ features = []
 # digests are the one of no file, sixty-four zeros.
 
 # Parallel analysis: overlapping workers, the plotted data, and the named comparison.
+# Its instances and its grader are tools/evaluate/course/analysis/, whose `fixture_digest` and
+# `grader_digest` compute the digests below; tools/evaluate/tests/test_analysis.py holds the two
+# together.
 [[tasks]]
 id = "analysis.t01"
 core = true
@@ -149,9 +152,9 @@ background = "several_agents"
 features = ["delegation"]
 harnesses = ["claude_code"]
 instances = [
-    { id = "analysis.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "analysis.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "analysis.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "analysis.t01.i01", fixture_digest = "sha256:a386e31bf75169018b3b1ee5b31d9d9b205077e7945ee5bf1534879a7aaa3a05", grader_digest = "sha256:951762eb38be46245cc4a58ff8b50b51715d9e4c595e845e2bd8a46a2babcf71" },
+    { id = "analysis.t01.i02", fixture_digest = "sha256:ba7ecde061f3f8faf42920e3aa3a90c4c737582633c93fb3ef74b3950cd29e2d", grader_digest = "sha256:73129a38c7405a88869d1eaa426c3b180286badb58d607ab38d2ebf8ba6fbdf4" },
+    { id = "analysis.t01.i03", fixture_digest = "sha256:5aa8abc3ff5f35b7395675755b776c5bc74db85ed224027286636caba94019d9", grader_digest = "sha256:987a65a4e1eedf0e257a3ee2cd0560db4a91dc309c774c29b0ecf13dc8146673" },
 ]
 
 # Debug and revise: the original cases, the changed cases, and the follow-up constraint.

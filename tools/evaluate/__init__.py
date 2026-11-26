@@ -14,7 +14,10 @@ from the image `evaluate.image` prepares.
 `evaluate.course` holds the course tasks, one package for each family. `evaluate.course.optimization`
 is the production-planning task: its three instances, the files a trial's workspace is given, and,
 kept outside every workspace, the reference fix and the grader that reads the plan and the table
-a run wrote. The grader needs the standard library only.
+a run wrote. The grader needs the standard library only. `evaluate.course.analysis` is the
+parallel-analysis task: its three paired-data instances and, kept outside every workspace, the
+reference solution and the grader of the two series, their figure, the named comparison and the
+spans of the workers the run delegated to; it needs the standard library only as well.
 
 `evaluate.plan` expands a suite (`suites/`) into the ordered workload of a profile and the bookings
 that hold it, offline. `evaluate.cli` is the command line, which `scripts/evaluate.sh` runs.
