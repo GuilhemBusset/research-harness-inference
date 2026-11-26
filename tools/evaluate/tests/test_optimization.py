@@ -225,9 +225,31 @@ def missing_week(plan: dict[str, Any]) -> str:
     return "\n".join(rows[:2] + rows[3:])
 
 
+def cost_in_another_row(plan: dict[str, Any]) -> str:
+    # The plan's cost under another name, and another cost as the total.
+    rows = f"Budget & {plan['cost']} \\\\\nTotal cost & {plan['cost'] + 1}"
+    return table(plan, plan["cost"]).replace(f"Total cost & {plan['cost']}", rows)
+
+
+def total_beside_the_columns(plan: dict[str, Any]) -> str:
+    # The label of the total spans every column the table has: none is left for the cost.
+    label = f"\\multicolumn{{{len(plan['production']) + 1}}}{{l}}{{Total cost}}"
+    return table(plan, plan["cost"]).replace("Total cost", label)
+
+
 @pytest.mark.parametrize("instance_id", INSTANCE_IDS)
 @pytest.mark.parametrize(
-    "disagreeing", [other_cost, negated_cost, negated_cost_in_words, other_units, swapped_columns, missing_week]
+    "disagreeing",
+    [
+        other_cost,
+        negated_cost,
+        negated_cost_in_words,
+        other_units,
+        swapped_columns,
+        missing_week,
+        cost_in_another_row,
+        total_beside_the_columns,
+    ],
 )
 def test_a_table_that_disagrees_with_the_plan_is_rejected(tmp_path: Path, instance_id: str, disagreeing: Any) -> None:
     plan = reference_plan(instance_id)
@@ -311,14 +333,40 @@ def test_a_solvers_rounding_is_within_the_tolerances_and_a_part_of_a_unit_is_not
     assert failed(grader.grade(TWIN, TWIN_OPTIMUM, produced(tmp_path / "part", part))) == {Property.INTEGRALITY}
 
 
+def test_a_number_of_the_table_may_differ_by_the_table_tolerance_and_no_more(tmp_path: Path) -> None:
+    plan = twin_plan([5, 5], [0, 0], [1, 1])
+    at_the_tolerance = table({"production": {"bell": [5.005, 4.995]}}, "20.005")
+    beyond = table({"production": {"bell": [5.006, 5]}}, "20")
+
+    assert grader.grade(TWIN, TWIN_OPTIMUM, produced(tmp_path / "at", plan, at_the_tolerance)).accepted
+    assert failed(grader.grade(TWIN, TWIN_OPTIMUM, produced(tmp_path / "beyond", plan, beyond))) == {Property.TABLE}
+
+
+def test_the_table_may_hold_the_cost_the_plan_states_or_the_cost_of_its_weeks(tmp_path: Path) -> None:
+    # A solver's cost: within the cost tolerance of what the weeks add up to, beyond the table's.
+    plan = reference_plan(EXEMPLAR)
+    plan["cost"] += 0.008
+
+    as_stated = optimization.grade(EXEMPLAR, produced(tmp_path / "stated", plan, table(plan, plan["cost"])))
+    rounded = optimization.grade(EXEMPLAR, produced(tmp_path / "rounded", plan, table(plan, round(plan["cost"]))))
+
+    assert as_stated.accepted, as_stated.faults
+    assert rounded.accepted, rounded.faults
+
+
 def test_a_table_in_another_notation_is_accepted(tmp_path: Path) -> None:
     plan = reference_plan(EXEMPLAR)
     made = plan["production"]
-    rows = [f"{t + 1} & {made['saddle'][t]} & $ {made['frame'][t]} $ & {made['wheel'][t]}.0 \\\\" for t in range(6)]
-    # Other columns, rules, type and separators than the reference writes, and a comment.
+    # Each way a row ends, the third with a comment against it.
+    ends = [r"\\", r"\tabularnewline", r"\\% week 3", r"\\[2pt]", r"\\*", r"\\"]
+    rows = [
+        f"{t + 1} & {made['saddle'][t]} & $ {made['frame'][t]} $ & {made['wheel'][t]}.0 {ends[t]}" for t in range(6)
+    ]
+    # Other columns, rules, type and separators than the reference writes, and a heading above.
     latex = "\n".join(
         [
-            r"\begin{table} \begin{tabular}[t]{@{}l r r p{2cm}@{}} \toprule",
+            r"\begin{table} \begin{tabular}[t]{@{}l *{2}{r} p{2cm}@{}} \toprule",
+            r"& \multicolumn{3}{c}{Units made} \\",
             r"\textbf{Week} & \textbf{Saddles} & \textbf{Frames} & \textbf{Wheels} \\ \cmidrule(lr){2-4}",
             *rows,
             r"\midrule % the cost was 99999 in a draft",

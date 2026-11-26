@@ -50,9 +50,10 @@ The plan to find is the one with the lowest total cost.
 
 - a header row: the week, then one column for each product, under its name in `instance.json`;
 - one row for each week: its number, then the units of each product made in that week;
-- a last row with the plan's total cost.
+- a last row with the plan's total cost, and no other number.
 
-Write the total cost as a plain number.
+Write the total cost as a plain number. Besides the week rows and the last row, no row of the
+table holds a number, and no row has more cells than the table has columns.
 
 ## What to keep
 
@@ -84,5 +85,5 @@ this folder. It establishes, from the numbers of `plan.json`:
 - that `plan.tex` holds the same units for every product and week, and the same total cost.
 
 A number of `plan.json` may be off by a solver's rounding: one millionth of a unit or of an hour,
-and one millionth of the cost, relatively. A number of the table may be off by 0.005. Any cheapest
-plan is accepted, when there are several.
+and one millionth of the cost, relatively. A number of the table may be off by 0.005, from the
+number of `plan.json` it shows. Any cheapest plan is accepted, when there are several.
