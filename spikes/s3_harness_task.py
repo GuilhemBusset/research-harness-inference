@@ -10,8 +10,9 @@ issue written then (section 12). It posts no measurement event; what it observed
 script of this module (`sdk_script`), with the OpenAI SDK of the group `spikes`:
 
 - Claude Code with its default settings: what `rhi login` writes (`rhi_cli.harness`), its key from
-  `rhi token`, and nothing else of its own. No model, effort, thinking or window is set: it asks for
-  its own `claude-` names. Two things are set that change no request it sends: the tools it may use
+  `rhi token`, and nothing else of its own. Its auto-compact window is the one `rhi login` sets
+  (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLIENT_WINDOW` below); no model, effort or thinking is set,
+  so it asks for its own `claude-` names. Two things are set that change no request it sends: the tools it may use
   without asking (`ALLOWED_TOOLS`), since it runs with no one to ask, and `DISABLE_AUTOUPDATER`, so
   that what ran is the version recorded;
 - Codex with the profile `rhi` that `rhi login` writes, with no sandbox of its own (the job's
