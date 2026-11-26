@@ -5,14 +5,16 @@ and measurement protocol").
 `expand` turns a suite (`suites/<name>.toml`), a profile and a class size into a `Plan`: a
 `contracts.Workload`, which is what a run's manifest records, and for each of its cells what the
 identity of a cell does not say (its roles, admissions, drain, identities, seeds, prefix namespace
-and arrivals). It reads the suite and nothing else: no credentials, no network, no clock, and no
-random generator, so the same suite and seeds give the same plan on any machine.
+and arrivals). It reads the suite, and the replay's course fixture for its digest, and nothing
+else: no credentials, no network, no clock, and no random generator, so the same suite and seeds
+give the same plan on any machine.
 
 **The workload.** The hash `plan` prints is `contracts.workload_identity` of that workload, the
 `workload_id` of every manifest built on it. The arrivals and the rest of what is planned for a
-cell are in it through the workload's `arrival_digest` and `protocol_digest`. It pins the
-harnesses its trials run on and no other: a screen, which runs the anchor only, is the same
-workload whatever version another harness is at. The number of hosts is a treatment and is not in
+cell are in it through the workload's `arrival_digest` and `protocol_digest`. So is the course
+fixture the replay builds its requests from (`REPLAY_FIXTURE`), by its digest in the protocol: a
+changed fixture is another workload. It pins the harnesses its trials run on and no other: a
+screen, which runs the anchor only, is the same workload whatever version another harness is at. The number of hosts is a treatment and is not in
 it: one and two hosts are planned the same workload.
 
 **The order.** The warm-up first, then one round for each repetition: the capacity sweep, the live
@@ -81,6 +83,8 @@ from evaluate.contracts import (
 )
 
 SUITES = Path(__file__).resolve().parent / "suites"
+# The course fixture the replay draws its tool turns from (`traces.COURSE`), by its bytes.
+REPLAY_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "replay" / "course.json"
 DEFAULT_SUITE = "course-v1"
 HOUR_MS = 3_600_000
 # Several-agents doubles the slots of a class, and a cell has 1024 at most.
@@ -328,6 +332,11 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def file_digest(path: Path) -> str:
+    """The digest of a file's bytes."""
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _derive(*parts: object) -> int:
     """A seed, or any 32-bit number, that depends on every part and on nothing else."""
     return int(_digest(list(parts))[7:15], 16)
@@ -414,7 +423,7 @@ def _read(name: str, raw: dict[str, Any]) -> SuiteSpec:
         opening_window_ms=_whole(raw["opening"]["window_ms"], 1),
         profiles={profile: _profile(raw["profiles"][profile]) for profile in Profile},
         estimates=Estimates(**{key: _whole(value) for key, value in raw["estimates"].items()}),
-        protocol={key: raw[key] for key in _PROTOCOL},
+        protocol={key: raw[key] for key in _PROTOCOL} | {"replay_fixture_digest": file_digest(REPLAY_FIXTURE)},
     )
 
 
