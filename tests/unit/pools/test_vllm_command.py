@@ -135,6 +135,7 @@ def assert_the_contracts_settings(arguments: list[str]) -> None:
     assert values(arguments, "--port") == ["8000"]
     assert values(arguments, "--served-model-name") == ["coursework"]
     assert values(arguments, "--kv-cache-metrics") == []
+    assert values(arguments, "--enable-prompt-tokens-details") == []
 
     # Media only from inline data: the allow-list names one domain, which never resolves.
     assert values(arguments, "--allowed-media-domains") == ["media.invalid"]
@@ -300,6 +301,21 @@ def test_no_effort_mapping_in_the_engine(changes: dict[str, object]) -> None:
 
 # Every serving setting that adds an argument, at once.
 EVERY_SETTING: dict[str, object] = {**SECTION_4_2, "prefix_caching": False, **DRAFT_HEAD, **EXCEPTION}
+
+
+@pytest.mark.parametrize("loader", [{}, {"loader": "stream"}, DOWNLOAD], ids=["no-loader", "stream", "download"])
+@pytest.mark.parametrize(
+    "changes",
+    [{}, EXCEPTION, SECTION_4_2, {"prefix_caching": False}, EVERY_SETTING],
+    ids=["plain", "with-the-exception", "section-4-2", "prefix-caching-off", "every-setting"],
+)
+def test_every_vllm_pool_reports_the_cached_part_of_its_input(
+    loader: dict[str, object], changes: dict[str, object]
+) -> None:
+    # Without the switch, an answer reports no cached input (`rhi.pools.vllm_command`).
+    arguments = vllm_command.arguments(pool({**changes, **loader}), bucket=BUCKET)
+    assert options(arguments).count("--enable-prompt-tokens-details") == 1
+    assert values(arguments, "--enable-prompt-tokens-details") == []
 
 
 @pytest.mark.parametrize(
