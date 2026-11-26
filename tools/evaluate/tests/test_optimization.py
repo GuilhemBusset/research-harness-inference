@@ -360,8 +360,10 @@ def test_a_table_in_another_notation_is_accepted(tmp_path: Path) -> None:
     made = plan["production"]
     # Each way a row ends, the third with a comment against it.
     ends = [r"\\", r"\tabularnewline", r"\\% week 3", r"\\[2pt]", r"\\*", r"\\"]
-    # The first week's number braced, after a rule that takes no argument.
-    weeks = [f"\\hline {{{t + 1}}}" if t == 0 else str(t + 1) for t in range(6)]
+    # The first week's number braced, after a rule that takes no argument; the next two highlighted,
+    # a row with the overhangs of its colour and a cell with a colour model.
+    weeks = [r"\hline {1}", r"\rowcolor{yellow}[0.5\tabcolsep][0.5\tabcolsep] 2", r"\cellcolor[gray]{0.9} 3"]
+    weeks += [str(t + 1) for t in range(3, 6)]
     rows = [
         f"{weeks[t]} & {made['saddle'][t]} & $ {made['frame'][t]} $ & {made['wheel'][t]}.0 {ends[t]}" for t in range(6)
     ]

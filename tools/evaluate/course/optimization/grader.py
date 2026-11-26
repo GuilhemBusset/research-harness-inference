@@ -276,7 +276,9 @@ _RULE_ARGUMENTS = {
     r"specialrule": _ARGUMENT * 3,
     r"rule": _OPTIONAL + _ARGUMENT * 2,
     r"vspace\*?|hspace\*?": _ARGUMENT,
-    r"rowcolor|cellcolor": _OPTIONAL + _ARGUMENT,
+    # colortbl: \rowcolor[model]{colour}[left overhang][right overhang], \cellcolor[model]{colour}.
+    r"rowcolor": _OPTIONAL + _ARGUMENT + _OPTIONAL * 2,
+    r"cellcolor": _OPTIONAL + _ARGUMENT,
 }
 _RULE = re.compile("|".join(rf"\\(?:{names})(?![A-Za-z]){arguments}" for names, arguments in _RULE_ARGUMENTS.items()))
 _ROW_END = re.compile(r"(?:\\\\\*?|\\(?:tabularnewline|cr)(?![A-Za-z]))(?:\s*\[[^\]]*\])?")
