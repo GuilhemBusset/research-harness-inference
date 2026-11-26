@@ -313,14 +313,14 @@ def test_an_agent_that_names_no_engine_beyond_the_allowance_leaves_the_window_wi
         workspace.add(LAUNCH, lambda _: 1, gap, instance=HOST_A, settings_fingerprint="unavailable")
         return reading(workspace, requested=replace(REQUESTED, launch_fingerprint=None))
 
-    # Two scrapes: 45 seconds, from the fingerprint at 1093 to the one at 1138, name no engine.
-    read = unnamed(2)
+    # Three scrapes: 45 seconds, from the first `unavailable` at 1108 to the fingerprint at 1153.
+    read = unnamed(3)
     assert read.treatments[Treatment.LAUNCH_SETTINGS] is Reason.NOT_DECLARED
     assert [host.launch_unnamed for host in read.hosts] == [True, False]
     assert read.reasons == (Reason.INCOMPLETE_COVERAGE,)
     assert read.flags == (InvalidFlag.MISSING_EVIDENCE,)
-    # One scrape is within the allowance, as a scrape that never arrived would be.
-    assert unnamed(1).reasons == ()
+    # Two scrapes, 1108 to 1138, are the allowance itself.
+    assert unnamed(2).reasons == ()
 
 
 def test_the_effective_settings_an_engine_exposes_are_observed_where_every_host_agrees() -> None:
@@ -829,6 +829,23 @@ def test_an_identity_there_before_the_window_with_no_number_to_count_from_does_n
     answers = telemetry.read(workspace, POOL, VLLM, WINDOW, WARM_UP)
     assert telemetry.identity_requests(answers, WINDOW, COHORT) == {COHORT[0]: None, COHORT[1]: 16}
 
+    # Another identity reads no number at the scrapes that bound the window, and counts nothing.
+    workspace = clean()
+    workspace.add(GATEWAY, lambda _: float("nan"), (973.0, 988.0, 1_303.0), alias="other", instance=TASK)
+    read = reading(workspace)
+    assert (read.traffic.coverage, read.traffic.reconciled, read.traffic.cohort_requests) == (
+        Coverage.INCOMPLETE,
+        False,
+        40,
+    )
+
+    # No identity reads a number: the counters are there, and unreadable, not missing.
+    workspace = clean()
+    for one in workspace.find(GATEWAY):
+        one.value = lambda _: float("nan")
+    read = reading(workspace)
+    assert (read.traffic.coverage, read.traffic.reconciled) == (Coverage.INCOMPLETE, False)
+
 
 def test_the_cohorts_count_reconciles_with_attempts_and_side_queries_together() -> None:
     assert reading(clean()).traffic.driver_requests == 40
@@ -898,6 +915,20 @@ def test_an_engine_named_only_inside_the_window_is_not_warmed_by_the_warm_up() -
     assert (first.warm_up_output_tokens, first.engine_replaced, first.warmed) == (600, False, False)
     assert (second.warm_up_output_tokens, second.warmed) == (600, True)
     assert Reason.WARM_UP_INCOMPLETE in read.reasons
+
+    # The agent names the warm-up's engine up to 943, and first speaks in the window at 1048, of
+    # another one: that one served the window, and the warm-up is not shown to be its.
+    workspace = clean()
+    workspace.find(LAUNCH, instance=HOST_A)[0].times = tuple(at for at in SCRAPES if at <= 943)
+    workspace.add(
+        LAUNCH,
+        lambda _: 1,
+        tuple(at for at in SCRAPES if at >= 1_048),
+        instance=HOST_A,
+        settings_fingerprint=OTHER_FINGERPRINT,
+    )
+    first = reading(workspace).hosts[0]
+    assert (first.warm_up_output_tokens, first.warmed) == (600, False)
 
 
 def test_a_host_that_only_answered_its_own_liveness_was_not_warmed_up() -> None:

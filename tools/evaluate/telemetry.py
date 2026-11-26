@@ -105,8 +105,10 @@ rates; nothing flags them.
 An identity's series begins with its first request, so one that first appears in the window, with
 no sample at or before its start, counts from zero. One that was there before the window and says
 no number at or before its start has a baseline that cannot be read: it counts from its first
-number, and the counters neither cover the window nor reconcile. What the pool counted beyond the
-cohort came from someone else, a student or a deployment's smoke test, and is `external_traffic`. What the cohort counted must be what the driver says reached
+number, and the counters neither cover the window nor reconcile; one scraped at the window's
+bounding scrapes with no number at all counts nothing and leaves the same hole. What the pool
+counted beyond the cohort came from someone else, a student or a deployment's smoke test, and is
+`external_traffic`. What the cohort counted must be what the driver says reached
 the gateway: its attempts, retries included, and the side queries of its harnesses; a difference is
 `unreconciled_counters`. Matching counts say nothing of seconds the gateway's counters do not cover:
 each of its tasks must have been scraped through the whole window, and each series through the drain
@@ -132,8 +134,9 @@ engine since the warm-up began, a counter that restarted, or a second fingerprin
 tokens are kept and the host is not warmed (`warm_up_engine_replaced`). An agent that says no
 fingerprint (`unavailable`) names no engine, so no other one: when it named its engine after the
 warm-up began, the tokens that warm are the ones counted since. What ties the warm-up to the
-engine the window measured is the fingerprint the agent said last by the window's first scrape:
-when it says none there, or named its engine only from inside the window, the tokens are kept and
+engine the window measured is the fingerprint the agent said last by its first launch sample in
+the window: when it says none there, names its engine only from inside the window, or names
+another one than the warm-up's, or when the window has no launch sample, the tokens are kept and
 warm nothing. A restart inside the window
 is the window's: it is counted across and recorded, and flags nothing. The warm-up must be over
 by the scrape the window's increases run from. When a counter of a host rose between two scrapes
@@ -725,6 +728,16 @@ def _began(one: Series, window: Window) -> bool:
     return not any(at <= window.started for at, _ in one.samples if math.isfinite(at))
 
 
+def _present(one: Series, window: Window) -> bool:
+    """Whether the series has a sample, a number or not, where the scrapes that bound the window
+    are: from the allowance before its start to a scrape after its drain, as `_risen` reads it."""
+    return any(
+        window.started - ALLOWANCE_SECONDS <= at < window.drained + SCRAPE_SECONDS
+        for at, _ in one.samples
+        if math.isfinite(at)
+    )
+
+
 def _bounding(one: Series, window: Window) -> list[Sample]:
     """The samples that bound the window: from the last at or before its start to the first at
     or after its drain. What was scraped beyond them is not the window's."""
@@ -864,19 +877,18 @@ def _said(by: Mapping[tuple[str, ...], list[float]], window: Window) -> dict[tup
 def _unnamed(launch: Iterable[Series], low: float, high: float) -> float:
     """The longest time from `low` to `high` that one host's agent left its engine unnamed by
     saying no fingerprint (`unavailable`, or a text outside the grammar): for each run of such
-    samples, from the last sample before it that named an engine to the first after it that did,
-    held to `low` and `high`. As with any other hole, two samples that name the engine a scrape
-    apart, with one that does not between them, leave nothing unshown."""
-    longest, named, run = 0.0, -math.inf, False
+    samples, from its first sample to the first after it that named an engine, or to `high`,
+    held to `low` and `high`."""
+    longest, began = 0.0, None
     for at, text in _spoken(launch):
         if _FINGERPRINT.fullmatch(text):
-            if run:
-                longest = max(longest, min(at, high) - max(named, low))
-            named, run = at, False
-        else:
-            run = True
-    if run:
-        longest = max(longest, high - max(named, low))
+            if began is not None:
+                longest = max(longest, min(at, high) - max(began, low))
+            began = None
+        elif began is None:
+            began = at
+    if began is not None:
+        longest = max(longest, high - max(began, low))
     return longest
 
 
@@ -942,13 +954,15 @@ def _traffic(series: Sequence[Series], window: Window, driver: Driver) -> Traffi
     for one in series:
         by_task.setdefault(one.labels.get("instance", ""), []).append(one)
     series = [one for held in by_task.values() for one in _closed(held, window)]
-    every = [
-        (one, found) for one in series if (found := _risen(one, window, from_zero=_began(one, window))) is not None
-    ]
+    found_of = [(one, _risen(one, window, from_zero=_began(one, window))) for one in series]
+    every = [(one, found) for one, found in found_of if found is not None]
+    # A series scraped where the window's bounding scrapes are and with no number there to count
+    # with is an identity whose count cannot be read: a hole, and not an identity that was absent.
+    unread = any(found is None and _present(one, window) for one, found in found_of)
     # An increase beyond the bound of a count is no count: left out, and a hole in the evidence.
     risen = [(one, found) for one, found in every if _within(found[0])]
     if not any(times[-1] > window.started for _, (_, _, times) in risen):
-        coverage = Coverage.INCOMPLETE if every else Coverage.MISSING
+        coverage = Coverage.INCOMPLETE if every or unread else Coverage.MISSING
         return Traffic(None, None, None, expected, 0, driver.setup_probes == 0, coverage)
     # Each task of the gateway must show scrapes through the whole window, by any of its series:
     # only then did a series that begins in the window begin with its first request. And each
@@ -958,7 +972,8 @@ def _traffic(series: Sequence[Series], window: Window, driver: Driver) -> Traffi
     for one, (_, _, times) in risen:
         tasks.setdefault(one.labels.get("instance", ""), set()).update(times)
     complete = (
-        len(risen) == len(every)
+        not unread
+        and len(risen) == len(every)
         and all(_covers(sorted(times), window) for times in tasks.values())
         and all(times[-1] >= window.drained and _unbroken(times) for _, (_, _, times) in risen)
         and all(_began(one, window) or times[0] <= window.started for one, (_, _, times) in risen)
@@ -1153,8 +1168,9 @@ def _warm_up(
     The tokens that warm are the warm-up's for certain and that engine's: not the ones the
     window's scrapes count too, and, when the agent named its engine after the warm-up began
     (`_established`), the ones counted since. What ties them to that engine is the fingerprint
-    the agent said last by the window's first scrape of it: when that names no engine, or names
-    it only from inside the window, the warm-up's tokens are kept and warm nothing."""
+    the agent said last by the window's first scrape of it: when that names no engine, names one
+    only from inside the window (another than the warm-up's included), or there is no such
+    scrape, the warm-up's tokens are kept and warm nothing."""
     if warm_up is None:
         return None, Coverage.MISSING, False, False, False
 
@@ -1171,13 +1187,12 @@ def _warm_up(
     replaced = _replaced(of, warm_up.started, window.started)
     overlaps = any(_shared(of(metric), warm_up, window) for metric in COUNTERS)
     # The window's first scrape of the agent: what it says there was said of the engine that
-    # served the window.
+    # served the window. A window with no such scrape shows no engine the warm-up could be tied to.
     launch = of(Source.LAUNCH)
     opening = min(
-        (at for one in launch for at, _ in _scraped(one) if window.started <= at <= window.started + ALLOWANCE_SECONDS),
-        default=window.started,
+        (at for one in launch for at, _ in _scraped(one) if window.started <= at <= window.drained), default=None
     )
-    since = _established(launch, warm_up.started, opening)
+    since = None if opening is None else _established(launch, warm_up.started, opening)
     certain = worked if since is not None else None
     if certain is not None and since is not None and since > warm_up.started:
         certain = _added(during(HostMetric.OUTPUT_TOKENS_TOTAL), since)
