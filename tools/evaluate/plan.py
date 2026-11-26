@@ -10,14 +10,18 @@ random generator, so the same suite and seeds give the same plan on any machine.
 
 **The workload.** The hash `plan` prints is `contracts.workload_identity` of that workload, the
 `workload_id` of every manifest built on it. The arrivals and the rest of what is planned for a
-cell are in it through the workload's `arrival_digest` and `protocol_digest`. The number of hosts
-is a treatment and is not: one and two hosts are planned the same workload.
+cell are in it through the workload's `arrival_digest` and `protocol_digest`. It pins the
+harnesses its trials run on and no other: a screen, which runs the anchor only, is the same
+workload whatever version another harness is at. The number of hosts is a treatment and is not in
+it: one and two hosts are planned the same workload.
 
 **The order.** The warm-up first, then one round for each repetition: the capacity sweep, the live
 tasks at low load, the live tasks at class size, the class opening. The cells of a round start a
 part of the way down their list that grows with the repetition, so no cell always follows the same
 one. The design asks to batch a qualification "by family and replicate": a round is a replicate,
-and a live cell holds the two families of one shape.
+and a live cell holds the trials of one family at one load, so a booking can end between two
+families. The largest cell of a qualification is then the family with the most instance/harness
+pairs.
 
 **What is planned once.** A sweep cell at the class size that has the agent slots of a diagnostic
 cell is one cell with both roles and the longer admissions. With one seat no other seat can load a
@@ -57,6 +61,7 @@ from evaluate.contracts import (
     CachePolicy,
     CellIdentity,
     ContractError,
+    Family,
     Harness,
     HarnessAssignment,
     HarnessFeature,
@@ -183,6 +188,15 @@ class SuiteSpec:
             found += [(task, instance.instance_id, harness) for instance in instances for harness in harnesses]
         return found
 
+    def families(self, profile: Profile) -> list[tuple[Family, Shape, list[tuple[str, Harness]]]]:
+        """The families the profile runs, in the suite's order, each with the shape of its seats
+        and the instance/harness pairs of one attempt: what one live cell holds."""
+        found: dict[Family, tuple[Family, Shape, list[tuple[str, Harness]]]] = {}
+        for task, instance, harness in self.pairs(profile):
+            family = found.setdefault(task.family, (task.family, self.background[task.task_id], []))
+            family[2].append((instance, harness))
+        return list(found.values())
+
 
 @dataclass(frozen=True)
 class PlannedCell:
@@ -291,9 +305,19 @@ class Schedule:
     minimum_window_ms: int
     batches: tuple[Batch, ...]
 
+    @property
+    def booked_ms(self) -> int:
+        """How long a host is booked for, when each booking is its batch's minimum window."""
+        return sum(batch.minimum_window_ms for batch in self.batches)
+
     def host_hours(self, instances: int) -> float:
-        """The hours the hosts are booked for, when each booking is its batch's minimum window."""
-        return instances * sum(batch.minimum_window_ms for batch in self.batches) / HOUR_MS
+        """The hours the hosts are booked for."""
+        return self.booked_ms * instances / HOUR_MS
+
+    def price_usd(self, instances: int, usd_per_host_hour: float) -> float:
+        """What the booked time costs at that rate, to the cent: from the booked time itself, not
+        from host-hours already rounded."""
+        return round(self.booked_ms * instances * usd_per_host_hour / HOUR_MS, 2)
 
 
 # --- Reading a suite -------------------------------------------------------------------------
@@ -366,6 +390,8 @@ def _read(name: str, raw: dict[str, Any]) -> SuiteSpec:
     anchor = Harness(raw["anchor"])
     if any(anchor not in [assignment.harness for assignment in task.harnesses] for task in tasks):
         raise ValueError("the anchor harness runs every task")
+    if len({(task.family, background[task.task_id]) for task in tasks}) != len({task.family for task in tasks}):
+        raise ValueError("the tasks of a family have one background shape")
     sweep = raw["sweep"]
     return SuiteSpec(
         name=name,
@@ -512,7 +538,7 @@ def expand(
     chosen = spec.profiles[profile]
     plan = _Expansion(spec, input_seed, schedule_seed)
     per = spec.conversations
-    pairs = spec.pairs(profile)
+    families = spec.families(profile)
     # With one seat there is no other seat to load a live task: both loads are the low-load cell.
     one_seat = students == 1
     loads = [Role.LOW_LOAD] if one_seat else list(chosen.loads)
@@ -550,12 +576,7 @@ def expand(
                     namespace=steady[at],
                 )
         for load in loads if at < chosen.attempts else []:
-            for shape in _from(list(Shape), at, chosen.attempts):
-                attempts = [
-                    (instance, harness) for task, instance, harness in pairs if spec.background[task.task_id] is shape
-                ]
-                if not attempts:
-                    continue
+            for _family, shape, attempts in _from(families, at, chosen.attempts):
                 # One seat runs the task. At class size the other seats keep up the replay.
                 background = 0 if load is Role.LOW_LOAD else students - 1
                 plan.add(
@@ -603,6 +624,7 @@ def expand(
         "core": sorted(spec.core),
         "cells": [cell.planned() for cell in cells],
     }
+    scheduled = {trial.harness for trial in plan.trials}
     try:
         workload = Workload(
             profile=profile,
@@ -613,7 +635,7 @@ def expand(
             input_seed=input_seed,
             schedule_seed=schedule_seed,
             cache_policy=spec.cache_policy,
-            harnesses=spec.pins,
+            harnesses=tuple(pin for pin in spec.pins if pin.harness in scheduled),
             limits=spec.limits,
             sampling=spec.sampling,
             objectives=spec.objectives,

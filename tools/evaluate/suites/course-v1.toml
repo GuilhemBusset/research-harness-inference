@@ -206,7 +206,7 @@ instances = [
 #   cell_evidence_mib     the request records and host samples of a cell;
 #   trial_evidence_mib    the trial record and the graded output of a trial.
 [estimates]
-capacity_wait_ms = 1200000
+capacity_wait_ms = 900000
 warm_up_ms = 300000
 telemetry_settle_ms = 60000
 cleanup_ms = 300000

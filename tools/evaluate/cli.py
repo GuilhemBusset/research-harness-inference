@@ -14,10 +14,10 @@ each with the shortest window that holds it and the command that runs it; the ho
 their price.
 
 **The window and the rate.** A booking is at most `--for` long, the capacity wait included. Left
-out, it is `session_max_hours` of `config.example.toml`. The price is the host-hours at `--rate`,
-in dollars a host-hour. Left out, it is the example configuration's price of its default pool.
-Each is labelled `supplied` or `example`: no real rate or session limit is in the repository, and
-the deployed ones are read by `run`, not here.
+out, it is `session_max_hours` of `config.example.toml`. The price is the booked time at `--rate`,
+in dollars a host-hour, rounded once, to the cent. Left out, the rate is the example
+configuration's price of its default pool. Each is labelled `supplied` or `example`: no real rate or session limit is in the
+repository, and the deployed ones are read by `run`, not here.
 
 **The commands.** The batch commands name `run`, which this module does not have yet, and leave
 the pool and the experiment issue to the operator's shell (`$pool`, `$experiment_issue`): neither
@@ -144,7 +144,7 @@ def document(args: argparse.Namespace, plan: Plan, bookings: Schedule, sources: 
         "price": {
             "usd_per_host_hour": sources["rate_value"],
             "source": sources["rate"],
-            "estimate_usd": round(host_hours * sources["rate_value"], 2),
+            "estimate_usd": bookings.price_usd(args.instances, sources["rate_value"]),
         },
     }
 

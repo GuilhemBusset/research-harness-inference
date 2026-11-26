@@ -23,6 +23,13 @@ MINUTE_MS = 60_000
 HOUR_MS = 60 * MINUTE_MS
 SUITE = plan.load_suite()
 LIVE = (Phase.LIVE_LOW_LOAD, Phase.LIVE_CLASS_LOAD)
+# The replay shape of each family: of the seat that runs its tasks, and of the seats around it.
+BACKGROUND = {
+    contracts.Family.OPTIMIZATION: Shape.HANDS_ON,
+    contracts.Family.DEBUGGING: Shape.HANDS_ON,
+    contracts.Family.ANALYSIS: Shape.SEVERAL_AGENTS,
+    contracts.Family.RESEARCH: Shape.SEVERAL_AGENTS,
+}
 
 
 def script(folder: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
@@ -115,6 +122,13 @@ def test_a_qualification_of_eight_seats_has_162_trials() -> None:
     for cell in cells_of(planned, Phase.LIVE_CLASS_LOAD):
         assert cell.identities == 8
         assert cell.replay_slots == cell.identity.agent_slots * 7 // 8
+    # A live cell is one family at one load in one attempt, so a booking can end between families.
+    live = cells_of(planned, *LIVE)
+    assert len(live) == 4 * 2 * 3
+    for cell in live:
+        (family,) = {contracts.Family(trials[at].instance_id.split(".")[0]) for at in cell.trials}
+        assert cell.identity.shape is BACKGROUND[family]
+    assert max(len(cell.trials) for cell in live) == 15
 
 
 def test_one_seat_plans_the_equivalent_loads_and_sweep_cells_once() -> None:
@@ -149,6 +163,17 @@ def test_a_screen_has_one_replay_repetition_and_one_anchor_attempt_of_each_core_
     assert sorted(trial.instance_id.rsplit(".", 1)[0] for trial in trials) == sorted(SUITE.core)
     assert {(trial.harness, trial.attempt) for trial in trials} == {(SUITE.anchor, 0)}
     assert SUITE.anchor is Harness.CLAUDE_CODE
+    # The workload pins the harnesses it schedules and no other: here the anchor alone, so the
+    # version of a harness the screen does not run is not part of its identity.
+    assert [pin.harness for pin in planned.workload.harnesses] == [Harness.CLAUDE_CODE]
+    pins = tuple(
+        dataclasses.replace(pin, version="9.9.9") if pin.harness is Harness.PI else pin for pin in SUITE.pins
+    )
+    other_pi = dataclasses.replace(SUITE, pins=pins)
+    assert plan.expand(other_pi, Profile.SCREEN, 8).workload_hash == planned.workload_hash
+    qualify = plan.expand(SUITE, Profile.QUALIFY, 8)
+    assert {pin.harness for pin in qualify.workload.harnesses} == set(Harness)
+    assert plan.expand(other_pi, Profile.QUALIFY, 8).workload_hash != qualify.workload_hash
 
 
 @pytest.mark.parametrize("students", [8, 10])
@@ -226,12 +251,7 @@ def test_the_suite_holds_the_assignments_and_the_limits_of_the_design() -> None:
     assert on[contracts.Family.ANALYSIS] == on[contracts.Family.RESEARCH] == {Harness.CLAUDE_CODE}
     assert all(len(task.instances) == 3 for task in SUITE.suite.tasks)
     # Hands-on background for optimization and debugging, several-agents for analysis and research.
-    assert {task.family: SUITE.background[task.task_id] for task in SUITE.suite.tasks} == {
-        contracts.Family.OPTIMIZATION: Shape.HANDS_ON,
-        contracts.Family.DEBUGGING: Shape.HANDS_ON,
-        contracts.Family.ANALYSIS: Shape.SEVERAL_AGENTS,
-        contracts.Family.RESEARCH: Shape.SEVERAL_AGENTS,
-    }
+    assert {task.family: SUITE.background[task.task_id] for task in SUITE.suite.tasks} == BACKGROUND
     limits = plan.expand(SUITE, Profile.QUALIFY, 8).workload.limits
     assert (limits.trial_wall_time_ms, limits.trial_model_turns, limits.trial_generated_tokens) == (
         12 * MINUTE_MS,
@@ -268,16 +288,23 @@ def test_batches_hold_whole_cells_inside_the_window() -> None:
 def test_a_cell_that_fits_no_window_is_refused(capsys: pytest.CaptureFixture[str]) -> None:
     planned = plan.expand(SUITE, Profile.QUALIFY, 8)
     shortest = plan.schedule(planned, 12 * HOUR_MS).minimum_window_ms
-    # The longest cell is the 21 hands-on trials of an attempt, each at its 12-minute limit.
-    assert shortest > 21 * 12 * MINUTE_MS
+    # The longest cell is the largest family: the 15 optimization trials of an attempt, each at
+    # its 12-minute limit. With the booking's reserves it fits a booking of four hours.
+    assert 15 * 12 * MINUTE_MS < shortest <= 4 * HOUR_MS
     assert plan.schedule(planned, shortest).batches
     with pytest.raises(PlanError) as refused:
         plan.schedule(planned, shortest - 1)
     assert refused.value.reason is Refusal.CELL_OUTSIDE_WINDOW
 
-    # The command plans nothing then: no part of the cell is placed in a shorter booking.
-    arguments = ["plan", "--profile", "qualify", "--students", "8", "--instances", "1", "--for", "4h"]
-    assert cli.main(arguments) == 2
+    # Bookings of four hours hold the whole qualification, each of its cells whole in one of them.
+    arguments = ("--profile", "qualify", "--students", "8", "--instances", "1")
+    booked = printed(capsys, *arguments, "--for", "4h")
+    assert all(batch["minimum_window_ms"] <= 4 * HOUR_MS for batch in booked["batches"])
+    assert [cell for batch in booked["batches"] for cell in batch["cells"]] == list(range(1, len(planned.cells)))
+    assert sum(len(booked["cells"][cell]["trials"]) for batch in booked["batches"] for cell in batch["cells"]) == 162
+
+    # In a shorter window the command plans nothing: no part of the cell is placed in a booking.
+    assert cli.main(["plan", *arguments, "--for", f"{shortest // MINUTE_MS - 1}m"]) == 2
     said = capsys.readouterr()
     assert said.out == ""
     assert Refusal.CELL_OUTSIDE_WINDOW in said.err
@@ -298,16 +325,15 @@ def test_the_plan_prints_what_a_booking_needs(capsys: pytest.CaptureFixture[str]
     assert [trial for cell in planned["cells"] for trial in cell["trials"]] == list(range(162))
     assert planned["scratch_mib"] > 0
     assert planned["minimum_window_ms"] <= min(batch["minimum_window_ms"] for batch in planned["batches"])
-    assert planned["host_hours"] == pytest.approx(
-        sum(batch["minimum_window_ms"] for batch in planned["batches"]) / HOUR_MS, abs=0.001
-    )
+    booked_ms = sum(batch["minimum_window_ms"] for batch in planned["batches"])
+    assert planned["host_hours"] == pytest.approx(booked_ms / HOUR_MS, abs=0.001)
     # Priced at the example rate unless one is given, and labelled either way.
     price = planned["price"]
     assert price["source"] == "example"
-    assert price["estimate_usd"] == pytest.approx(planned["host_hours"] * price["usd_per_host_hour"], abs=0.01)
+    assert price["estimate_usd"] == round(booked_ms * price["usd_per_host_hour"] / HOUR_MS, 2)
     supplied = printed(capsys, *arguments, "--rate", "2")["price"]
     assert (supplied["source"], supplied["usd_per_host_hour"]) == ("supplied", 2.0)
-    assert supplied["estimate_usd"] == pytest.approx(2 * planned["host_hours"], abs=0.01)
+    assert supplied["estimate_usd"] == round(booked_ms * 2 / HOUR_MS, 2)
 
     # One command for each batch: it books the batch's own window, and all but the first resume.
     commands = [batch["command"] for batch in planned["batches"]]
