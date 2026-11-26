@@ -21,4 +21,10 @@ generator's readers, so it needs `services/gateway` and `spikes` on the path as 
 `evaluate.traces` freezes the conversations a replay sends, from a seed and the course fixture
 under `fixtures/replay/`, before any of them is sent: the requests and pauses of each, in the form
 the load generator's recorded-session reader reads. It needs `spikes` on the path too.
+
+`evaluate.telemetry` reads from the Prometheus workspace what served a measured window: the hosts
+and what each ran, their engines' counters through the drain, and the gateway's traffic. It says
+which treatments that evidence leaves unverified and why a window cannot qualify. It reads with
+spike S5's readers, by the names the services export, so it needs `spikes`, the services and
+`dashboards` on the path.
 """
