@@ -34,6 +34,7 @@ from botocore.exceptions import ClientError
 import common
 import loadgen
 import s3_harness_task as s3
+from rhi_cli import harness as login_files
 from rhi_cli import store
 from rhi_common.keys import generate_key
 
@@ -480,7 +481,8 @@ def test_the_image_is_recorded_by_its_accepted_retry_and_named_only_by_its_colou
         assert (row["accepted"], row["status"], row["named"]) == (True, 200, named)
 
 
-def test_the_compaction_files_hold_more_than_the_client_s_window(tmp_path: Path) -> None:
+def test_the_compaction_files_hold_more_than_the_window_rhi_login_sets(tmp_path: Path) -> None:
+    assert s3.CLIENT_WINDOW == login_files.AUTO_COMPACT_WINDOW
     s3.write_filler(tmp_path, "rhiabc123", Random(1))
     # A line is at most its words and four tokens more.
     estimate = sum(4 + len(line.split()) for path in tmp_path.glob("*.txt") for line in path.read_text().splitlines())
