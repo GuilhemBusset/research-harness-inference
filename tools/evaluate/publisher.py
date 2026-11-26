@@ -4,12 +4,15 @@ per run and a final comment per paired comparison (docs/design/agent-session-eva
 
 **What is published.** Only the fields of `Experiment`, `RunResult` and `Comparison`, each checked
 before anything is rendered: a fixed vocabulary (`Ending`, `Reason`, `Verdict`, `Cleanup`,
-`Relative` and the shapes, harnesses and profiles of `evaluate.contracts`), a bounded label, a
-count, a relative duration, a digest, a commit, or the permalink of a reviewed bundle on GitHub.
-The experiment's question is the one free text, on one line and without a marker or a mention. A
-field that is none of these refuses the whole record (`Refusal.FIELD_REJECTED`) before anything is
-queued or sent. A run that failed or was interrupted is published with its completed cells and the
-fixed reason it ended for; its absent measurements read as not measured. Booking times, schedules,
+`Relative` and the shapes, harnesses and profiles of `evaluate.contracts`), a count, a measured
+number as it was measured, a digest, a commit, or the permalink of a reviewed bundle on GitHub. A
+configuration is the public serving settings of `contracts.Settings`, each held to its own rule
+(an image digest, a GPU's public name, ...), and the floors are the suite's `contracts.Objectives`,
+signed where the suite's are. The experiment's question is the one free text, on one line and
+without a marker or a mention. A field that is none of these refuses the whole record
+(`Refusal.FIELD_REJECTED`) before anything is queued or sent. A completed run accounts for every
+planned cell; a run that failed or was interrupted is published with its completed cells and the
+fixed reason it ended for, its absent measurements read as not measured. Booking times, schedules,
 identifiers of resources, tool output and prompts are not fields, so nothing renders them.
 
 **Scanned before each write.** The public hygiene scanner (`tools/hygiene/scan.py`, loaded from
@@ -19,19 +22,31 @@ the issue's title and body, a comment's body with its marker. A finding refuses 
 queued.
 
 **The record first.** `open_experiment` creates the experiment's issue (a `CREATE_ISSUE` intent
-of the journal, saved before it is sent) or selects the one the operator named: an issue, not a
-pull request, written by the driver, whose body carries the identity of the same experiment. Only
-then is its number journaled, and the journal refuses a booking until it is. If GitHub does not
-confirm it, `Refusal.ISSUE_UNCONFIRMED` stops the run before it books.
+of the journal, saved before it is sent, with the experiment's identity, the repository and the
+driver's login) or selects the one the operator named: an issue, not a pull request, written by
+the driver, whose body carries the identity of the same experiment. Only then is its number
+journaled, and the journal refuses a booking until it is. If GitHub does not confirm it,
+`Refusal.ISSUE_UNCONFIRMED` stops the run before it books. A run is bound to one experiment: once
+its journal holds an issue, or a creation in doubt, another experiment is refused
+(`Refusal.ISSUE_MISMATCH`). A creation saved while the driver's login was not known was never
+sent: it is ruled out and saved again with the login before anything is sent.
 
 **Comments in the journal.** `publish_run` queues the run's terminal comment and
-`publish_comparison` the paired comparison's, each a `DELIVER` intent that holds the rendered body
-and its marker before anything is posted. They are delivered one at a time, in the order they were
+`publish_comparison` the final comment of each pair the run is the candidate of, each a `DELIVER`
+intent that holds the rendered body and its marker before anything is posted. A second comment for
+the same run, or the same pair, is refused (`Refusal.ALREADY_QUEUED`). They are delivered one at a time, in the order they were
 queued, so a comparison ready while its run's comment is still in doubt is saved whole and posted
 after it. A delivery that GitHub does not answer keeps its intent pending: the bundle stays where it
 is, and the result counts it as waiting, apart from the run's verdicts.
 
-**Reconciling.** A write whose answer is lost (no response, or a server error) may have happened.
+**One destination.** Every write and every reconciliation of a run goes to the repository and as
+the writer its journal saved with the issue. A publisher for another repository, or with another
+login, sends nothing for that run (`Refusal.DESTINATION_MISMATCH`). A delivery whose saved payload
+is not a comment this module queued is not sent either (`Refusal.UNRECOGNIZED_ENTRY`): it stays in
+the journal, private, as it was.
+
+**Reconciling.** A write whose answer is lost (no response, a cut response, or a server error) may
+have happened.
 The intent's marker is a line of what was sent. The publisher then reads the driver's own records,
 the issues the driver created or the comments on the experiment's issue, and confirms the first one
 written by the driver whose text carries that marker line. A record of anyone else with the same
@@ -48,7 +63,9 @@ that sends to the endpoint. A refusal is one member of `Refusal`.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
+import http.client
 import importlib.util
 import json
 import math
@@ -63,7 +80,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
-from evaluate.contracts import Harness, Profile, Shape
+from evaluate import contracts
+from evaluate.contracts import ContractError, Harness, Objectives, Profile, Settings, Shape
 from evaluate.journal import Action, Intent, IntentStatus, Journal
 
 if TYPE_CHECKING:
@@ -73,15 +91,20 @@ HYGIENE_SCANNER = Path(__file__).resolve().parents[1] / "hygiene" / "scan.py"
 PAGE_SIZE = 100
 
 _LABEL = re.compile(r"[a-z0-9][a-z0-9._:+-]{0,63}")
+_SETTINGS = tuple(one.name for one in dataclasses.fields(Settings))
+_FLOORS = tuple(one.name for one in dataclasses.fields(Objectives))
+_MAX_SEED = 2**32 - 1
 _RUN_ID = re.compile(r"[0-9a-f]{16}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
-_PERMALINK = re.compile(r"https://github\.com/[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}/blob/[0-9a-f]{40}/[A-Za-z0-9._/-]{1,200}")
+_PERMALINK = re.compile(
+    r"https://github\.com/[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}/blob/[0-9a-f]{40}/[A-Za-z0-9._/-]{1,200}"
+)
 # What the question may not hold: a scanner exception, a marker, a mention, a link, markup.
 _UNSAFE = re.compile(r"hygiene:|<!--|-->|@|://|[`<>\[\]|]", re.IGNORECASE)
 _MAX_QUESTION = 300
-_MAX_COUNT = 10**9
+_MAX_COUNT = contracts.MAX_COUNT
 
 
 class Refusal(StrEnum):
@@ -93,8 +116,12 @@ class Refusal(StrEnum):
     ISSUE_UNCONFIRMED = "issue-unconfirmed"
     # The selected issue is not the driver's record of this experiment.
     ISSUE_MISMATCH = "issue-mismatch"
-    # The run's comment, or its comparison, is already queued.
+    # The run's comment, or the comparison of the same pair, is already queued.
     ALREADY_QUEUED = "already-queued"
+    # The publisher writes to another repository, or as another login, than the run's record.
+    DESTINATION_MISMATCH = "destination-mismatch"
+    # A delivery in the journal is not a comment this module queued: it is not sent.
+    UNRECOGNIZED_ENTRY = "unrecognized-entry"
 
 
 class PublishError(Exception):
@@ -162,11 +189,12 @@ class Experiment:
     suite: str
     profile: Profile
     workload: str
-    # Each target (`reference`, `candidate`, ...) and its requested settings.
-    targets: Mapping[str, Mapping[str, str]]
+    # Each target (`reference`, `candidate`, ...) and its requested public settings: a
+    # `contracts.Settings`, or a mapping of some of its fields.
+    targets: Mapping[str, Settings | Mapping[str, object]]
     seeds: Sequence[int]
-    # Each floor and its value, in the unit its name says.
-    floors: Mapping[str, float]
+    # The suite's objectives: a `contracts.Objectives`, or a mapping of all its fields.
+    floors: Objectives | Mapping[str, float]
 
 
 @dataclass(frozen=True)
@@ -175,7 +203,7 @@ class RunResult:
     ending: Ending
     cells_completed: int
     cells_planned: int
-    observed: Mapping[str, str]
+    observed: Settings | Mapping[str, object]
     requested_hosts: int
     served_hosts: int
     capacity: Mapping[Shape, Verdict]
@@ -188,7 +216,7 @@ class RunResult:
     cleanup: Cleanup
     bundle_digest: str
     reason: Reason | None = None
-    ttft_p95_ms: int | None = None
+    ttft_p95_ms: float | None = None
     speed_p50: float | None = None
     speed_p10: float | None = None
     permalink: str | None = None
@@ -239,10 +267,13 @@ def _count(value: object) -> int:
     return value
 
 
-def _amount(value: object) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
+def _amount(value: object, low: float = 0.0, high: float = _MAX_COUNT) -> int | float:
+    """A measured number, as it was given: never rounded."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise _reject()
-    return float(value)
+    if not math.isfinite(value) or not low <= value <= high:
+        raise _reject()
+    return value
 
 
 def _part(passed: object, out_of: object) -> str:
@@ -251,10 +282,31 @@ def _part(passed: object, out_of: object) -> str:
     return f"{passed}/{out_of}"
 
 
-def _labels(values: object) -> dict[str, str]:
-    if not isinstance(values, Mapping):
-        raise _reject()
-    return {_matches(_LABEL, key): _matches(_LABEL, value) for key, value in values.items()}
+def _settings(values: object) -> dict[str, object]:
+    """The declared public settings, each held to its own rule by `contracts.Settings`."""
+    if isinstance(values, Settings):
+        checked = values
+    else:
+        if not isinstance(values, Mapping) or not set(values) <= set(_SETTINGS):
+            raise _reject()
+        try:
+            checked = Settings.from_json({name: values.get(name) for name in _SETTINGS}, "settings")
+        except ContractError as error:
+            raise _reject() from error
+    return {name: value for name, value in checked.to_json().items() if value is not None}
+
+
+def _floors(values: object) -> dict[str, int | float]:
+    """The suite's objectives, each held to its own bounds by `contracts.Objectives`, as given."""
+    if not isinstance(values, Objectives):
+        if not isinstance(values, Mapping):
+            raise _reject()
+        try:
+            Objectives.from_json(dict(values), "floors")
+        except ContractError as error:
+            raise _reject() from error
+    given = values.to_json() if isinstance(values, Objectives) else values
+    return {name: _amount(given[name], -_MAX_COUNT) for name in _FLOORS}
 
 
 def _by_shape[E: StrEnum](values: object, vocabulary: type[E]) -> str:
@@ -282,13 +334,15 @@ def _permalink(value: object) -> str | None:
 def experiment_identity(experiment: Experiment) -> str:
     """The digest of the experiment's public fields: what a selected issue must carry."""
     fields = _experiment_fields(experiment)
+    # 5 and 5.0 are one floor: the identity reads each as a number.
+    fields["floors"] = {name: float(value) + 0.0 for name, value in fields["floors"].items()}
     canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _experiment_fields(experiment: Experiment) -> dict[str, Any]:
-    targets, floors, seeds = experiment.targets, experiment.floors, experiment.seeds
-    if not isinstance(targets, Mapping) or not isinstance(floors, Mapping) or not isinstance(seeds, list | tuple):
+    targets, seeds = experiment.targets, experiment.seeds
+    if not isinstance(targets, Mapping) or not isinstance(seeds, list | tuple):
         raise _reject()
     fields = {
         "question": _question(experiment.question),
@@ -296,13 +350,24 @@ def _experiment_fields(experiment: Experiment) -> dict[str, Any]:
         "suite": _matches(_LABEL, experiment.suite),
         "profile": str(_member(Profile, experiment.profile)),
         "workload": _matches(_DIGEST, experiment.workload),
-        "targets": {_matches(_LABEL, name): _labels(settings) for name, settings in targets.items()},
-        "seeds": [_count(seed) for seed in seeds],
-        "floors": {_matches(_LABEL, name): _amount(value) for name, value in floors.items()},
+        "targets": {_matches(_LABEL, name): _settings(settings) for name, settings in targets.items()},
+        "seeds": [_seed(seed) for seed in seeds],
+        "floors": _floors(experiment.floors),
     }
-    if not fields["targets"] or not fields["floors"] or not fields["seeds"]:
+    if not fields["targets"] or not fields["seeds"]:
         raise _reject()
     return fields
+
+
+def _seed(value: object) -> int:
+    if type(value) is not int or not 0 <= value <= _MAX_SEED:
+        raise _reject()
+    return value
+
+
+def _shown(value: object) -> str:
+    """A checked value as it is written: a label as it is, a number as it was given."""
+    return value if isinstance(value, str) else json.dumps(value)
 
 
 def _identity_line(identity: str) -> str:
@@ -322,11 +387,11 @@ def render_issue(experiment: Experiment) -> tuple[str, str]:
         "",
         "**Target configurations**",
         "",
-        *(f"- `{name}`: {_settings(settings)}" for name, settings in sorted(fields["targets"].items())),
+        *(f"- `{name}`: {_settings_line(settings)}" for name, settings in sorted(fields["targets"].items())),
         "",
         "**Acceptance floors**",
         "",
-        *(f"- `{name}`: {value:g}" for name, value in sorted(fields["floors"].items())),
+        *(f"- `{name}`: {_shown(value)}" for name, value in sorted(fields["floors"].items())),
         "",
         _identity_line(experiment_identity(experiment)),
         "",
@@ -335,8 +400,8 @@ def render_issue(experiment: Experiment) -> tuple[str, str]:
     return f"Evaluation: {fields['question']}"[:256], "\n".join(lines) + "\n"
 
 
-def _settings(settings: Mapping[str, str]) -> str:
-    return ", ".join(f"{key}=`{value}`" for key, value in sorted(settings.items())) or "none"
+def _settings_line(settings: Mapping[str, object]) -> str:
+    return ", ".join(f"{key}=`{_shown(value)}`" for key, value in sorted(settings.items())) or "none"
 
 
 def _measured(value: str | None) -> str:
@@ -348,17 +413,20 @@ def render_run(result: RunResult) -> str:
     ending = _member(Ending, result.ending)
     if (ending is Ending.COMPLETED) != (result.reason is None):
         raise _reject()  # a partial run has a fixed reason, and a completed one none
+    completed = _part(result.cells_completed, result.cells_planned)
+    if ending is Ending.COMPLETED and not 0 < result.cells_completed == result.cells_planned:
+        raise _reject()  # a completed profile accounts for every planned cell
     if not isinstance(result.tasks, Mapping):
         raise _reject()
-    ttft = None if result.ttft_p95_ms is None else f"{_count(result.ttft_p95_ms)} ms"
+    ttft = None if result.ttft_p95_ms is None else f"{_shown(_amount(result.ttft_p95_ms))} ms"
     speeds = (result.speed_p50, result.speed_p10)
-    speed = None if None in speeds else " / ".join(f"{_amount(one):.1f}" for one in speeds) + " tokens/s"
+    speed = None if None in speeds else " / ".join(_shown(_amount(one)) for one in speeds) + " tokens/s"
     lines = [
         f"### Run `{_matches(_RUN_ID, result.run_id)}`: {ending}",
         "",
         *([] if result.reason is None else [f"- Reason: `{_member(Reason, result.reason)}`"]),
-        f"- Completed cells: {_part(result.cells_completed, result.cells_planned)}",
-        f"- Observed configuration: {_settings(_labels(result.observed))}",
+        f"- Completed cells: {completed}",
+        f"- Observed configuration: {_settings_line(_settings(result.observed))}",
         f"- Hosts: {_count(result.requested_hosts)} requested, {_count(result.served_hosts)} served",
         f"- Capacity by shape: {_by_shape(result.capacity, Verdict)}",
         f"- Quality by shape: {_by_shape(result.quality, Verdict)}",
@@ -366,8 +434,13 @@ def render_run(result: RunResult) -> str:
         f"- Stream speed p50 / p10: {_measured(speed)}",
         f"- Failures / attempts: {_part(result.failures, result.attempts)}",
         "- Task passes / attempts: "
-        + (", ".join(f"{_member(Harness, harness)} {_part(*counts)}" for harness, counts in sorted(result.tasks.items())) or "none"),
-        f"- Estimated host-hours: {_amount(result.host_hours):.2f}",
+        + (
+            ", ".join(
+                f"{_member(Harness, harness)} {_part(*counts)}" for harness, counts in sorted(result.tasks.items())
+            )
+            or "none"
+        ),
+        f"- Estimated host-hours: {_shown(_amount(result.host_hours))}",
         f"- Cleanup: `{_member(Cleanup, result.cleanup)}`",
         *_bundle(result.bundle_digest, result.permalink),
     ]
@@ -445,7 +518,8 @@ class HttpTransport:
                 return response.status, json.loads(response.read() or b"null")
         except urllib.error.HTTPError as error:
             return error.code, None
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, http.client.HTTPException) as error:
+            # No response, or one cut short (`IncompleteRead`) or unreadable: it may have happened.
             raise Unanswered from error
 
 
@@ -477,7 +551,9 @@ class GitHub:
     def _pages(self, path: str, query: Mapping[str, object]) -> Iterator[dict[str, Any]]:
         page = 1
         while True:
-            listed = self._call("GET", f"{path}?{urllib.parse.urlencode({**query, 'per_page': PAGE_SIZE, 'page': page})}")
+            listed = self._call(
+                "GET", f"{path}?{urllib.parse.urlencode({**query, 'per_page': PAGE_SIZE, 'page': page})}"
+            )
             if not isinstance(listed, list):
                 raise Unanswered
             yield from (one for one in listed if isinstance(one, dict))
@@ -536,43 +612,85 @@ class Publisher:
         if any(self._scan(text, "evaluate-publication.md") for text in texts):
             raise PublishError(Refusal.HYGIENE_FINDING)
 
+    def _driver(self) -> str:
+        """The driver's login, or `Refusal.ISSUE_UNCONFIRMED` when GitHub does not say it."""
+        try:
+            return self.github.login()
+        except (Unanswered, Rejected) as error:
+            raise PublishError(Refusal.ISSUE_UNCONFIRMED) from error
+
+    def _same_destination(self, record: Mapping[str, Any] | None) -> None:
+        """Refuses a publisher that is not the run's: another repository, or another login. A
+        login GitHub does not give raises `Unanswered` or `Rejected`."""
+        if record is None or record.get("repository") != self.github.repository:
+            raise PublishError(Refusal.DESTINATION_MISMATCH)
+        if record.get("driver") != self.github.login():
+            raise PublishError(Refusal.DESTINATION_MISMATCH)
+
     # --- The experiment's issue ---
 
     def open_experiment(self, journal: Journal, experiment: Experiment, issue: int | None = None) -> int:
         """The number of the experiment's issue, journaled: created with `issue=None`, else the
-        selected one once it shows to be the driver's record of this experiment."""
+        selected one once it shows to be the driver's record of this experiment. A run whose
+        journal already holds an issue, or a creation in doubt, goes on with it only for the
+        same experiment, in the same repository, as the same driver."""
         title, body = render_issue(experiment)
-        if issue is not None:
-            return self._select(journal, experiment, issue)
-        if journal.issue_number is not None:
-            return journal.issue_number
-        intent = next((one for one in _waiting(journal, Action.CREATE_ISSUE)), None)
-        sent_before = intent is not None
-        if intent is None:
-            self._checked(title, body)
-            intent = journal.intend(Action.CREATE_ISSUE, {"title": title, "body": body})
-        return self._settle_issue(journal, intent, sent_before=sent_before)
-
-    def _select(self, journal: Journal, experiment: Experiment, number: int) -> int:
-        if journal.issue_number is not None:
-            if journal.issue_number != number:
+        identity = experiment_identity(experiment)
+        if issue is not None and (type(issue) is not int or not 0 < issue <= _MAX_COUNT):
+            raise _reject()
+        held = _held(journal)
+        if held is not None:
+            record, creation = held
+            if record.get("identity") != identity or issue not in (None, journal.issue_number):
                 raise PublishError(Refusal.ISSUE_MISMATCH)
-            return number
-        _count(number)
+            if journal.issue_number is not None:
+                try:
+                    self._same_destination(record)
+                except (Unanswered, Rejected) as error:
+                    raise PublishError(Refusal.ISSUE_UNCONFIRMED) from error
+                return journal.issue_number
+            assert creation is not None  # no number yet: the creation is in doubt
+            return self._settle_issue(journal, creation, sent_before=True)
+        if journal.issue_number is not None:
+            raise PublishError(Refusal.ISSUE_MISMATCH)  # journaled without a record of what it is
+        if issue is not None:
+            return self._select(journal, identity, issue)
+        self._checked(title, body)
+        try:
+            driver: str | None = self.github.login()
+        except (Unanswered, Rejected):
+            driver = None  # saved unsent: the run stays bound to this experiment
+        payload = {"title": title, "body": body, "identity": identity, "repository": self.github.repository}
+        intent = journal.intend(Action.CREATE_ISSUE, {**payload, "driver": driver})
+        if driver is None:
+            raise PublishError(Refusal.ISSUE_UNCONFIRMED)
+        return self._settle_issue(journal, intent, sent_before=False)
+
+    def _select(self, journal: Journal, identity: str, number: int) -> int:
         try:
             found, driver = self.github.issue(number), self.github.login()
         except (Unanswered, Rejected) as error:
             raise PublishError(Refusal.ISSUE_UNCONFIRMED) from error
-        identity = _identity_line(experiment_identity(experiment))
         mine = isinstance(found, dict) and "pull_request" not in found and _author(found) == driver
-        if not mine or identity not in str(found.get("body")).splitlines():
+        if not mine or _identity_line(identity) not in str(found.get("body")).splitlines():
             raise PublishError(Refusal.ISSUE_MISMATCH)
-        journal.adopt_issue(number)
+        journal.adopt_issue(number, {"identity": identity, "repository": self.github.repository, "driver": driver})
         return number
 
     def _settle_issue(self, journal: Journal, intent: Intent, *, sent_before: bool) -> int:
+        payload = intent.payload
+        if payload.get("repository") != self.github.repository:
+            raise PublishError(Refusal.DESTINATION_MISMATCH)
+        driver = self._driver()
+        if payload.get("driver") is None:
+            # Saved before the driver was known, so never sent: sent now, as this driver.
+            journal.rule_out(intent.ordinal)
+            intent = journal.intend(Action.CREATE_ISSUE, {**payload, "driver": driver})
+            sent_before = False
+        elif payload["driver"] != driver:
+            raise PublishError(Refusal.DESTINATION_MISMATCH)
+
         def find() -> dict[str, Any] | None:
-            driver = self.github.login()
             return next(
                 (
                     one
@@ -600,25 +718,39 @@ class Publisher:
         body = render_run(result)
         if result.run_id != journal.run_id:
             raise _reject()
-        return self._queue(journal, Kind.RUN, body)
+        return self._queue(journal, Kind.RUN, body, None)
 
     def publish_comparison(self, journal: Journal, comparison: Comparison) -> Outbox:
-        """Queues the comparison's final comment in the candidate's journal, after its run's."""
+        """Queues the pair's final comment in the candidate's journal, after its run's."""
         body = render_comparison(comparison)
         if comparison.candidate_run != journal.run_id or comparison.reference_run == journal.run_id:
             raise _reject()
-        return self._queue(journal, Kind.COMPARISON, body)
+        return self._queue(journal, Kind.COMPARISON, body, comparison.reference_run)
 
-    def _queue(self, journal: Journal, kind: Kind, body: str) -> Outbox:
-        if any(_kind(one) == kind for one in journal.intents if one.status is not IntentStatus.RULED_OUT):
-            raise PublishError(Refusal.ALREADY_QUEUED)
+    def _queue(self, journal: Journal, kind: Kind, body: str, reference: str | None) -> Outbox:
+        """Queues one comment of each run, and one of each pair it is the candidate of."""
+        for one in journal.intents:
+            if one.action is Action.DELIVER and one.status is not IntentStatus.RULED_OUT:
+                payload = one.payload
+                if (payload.get("kind"), payload.get("reference")) == (kind.value, reference):
+                    raise PublishError(Refusal.ALREADY_QUEUED)
         self._checked(body)
-        journal.queue(Action.DELIVER, {"kind": kind.value, "body": body})
+        journal.queue(Action.DELIVER, {"kind": kind.value, "body": body, "reference": reference})
         return self.flush(journal)
 
     def flush(self, journal: Journal) -> Outbox:
         """Delivers the journal's comments in order: the pending one, reconciled first, then each
-        queued one. It stops at the first that GitHub does not confirm, which stays pending."""
+        queued one. It stops at the first that GitHub does not confirm, which stays pending. It
+        sends nothing to another repository, or as another login, than the run's."""
+        if not any(_waiting(journal, Action.DELIVER)) and not any(
+            _waiting(journal, Action.DELIVER, IntentStatus.QUEUED)
+        ):
+            return outbox(journal)
+        held = _held(journal)
+        try:
+            self._same_destination(None if held is None else held[0])
+        except (Unanswered, Rejected):
+            return outbox(journal)  # no login: nothing is sent, and everything stays
         while True:
             intent = next(_waiting(journal, Action.DELIVER, IntentStatus.PENDING), None)
             sent_before = intent is not None
@@ -626,6 +758,7 @@ class Publisher:
                 queued = next(_waiting(journal, Action.DELIVER, IntentStatus.QUEUED), None)
                 if queued is None:
                     break
+                _entry(queued)
                 intent = journal.dequeue(queued.ordinal)
             if not self._settle_comment(journal, intent, sent_before=sent_before):
                 break
@@ -634,6 +767,7 @@ class Publisher:
     def _settle_comment(self, journal: Journal, intent: Intent, *, sent_before: bool) -> bool:
         number = journal.issue_number
         assert number is not None  # the journal queues no delivery before its issue
+        kind, text = _entry(intent)
 
         def find() -> dict[str, Any] | None:
             driver = self.github.login()
@@ -641,14 +775,14 @@ class Publisher:
             return next((one for one in mine if _carries(one.get("body"), intent.marker)), None)
 
         def send() -> dict[str, Any]:
-            body = _with_marker(intent.payload["body"], intent.marker)
+            body = _with_marker(text, intent.marker)
             self._checked(body)
             return self.github.comment(number, body)
 
         record = self._settle(find, send, sent_before=sent_before)
         if record is None:
             return False
-        journal.confirm(intent.ordinal, {"kind": intent.payload["kind"], "comment": record.get("id")})
+        journal.confirm(intent.ordinal, {"kind": kind.value, "comment": record.get("id")})
         return True
 
     @staticmethod
@@ -669,8 +803,30 @@ class Publisher:
             return None
 
 
-def _kind(intent: Intent) -> str | None:
-    return intent.payload.get("kind") if intent.action is Action.DELIVER else None
+_HEADINGS = {Kind.RUN: "### Run `", Kind.COMPARISON: "### Comparison: "}
+
+
+def _entry(intent: Intent) -> tuple[Kind, str]:
+    """The kind and the body of a delivery this module queued, or `Refusal.UNRECOGNIZED_ENTRY`
+    before anything is sent: any other payload stays private, in the journal, as it is."""
+    payload = intent.payload
+    kind, body = payload.get("kind"), payload.get("body")
+    if set(payload) != {"kind", "body", "reference"} or kind not in set(Kind) or not isinstance(body, str):
+        raise PublishError(Refusal.UNRECOGNIZED_ENTRY)
+    if not body.startswith(_HEADINGS[Kind(kind)]):
+        raise PublishError(Refusal.UNRECOGNIZED_ENTRY)
+    return Kind(kind), body
+
+
+def _held(journal: Journal) -> tuple[dict[str, Any], Intent | None] | None:
+    """What the run's journal holds about its issue: the payload of its creation (confirmed, or
+    in doubt) with that intent, or the record of the issue it adopted."""
+    creations = [one for one in journal.intents if one.action is Action.CREATE_ISSUE]
+    creation = next((one for one in reversed(creations) if one.status is not IntentStatus.RULED_OUT), None)
+    if creation is not None:
+        return creation.payload, creation
+    record = journal.issue_record
+    return None if record is None else (record, None)
 
 
 def _waiting(journal: Journal, action: Action, status: IntentStatus = IntentStatus.PENDING) -> Iterator[Intent]:
@@ -686,7 +842,8 @@ def outbox(journal: Journal) -> Outbox:
 
 def resume_publication(root: Path, run_id: str, publisher: Publisher) -> Outbox:
     """Publish-only resume: the run's pending issue creation, then its pending and queued
-    comments, from the journal alone. It measures nothing and sends nothing but to GitHub."""
+    comments, from the journal alone. It measures nothing and sends nothing but to GitHub, in
+    the run's repository and as the run's driver."""
     with Journal.open(root, run_id) as journal:
         creation = next(_waiting(journal, Action.CREATE_ISSUE), None)
         if creation is not None:

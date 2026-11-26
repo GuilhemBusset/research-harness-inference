@@ -5,13 +5,17 @@ comment of each run and the comparison's, against a fake GitHub endpoint in memo
 
 from __future__ import annotations
 
+import http.client
+import json
 import os
 import subprocess
 import sys
+import tomllib
 import urllib.parse
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -25,6 +29,7 @@ from evaluate.publisher import (
     Ending,
     Experiment,
     GitHub,
+    HttpTransport,
     Publisher,
     PublishError,
     Reason,
@@ -34,21 +39,30 @@ from evaluate.publisher import (
     Unanswered,
     Verdict,
     marker_line,
+    render_issue,
+    render_run,
     resume_publication,
 )
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 REPO = "example-org/experiments"
 DRIVER, OTHER = "evaluation-driver", "someone-else"
+SUITE = tomllib.loads((REPOSITORY / "tools/evaluate/suites/course-v1.toml").read_text(encoding="utf-8"))
+# The public settings of the checked-in report's pool: its image digest, its GPU's public name.
+SETTINGS = json.loads((REPOSITORY / "tools/evaluate/fixtures/report/manifest.json").read_text(encoding="utf-8"))
+SETTINGS = {name: value for name, value in SETTINGS["observed"].items() if value is not None}
 EXPERIMENT = Experiment(
     question="Does the candidate release keep class-size capacity on two hosts?",
     source_commit="a" * 40,
     suite="course-v1",
     profile=Profile.QUALIFY,
     workload="sha256:" + "b" * 64,
-    targets={"reference": {"release": "r41", "hosts": "2"}, "candidate": {"release": "r42", "hosts": "2"}},
+    targets={
+        "reference": {"host_count": 2, "kv_dtype": "bits_16"},
+        "candidate": {"host_count": 2, "kv_dtype": "bits_8"},
+    },
     seeds=(11, 12, 13),
-    floors={"ttft_p95_ms": 2000, "speed_p10": 8.0},
+    floors=SUITE["objectives"],
 )
 REFERENCE_RUN = "f" * 16
 
@@ -104,7 +118,9 @@ class FakeGitHub:
         if rest == [""] and method == "POST":
             return 201, self.issues[self.post_issue(DRIVER, body["body"])]
         if rest == [""]:
-            return 200, self._page([one for one in self.issues.values() if one["user"]["login"] == params["creator"]], params)
+            return 200, self._page(
+                [one for one in self.issues.values() if one["user"]["login"] == params["creator"]], params
+            )
         number = int(rest[0])
         if rest == [str(number)]:
             return (200, self.issues[number]) if number in self.issues else (404, None)
@@ -123,7 +139,9 @@ class FakeGitHub:
     def records(self, marker: str, login: str = DRIVER) -> list[dict[str, Any]]:
         """The records of `login`, issues and comments, that carry the marker's line."""
         every = [*self.issues.values(), *self.comments]
-        return [one for one in every if one["user"]["login"] == login and marker_line(marker) in one["body"].splitlines()]
+        return [
+            one for one in every if one["user"]["login"] == login and marker_line(marker) in one["body"].splitlines()
+        ]
 
 
 @pytest.fixture(autouse=True)
@@ -147,7 +165,7 @@ def run(run_id: str, **changes: Any) -> RunResult:
         ending=Ending.COMPLETED,
         cells_completed=12,
         cells_planned=12,
-        observed={"release": "r42", "instance-type": "g6e.xlarge"},
+        observed={"instance_type": "g7e.2xlarge", "gpu_type": "RTX PRO 6000", "host_count": 2},
         requested_hosts=2,
         served_hosts=2,
         capacity={Shape.HANDS_ON: Verdict.PASS, Shape.SEVERAL_AGENTS: Verdict.MEASURED_MISS},
@@ -227,7 +245,9 @@ def test_candidate_and_reference_comments_and_their_comparison_attach_to_one_exp
         assert driver.open_experiment(candidate, EXPERIMENT, issue=number) == number
         candidate.intend(Action.BOOK, {"instances": 2})  # the booking comes once the issue is known
         candidate_comment = driver.publish_run(candidate, run(candidate.run_id))
-        compared = driver.publish_comparison(candidate, replace(comparison(candidate.run_id), reference_run=reference.run_id))
+        compared = driver.publish_comparison(
+            candidate, replace(comparison(candidate.run_id), reference_run=reference.run_id)
+        )
 
     assert len(fake.issues) == 1
     assert [comment["issue"] for comment in fake.comments] == [number] * 3
@@ -291,6 +311,101 @@ def test_a_retry_keeps_its_marker_until_the_drivers_record_is_found(
         assert (delivery.marker, delivery.result) == (marker, {"kind": "run", "comment": own["id"]})
 
 
+def test_a_cut_response_is_an_answer_lost() -> None:
+    reply = MagicMock(status=201)
+    reply.read.side_effect = http.client.IncompleteRead(b"{", 10)
+    with patch("urllib.request.urlopen") as opener, pytest.raises(Unanswered):
+        opener.return_value.__enter__.return_value = reply
+        HttpTransport("")("POST", f"/repos/{REPO}/issues", {})
+
+
+# --- One record, one destination -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("changed", ["repository", "writer"])
+def test_a_resume_writes_only_to_the_runs_repository_as_its_driver(
+    tmp_path: Path, fake: FakeGitHub, changed: str
+) -> None:
+    with Journal.create(tmp_path) as journal:
+        number = Publisher(GitHub(fake, REPO)).open_experiment(journal, EXPERIMENT)
+        fake.faults.append(("POST", "lost-then-down"))  # the comment is posted, its answer lost
+        assert Publisher(GitHub(fake, REPO)).publish_run(journal, run(journal.run_id)).waiting == 1
+    fake.down = False
+    elsewhere = FakeGitHub()
+    elsewhere.post_issue(DRIVER, "Another experiment")  # the same number, in another repository
+
+    def send(method: str, path: str, body: Any) -> tuple[int, Any]:
+        if changed == "repository":
+            return elsewhere(method, path.replace("example-org/other", REPO), body)
+        if path == "/user":
+            return 200, {"login": "second-driver"}
+        return fake(method, path, body)
+
+    repository = "example-org/other" if changed == "repository" else REPO
+    with pytest.raises(PublishError) as raised:
+        resume_publication(tmp_path, journal.run_id, Publisher(GitHub(send, repository)))
+    assert raised.value.reason is Refusal.DESTINATION_MISMATCH
+    assert len(fake.comments) == 1 and fake.comments[0]["issue"] == number
+    assert not elsewhere.comments and not elsewhere.writes()
+    assert resume_publication(tmp_path, journal.run_id, Publisher(GitHub(fake, REPO))) == publisher.Outbox(number, 1, 0)
+    assert len(fake.comments) == 1  # the run's own driver finds it by its marker
+
+
+@pytest.mark.parametrize("in_doubt", [True, False])
+def test_a_run_stays_bound_to_its_experiment(
+    tmp_path: Path, fake: FakeGitHub, driver: Publisher, in_doubt: bool
+) -> None:
+    journal = Journal.create(tmp_path)
+    fake.down = in_doubt
+    if in_doubt:
+        with pytest.raises(PublishError):
+            driver.open_experiment(journal, EXPERIMENT)
+    else:
+        driver.open_experiment(journal, EXPERIMENT)
+    fake.down = False
+    for changed in (replace(EXPERIMENT, seeds=(19,)), replace(EXPERIMENT, targets={"reference": {"host_count": 3}})):
+        with pytest.raises(PublishError) as raised:
+            driver.open_experiment(journal, changed)
+        assert raised.value.reason is Refusal.ISSUE_MISMATCH
+    if in_doubt:
+        refused_to_book(journal)
+        assert fake.writes() == []
+    number = driver.open_experiment(journal, EXPERIMENT)  # the same experiment goes on with its issue
+    assert (number, len(fake.issues)) == (journal.issue_number, 1)
+
+
+def test_each_distinct_pair_has_one_final_comment(tmp_path: Path, fake: FakeGitHub, driver: Publisher) -> None:
+    with Journal.create(tmp_path) as candidate:
+        number = driver.open_experiment(candidate, EXPERIMENT)
+        driver.publish_run(candidate, run(candidate.run_id))
+        pairs = []
+        for _ in range(2):
+            with Journal.create(tmp_path) as reference:
+                driver.open_experiment(reference, EXPERIMENT, issue=number)
+                driver.publish_run(reference, run(reference.run_id))
+                pairs.append(replace(comparison(candidate.run_id), reference_run=reference.run_id))
+                driver.publish_comparison(candidate, pairs[-1])
+        with pytest.raises(PublishError) as raised:
+            driver.publish_comparison(candidate, pairs[0])  # a retry of the same pair
+        assert raised.value.reason is Refusal.ALREADY_QUEUED
+    assert len(fake.comments) == 5
+    assert [comment["issue"] for comment in fake.comments] == [number] * 5
+
+
+def test_a_delivery_the_publisher_did_not_queue_stays_private(
+    tmp_path: Path, fake: FakeGitHub, driver: Publisher
+) -> None:
+    with Journal.create(tmp_path) as journal:
+        driver.open_experiment(journal, EXPERIMENT)
+        legacy = journal.intend(Action.DELIVER, {"body": "Private diagnostic note."})
+    with pytest.raises(PublishError) as raised:
+        resume_publication(tmp_path, journal.run_id, driver)
+    assert raised.value.reason is Refusal.UNRECOGNIZED_ENTRY
+    assert fake.comments == []
+    with Journal.open(tmp_path, journal.run_id) as again:
+        assert again.intents[legacy.ordinal] == legacy  # kept, pending, as it was
+
+
 # --- What is published -----------------------------------------------------------------------
 
 
@@ -299,9 +414,11 @@ def test_a_retry_keeps_its_marker_until_the_drivers_record_is_found(
     [
         {"bundle_digest": "md5:" + "c" * 32},
         {"permalink": "https://example.com/bundle.json"},
-        {"observed": {"release": "Free text, with spaces"}},
+        {"observed": {"class_schedule": "private-canary"}},  # not a public setting
+        {"observed": {"gpu_type": "a free name"}},
         {"ending": Ending.INTERRUPTED},  # a partial run without its fixed reason
         {"reason": Reason.CAPACITY_UNAVAILABLE},  # a completed run with one
+        {"cells_completed": 0},  # completed, with cells missing
         {"failures": 401},
         {"cleanup": "stopped"},
     ],
@@ -318,6 +435,23 @@ def test_a_rejected_field_sends_and_queues_nothing(
     assert (journal.intents, fake.writes()) == (intents, writes)
 
 
+def test_public_settings_floors_and_measurements_render_as_given(
+    tmp_path: Path, fake: FakeGitHub, driver: Publisher
+) -> None:
+    seed = 2**32 - 1
+    experiment = replace(EXPERIMENT, targets={"reference": SETTINGS}, seeds=(seed,))
+    with Journal.create(tmp_path) as journal:
+        number = driver.open_experiment(journal, experiment)
+        driver.publish_run(journal, run(journal.run_id, observed=SETTINGS, ttft_p95_ms=850.5))
+    issue, (comment,) = fake.issues[number]["body"], fake.comments
+    for value in (SETTINGS["engine_image_digest"], SETTINGS["gpu_type"]):
+        assert value in issue and value in comment["body"]
+    assert str(seed) in issue and "850.5 ms" in comment["body"]
+    assert f"`paired_margin_points`: {SUITE['objectives']['paired_margin_points']}" in issue
+    assert render_issue(experiment) == render_issue(experiment)  # a checked record renders the same
+    assert "850.5" in render_run(run("a" * 16, ttft_p95_ms=850.5))
+
+
 def test_a_rejected_question_or_a_scan_finding_sends_nothing(
     tmp_path: Path, fake: FakeGitHub, driver: Publisher
 ) -> None:
@@ -327,19 +461,22 @@ def test_a_rejected_question_or_a_scan_finding_sends_nothing(
             driver.open_experiment(journal, replace(EXPERIMENT, question=question))
         assert raised.value.reason is Refusal.FIELD_REJECTED
 
-    finding = Publisher(GitHub(fake, REPO), scan=lambda _text, _path: ["finding"])
-    with pytest.raises(PublishError) as raised:
-        finding.open_experiment(journal, EXPERIMENT)
-    assert raised.value.reason is Refusal.HYGIENE_FINDING
+    resource = "vpc-" + "0123456789abcdef0"  # what the real scanner finds, built here
+    for scanned, question in (
+        (driver, f"Does {resource} hold?"),
+        (Publisher(GitHub(fake, REPO), scan=lambda _t, _p: ["x"]), None),
+    ):
+        with pytest.raises(PublishError) as raised:
+            scanned.open_experiment(journal, EXPERIMENT if question is None else replace(EXPERIMENT, question=question))
+        assert raised.value.reason is Refusal.HYGIENE_FINDING
+    assert (fake.writes(), journal.intents) == ([], ())
 
     driver.open_experiment(journal, EXPERIMENT)
-    writes = fake.writes()
-    resource = "vpc-" + "0123456789abcdef0"  # a label the real scanner finds, built here
+    comments_found = Publisher(GitHub(fake, REPO), scan=lambda text, _path: ["x"] if text.startswith("### Run") else [])
     with pytest.raises(PublishError) as raised:
-        driver.publish_run(journal, run(journal.run_id, observed={"network": resource}))
+        comments_found.publish_run(journal, run(journal.run_id))
     assert raised.value.reason is Refusal.HYGIENE_FINDING
-    assert (fake.writes(), deliveries(journal)) == (writes, [])
-    assert len(writes) == 1  # the issue, and nothing else
+    assert (len(fake.writes()), deliveries(journal)) == (1, [])  # the issue, and nothing else
 
 
 def test_a_post_run_outage_keeps_the_comment_and_its_comparison_for_publish_only_resume(
@@ -359,12 +496,16 @@ def test_a_post_run_outage_keeps_the_comment_and_its_comparison_for_publish_only
 
     fake.down = False
     fake.log.clear()
-    assert resume_publication(tmp_path, journal.run_id, driver) == publisher.Outbox(number, 2, 0)
+    resumed = Publisher(GitHub(fake, REPO))  # a new process: publish-only
+    assert resume_publication(tmp_path, journal.run_id, resumed) == publisher.Outbox(number, 2, 0)
     run_comment, compared = fake.comments
     assert run_comment["body"] == pending.payload["body"] + "\n" + marker_line(pending.marker) + "\n"
     assert compared["body"] == queued.payload["body"] + "\n" + marker_line(queued.marker) + "\n"
     # Publish-only: the driver's identity and the experiment's issue, and nothing else.
-    assert {path.partition("?")[0] for _method, path in fake.log} <= {"/user", f"/repos/{REPO}/issues/{number}/comments"}
+    assert {path.partition("?")[0] for _method, path in fake.log} <= {
+        "/user",
+        f"/repos/{REPO}/issues/{number}/comments",
+    }
 
 
 def test_publish_only_resume_loads_no_benchmark_or_cloud_client() -> None:

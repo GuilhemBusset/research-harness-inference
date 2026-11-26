@@ -46,12 +46,14 @@ run. After it, `confirm` saves what came back: the issue's number, the exact boo
 comment. An intent that is still pending after a restart is an action that may or may not have
 happened: the driver looks for its marker in the actual record, then confirms it or rules it out
 (`rule_out`). One intent of each action is pending at most, so a retry targets the same record.
-An action that has to wait for the pending one is saved with `queue`, its marker made then: it is
-not sent, and `dequeue` makes it the pending one once nothing else of its action is, in the order
-they were queued. A comment that is ready while the one before it is still in doubt is saved
-whole, so that a restart delivers both, in order.
+A delivery that has to wait for the pending one is saved with `queue`, its marker made then: it
+is not sent, and `dequeue` makes it the pending one once no other delivery is, in the order they
+were queued. A comment that is ready while the one before it is still in doubt is saved whole, so
+that a restart delivers both, in order. Only a delivery is queued: a run has one issue, and once
+its number is journaled no creation can replace it.
 A booking or a delivery is refused until the issue number is journaled. `adopt_issue` journals the
-number of an issue the operator named. What an intent saved does not change afterwards: its
+number of an issue the operator named, with what the driver checked about it (private, like a
+payload). What an intent saved does not change afterwards: its
 payload and its result are given as copies, and a change to one changes nothing in the journal.
 
 `pending` is the one thing a restart does first, a member of `Step` and the saved intent it is
@@ -274,6 +276,8 @@ class _State:
     issue_number: int | None = None
     intents: tuple[Intent, ...] = ()
     attempts: tuple[Attempt, ...] = ()
+    # What the driver saved about an issue it adopted, as the text of a JSON object.
+    issue_record: str | None = None
 
 
 # --- The files -------------------------------------------------------------------------------
@@ -382,6 +386,7 @@ def _encode(state: _State) -> str:
         "schema_version": SCHEMA_VERSION,
         "run_id": state.run_id,
         "issue_number": state.issue_number,
+        "issue_record": None if state.issue_record is None else json.loads(state.issue_record),
         "intents": [
             {
                 "ordinal": intent.ordinal,
@@ -413,7 +418,14 @@ def _decode(text: str) -> _State:
             record = None if item["record"] is None else contracts.loads(json.dumps(item["record"]), CellRecord)
             read: dict[str, Any] = {**item, "status": AttemptStatus(item["status"]), "record": record}
             attempts.append(Attempt(**read))
-        return _State(saved["run_id"], saved["issue_number"], tuple(intents), tuple(attempts))
+        record = saved.get("issue_record")
+        return _State(
+            run_id=saved["run_id"],
+            issue_number=saved["issue_number"],
+            intents=tuple(intents),
+            attempts=tuple(attempts),
+            issue_record=None if record is None else _private(record),
+        )
     except (KeyError, TypeError, ValueError, JournalError) as error:  # a `ContractError` is a `ValueError`
         raise JournalError(Refusal.JOURNAL_UNREADABLE) from error
 
@@ -514,6 +526,12 @@ class Journal:
         return self._state.issue_number
 
     @property
+    def issue_record(self) -> dict[str, Any] | None:
+        """What `adopt_issue` saved about the issue it journaled, as a new copy."""
+        record = self._state.issue_record
+        return None if record is None else json.loads(record)
+
+    @property
     def intents(self) -> tuple[Intent, ...]:
         return self._state.intents
 
@@ -576,8 +594,11 @@ class Journal:
         return self._new_intent(action, payload, IntentStatus.PENDING)
 
     def queue(self, action: Action, payload: Mapping[str, object]) -> Intent:
-        """Saves `payload` and its marker for an `action` that is not taken yet: it waits behind
-        the pending intent of its action, whether or not there is one, until `dequeue`."""
+        """Saves `payload` and its marker for a delivery that is not sent yet: it waits behind
+        the pending delivery, whether or not there is one, until `dequeue`. Nothing else is
+        queued: an issue or a booking is one intent at a time."""
+        if action is not Action.DELIVER:
+            raise JournalError(Refusal.INVALID_VALUE)
         return self._new_intent(action, payload, IntentStatus.QUEUED)
 
     def dequeue(self, ordinal: int) -> Intent:
@@ -610,6 +631,8 @@ class Journal:
         saved = _private(result)
         known = type(ordinal) is int and 0 <= ordinal < len(self.intents)
         if known and self.intents[ordinal].action is Action.CREATE_ISSUE:
+            if self.issue_number is not None:
+                raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
             number = _whole_number(json.loads(saved).get("number"), 1, contracts.MAX_COUNT)
             return self._settle(ordinal, IntentStatus.CONFIRMED, saved, issue_number=number)
         return self._settle(ordinal, IntentStatus.CONFIRMED, saved)
@@ -618,13 +641,15 @@ class Journal:
         """Saves that the intent's action did not happen: the actual record does not show it."""
         return self._settle(ordinal, IntentStatus.RULED_OUT, None)
 
-    def adopt_issue(self, number: int) -> None:
-        """Journals the number of an issue the operator named: nothing is created for the run."""
+    def adopt_issue(self, number: int, record: Mapping[str, object] | None = None) -> None:
+        """Journals the number of an issue the operator named, and `record`, what the driver
+        checked about it: nothing is created for the run."""
         if self.issue_number is not None:
             raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
         if self.pending().step is Step.RECONCILE_ISSUE:
             raise JournalError(Refusal.ACTION_PENDING)
-        self._transition(issue_number=_whole_number(number, 1, contracts.MAX_COUNT))
+        saved = None if record is None else _private(record)
+        self._transition(issue_number=_whole_number(number, 1, contracts.MAX_COUNT), issue_record=saved)
 
     # --- Cells ---
 
