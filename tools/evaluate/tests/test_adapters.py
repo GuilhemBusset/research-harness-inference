@@ -477,6 +477,59 @@ def test_a_follow_up_without_the_first_conversation_is_not_answered(harness: Har
     assert not (other.work / "revised.txt").exists()
 
 
+@pytest.mark.parametrize("counted", [True, False], ids=["turns-counted", "turns-not-counted"])
+def test_a_follow_up_whose_conversation_is_lost_cannot_pass_on_the_first_prompts_work(
+    counted: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = word(), word()
+    conversation = Conversation(
+        [chained(first, "seed.txt", "answer.txt"), chained(second, "changed.txt", "revised.txt")]
+    )
+    accepted = Grade(properties=(True,), within_limits=True)
+    with bench(tmp_path, Harness.CODEX, [conversation]) as made:
+        seeded(made.worker, "seed.txt")
+        seeded(made.worker, "changed.txt")
+        run = made.worker.run
+
+        def forgetful(command: Sequence[str]) -> workers.Ran:
+            (made.worker.root / "home" / "codex-session.json").unlink(missing_ok=True)
+            return run(command)
+
+        monkeypatch.setattr(made.worker, "run", forgetful)
+        turns = (lambda: made.forwarder.budget.model_turns) if counted else None
+        trial = adapter(Harness.CODEX, FOLLOW_UP).trial(
+            made.worker, [f"Do the task {first}.", f"Now also {second}."], turns=turns
+        )
+        evidence = trial.ending.evidence(made.forwarder)
+
+    # The first prompt was worked on, and the follow-up ended before it asked the model anything.
+    assert made.pool.turns() == [(0, 0), (0, 1), (0, 2)]
+    assert (made.worker.work / "answer.txt").exists()
+    assert not (made.worker.work / "revised.txt").exists()
+    assert not trial.ending.completed
+    record = evidence.trial_record(execution=0, trial=0, student=0, grade=accepted)
+    assert (record.outcome, record.invalid) == (TrialOutcome.INVALID, InvalidReason.DRIVER_ERROR)
+
+
+def test_a_follow_up_that_failed_after_it_asked_the_model_is_the_graders_when_its_turns_were_counted(
+    tmp_path: Path,
+) -> None:
+    first, second = word(), word()
+    # The follow-up is answered with a call the stand-in ends in failure on.
+    broken = Phase(second, [lambda _: Raw("exec_command", "{}"), lambda _: Say("done")])
+    with bench(tmp_path, Harness.CODEX, [Conversation([chained(first, "seed.txt", "answer.txt"), broken])]) as made:
+        seeded(made.worker, "seed.txt")
+        prompts = [f"Do the task {first}.", f"Now also {second}."]
+        trial = adapter(Harness.CODEX, FOLLOW_UP).trial(
+            made.worker, prompts, turns=lambda: made.forwarder.budget.model_turns
+        )
+        evidence = trial.ending.evidence(made.forwarder)
+
+    assert made.pool.turns() == [(0, 0), (0, 1), (0, 2), (1, 0)]
+    assert (trial.ending.completed, trial.ending.turns_before) == (False, 3)
+    assert (evidence.model_turns, evidence.failure, evidence.invalid) == (4, None, None)
+
+
 # The delegated workers.
 
 
@@ -555,6 +608,22 @@ def test_a_trial_reports_delegation_only_for_a_task_that_delegates(tmp_path: Pat
 
     assert made.pool.faults == [scripted.NO_TOOL]
     assert (delegating.delegation, alone.delegation) == (Delegation(0, False), None)
+
+
+def test_a_transcript_that_cannot_be_read_gives_no_count_of_workers_and_an_invalid_trial(tmp_path: Path) -> None:
+    class Unread:
+        """A worker whose command ends in success, and whose transcript is not there to read."""
+
+        transcript = tmp_path / "transcript"
+
+        def run(self, command: Sequence[str]) -> workers.Ran:
+            return workers.Ran(0, False, False, self.transcript)
+
+    trial = adapter(Harness.CLAUDE_CODE, DELEGATION).trial(Unread(), ["made-up prompt"])
+
+    # What was not read shows no worker, and none that there was no worker.
+    assert trial.delegation is None
+    assert trial.ending == Ending(completed=False, invalid=InvalidReason.DRIVER_ERROR)
 
 
 # Tools that fail, and how a trial ended.

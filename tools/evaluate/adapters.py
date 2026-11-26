@@ -39,7 +39,8 @@ harness. Everything else of the environment is the container's own.
 
 - *a follow-up in the same conversation* (`follow_up`; Claude Code, Codex): a later prompt is a
   second command in the same worker and home, which continues the conversation the harness stored
-  there. It is refused for an assignment without the feature;
+  there. It is refused for an assignment without the feature. A follow-up counts as given only
+  once its command asked the model for a turn (below, *invalid*);
 - *local research tools* (`local_search`): each tool folder the worker mounts under
   `workers.TOOLS` is on the `PATH`, so the harness's shell tool calls a tool by its name;
 - *delegation* (`delegation`; Claude Code): the tools that start a worker are among those Claude
@@ -67,10 +68,15 @@ An assignment that asks a harness for a feature it does not have here is refused
   in failure, and the adapter does not name it;
 - *invalid*, `driver_error`: the measurement broke, not the attempt. The harness could not be
   started (the launcher could not write its profile, or there was no such command), the runtime
-  or the worker's transcript failed, or the harness ended in failure without having asked the
-  model for a single turn: it never worked on the task, whatever the task's folder holds.
+  failed, what a step printed could not be written or read back, or the harness ended a prompt
+  in failure without having asked the model for a single turn for it: it never worked on that
+  prompt, whatever the task's folder holds. For the first prompt the forwarder's count of the
+  trial's turns shows it. For a follow-up, which a harness that cannot load its conversation ends
+  the same way, only a count taken when the follow-up was given does (`Adapter.trial`, `turns`);
+  without one, nothing shows the follow-up reached the model, and the trial is invalid.
 
-A harness that ended in failure for another reason has no reason of the adapter's:
+A harness that ended in failure for another reason, after it asked the model, has no reason of
+the adapter's:
 `Ending.evidence` gives its exit status to the forwarder, which names an endpoint failure when a
 turn was left unanswered, and adds the adapter's reason where the forwarder saw none. What was
 written is still graded.
@@ -90,7 +96,7 @@ from evaluate.contracts import FailureReason, Harness, HarnessFeature, InvalidRe
 from evaluate.forwarding import PLACEHOLDER_KEY
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from evaluate.contracts import HarnessAssignment
     from evaluate.forwarding import Evidence, Forwarder
@@ -223,15 +229,20 @@ class Ending:
     failure: FailureReason | None = None
     invalid: InvalidReason | None = None
     exit_status: int | None = None
+    turns_before: int | None = 0
+    """The model turns the trial had been admitted when the prompt that ended it was given: none
+    before the first prompt, and before a follow-up `None` unless they were counted then."""
 
     def evidence(self, forwarder: Forwarder) -> Evidence:
         """The trial's evidence, with this ending: the forwarder's own reading of the exit
         status, and this ending's failure where the forwarder saw none. A harness that did not
-        complete, for no reason either of them names, and that the forwarder admitted no model
-        turn of, never worked on the task: the trial is invalid, the driver's error."""
+        complete, for no reason either of them names, and that is not shown to have asked the
+        model for a turn since its last prompt, never worked on that prompt: the trial is invalid,
+        the driver's error. The turns of the prompts before it show nothing of this one."""
         observed = forwarder.evidence(invalid=self.invalid, exit_status=self.exit_status)
         failure, invalid = observed.failure or self.failure, observed.invalid
-        if not self.completed and failure is None and invalid is None and observed.model_turns == 0:
+        asked = self.turns_before is not None and observed.model_turns > self.turns_before
+        if not self.completed and failure is None and invalid is None and not asked:
             invalid = InvalidReason.DRIVER_ERROR
         return replace(observed, failure=failure, invalid=invalid)
 
@@ -239,7 +250,8 @@ class Ending:
 @dataclass(frozen=True)
 class Trial:
     """A trial's steps, the first prompt's then each follow-up's that was given, and its ending.
-    `delegation` is read for an assignment that delegates, and is `None` for any other."""
+    `delegation` is read for an assignment that delegates, and is `None` for any other, and for a
+    trial whose output could not all be read: no count of workers comes from what was not read."""
 
     steps: tuple[Step, ...]
     ending: Ending
@@ -473,34 +485,36 @@ class Adapter:
     # Running.
 
     def run(self, worker: Runs, prompt: str, *, follow_up: bool = False) -> Step:
-        """Gives the harness one prompt in the worker, and keeps what the step printed."""
+        """Gives the harness one prompt in the worker, and keeps what the step printed. OSError
+        when that cannot be read: nothing stands in for it."""
         before = _size(worker.transcript)
         ran = worker.run(self.command(prompt, follow_up=follow_up))
-        try:
-            with ran.transcript.open("rb") as file:
-                file.seek(before)
-                printed = file.read()
-        except OSError:
-            printed = b""
+        with ran.transcript.open("rb") as file:
+            file.seek(before)
+            printed = file.read()
         return Step(ran, printed.decode("utf-8", "replace"))
 
-    def trial(self, worker: Runs, prompts: Sequence[str]) -> Trial:
+    def trial(self, worker: Runs, prompts: Sequence[str], *, turns: Callable[[], int] | None = None) -> Trial:
         """Gives the harness the task's prompt, then each follow-up while the one before
-        completed, and says how the trial ended. A runtime that fails, or a transcript that cannot
-        be written, is the driver's error: the worker has ended its container by then
-        (`Worker.run`), and the trial has its ending all the same."""
+        completed, and says how the trial ended. `turns` counts the model turns the trial's
+        forwarder has admitted so far (`forwarder.budget.model_turns`): with it, a follow-up that
+        ended in failure is known to have asked the model or not (`Ending.evidence`). A runtime
+        that fails, or a transcript that cannot be written or read, is the driver's error: the
+        trial has its ending all the same, and no delegation is read from it."""
         steps: list[Step] = []
         ending = Ending(completed=True)
+        broken = False
         try:
             for index, prompt in enumerate(prompts):
+                before = 0 if index == 0 else turns() if turns is not None else None
                 steps.append(self.run(worker, prompt, follow_up=index > 0))
-                ending = self.ending(steps[-1])
+                ending = replace(self.ending(steps[-1]), turns_before=before)
                 if not ending.completed:
                     break
         except (workers.WorkerFault, OSError):
-            ending = Ending(completed=False, invalid=InvalidReason.DRIVER_ERROR)
+            broken, ending = True, Ending(completed=False, invalid=InvalidReason.DRIVER_ERROR)
         found = None
-        if HarnessFeature.DELEGATION in self.features:
+        if HarnessFeature.DELEGATION in self.features and not broken:
             # Each step is a run of Claude Code, with workers of its own.
             runs = [delegation(step.output) for step in steps]
             found = Delegation(sum(one.workers for one in runs), any(one.overlapped for one in runs))
