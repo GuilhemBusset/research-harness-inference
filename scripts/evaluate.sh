@@ -34,8 +34,9 @@
 #
 #   0  a completed profile that meets its applicable floors, at every load it measured
 #   1  a measured miss of a completed profile
-#   2  invalid, incomplete or inconclusive evidence, an invocation that failed or was interrupted
-#      (its verdict rows still show what it measured), or a refusal
+#   2  invalid, incomplete or inconclusive evidence, an invocation that failed (a fault of the
+#      driver among them) or was interrupted (its verdict rows still show what it measured), or a
+#      refusal
 #
 # The publication changes no exit code. It is `delivered` once GitHub confirmed every write,
 # `pending` while the issue's creation or a comment waits, `refused` for a comment the scan refused:

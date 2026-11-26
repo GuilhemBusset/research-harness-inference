@@ -302,10 +302,13 @@ def applied(sessions: Sessions) -> bool:
     return True
 
 
-def supply(sessions: Sessions, *, now: int) -> list[Supply]:
-    """Every deployed pool, by name: its session and what the scaler's note says of its instances."""
+def supply(sessions: Sessions, *, now: int, only: str | None = None) -> list[Supply]:
+    """Every deployed pool, by name: its session and what the scaler's note says of its instances.
+    With `only`, that pool alone, if it is deployed: no other pool's items are read."""
     found = []
     for pool in sorted(admin_pools.max_instances(sessions.pools)):
+        if only is not None and pool != only:
+            continue
         # The two items the status shows, each by its key: no other item of the pool is read, a
         # record of a retired kind that an earlier release left in the table among them.
         records = {

@@ -19,8 +19,9 @@ this host (docs/design/agent-session-evaluation.md, "How the operator runs it").
   files and graders.
 
 The release every selected host must serve is the release parameter's image digest and model
-revision; `releases` gives what each host's lifecycle agent reports of the same two, from the
-workspace. The gateway is ready when its status says the pool is `ready`, as a canary student
+revision; `releases` gives what each host's lifecycle agent reports of the same two in its latest
+scrape, from the workspace (`current_releases`): a host whose latest scrape says two releases
+serves none the driver admits. The gateway is ready when its status says the pool is `ready`, as a canary student
 reads it. A lookup that cannot be made is `Unresolved`, naming the preflight check it fails: the
 controller reports it and creates, books and sends nothing. Nothing resolved here is printed or
 written: the keys, the addresses and the identifiers stay in the driver's process.
@@ -68,6 +69,8 @@ OBSERVABILITY_STACK, WORKSPACE_OUTPUT = admin_main.OBSERVABILITY_STACK_NAME, "Wo
 # What the gateway stack's output says while the endpoint has no HTTPS listener.
 NO_ENDPOINT = "none"
 READY = "ready"
+# What `current_releases` gives for a host whose latest scrape is ambiguous: never a release.
+AMBIGUOUS = "ambiguous"
 DRIVER_IMAGE_VARIABLE = "RHI_EVALUATE_DRIVER_IMAGE_DIGEST"
 PATH_CATEGORY_VARIABLE = "RHI_EVALUATE_PATH_CATEGORY"
 LOCK = Path(__file__).resolve().parents[2] / "uv.lock"
@@ -95,6 +98,25 @@ def _output(session: Any, stack: str, key: str) -> str | None:
 def release_of(image_digest: str, model_revision: str | None) -> str:
     """The release a host serves, as the driver compares it: the engine image and the model."""
     return f"{image_digest}/{model_revision or 'none'}"
+
+
+def current_releases(answer: Sequence[common.Series]) -> list[str]:
+    """The release each host reports now, one entry a host: its series sampled last. A host whose
+    latest scrape says two releases at once says none the driver can use (`AMBIGUOUS`), whatever
+    order the workspace answered in."""
+    latest: dict[str, tuple[float, set[str]]] = {}
+    for series in answer:
+        host = series.labels.get("instance")
+        if not host or not series.samples:
+            continue
+        at = max(sample[0] for sample in series.samples)
+        said = release_of(series.labels.get("image_digest", ""), series.labels.get("model_revision"))
+        before = latest.get(host)
+        if before is None or at > before[0]:
+            latest[host] = (at, {said})
+        elif at == before[0]:
+            before[1].add(said)
+    return [next(iter(said)) if len(said) == 1 else AMBIGUOUS for _, said in latest.values()]
 
 
 def worker_limits(plan: Plan) -> workers.Limits:
@@ -163,7 +185,11 @@ def resolve(
     of when `stack` closes, with the invocation."""
     from evaluate.controller import Check, Instruments
 
-    admin = admin_main.connect(session)
+    try:
+        admin = admin_main.connect(session)
+    except _UNREAD as error:
+        # No client of the driver's session can be made: no region, no credentials' source.
+        raise Unresolved(Check.DEPLOYMENT) from error
     try:
         pool = admin_pools.deployed(admin.pools()).get(scope.pool)
     except _UNREAD as error:
@@ -221,14 +247,10 @@ def resolve(
     held = stack.enter_context(workers.Workers(root / "workers", sealed=_sealed()))
     selector = telemetry.selectors(scope.pool, pool.engine)[telemetry.Source.RELEASE]
 
+    span = telemetry.range_of(telemetry.ALLOWANCE_SECONDS)
+
     def releases() -> list[str]:
-        span = telemetry.range_of(telemetry.ALLOWANCE_SECONDS)
-        found: dict[str, str] = {}
-        for series in reader.read_samples(f"{selector}[{span}]", at=time.time()):
-            labels = series.labels
-            if labels.get("instance"):
-                found[labels["instance"]] = release_of(labels.get("image_digest", ""), labels.get("model_revision"))
-        return list(found.values())
+        return current_releases(reader.read_samples(f"{selector}[{span}]", at=time.time()))
 
     status = common.Gateway(endpoint, scope.pool, keys[0])
     return Instruments(

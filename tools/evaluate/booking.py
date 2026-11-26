@@ -26,7 +26,7 @@ session in the other. `wait` polls every `POLL_SECONDS` and says ready only when
 all of:
 
 - the pool's record still that one, and its start come;
-- the scaler's note (`rhi_admin.session.supply`) no older than `SUPPLY_FRESH_SECONDS`, not written
+- the selected pool's scaler note (`rhi_admin.session.supply`, which reads no other pool) no older than `SUPPLY_FRESH_SECONDS`, not written
   before the session was, and counting *exactly* the selected hosts in service: one of two is not
   enough, and two where one was selected would spread a one-host measurement over both;
 - the gateway ready, by the driver's probe;
@@ -503,7 +503,7 @@ class Capacity:
         if now < bound.starts_at:
             return Reason.SESSION_NOT_STARTED
         try:
-            supplies = admin_session.supply(self.access.sessions, now=now)
+            supplies = admin_session.supply(self.access.sessions, now=now, only=chosen.pool)
         except _UNREAD:
             return Reason.POOL_STATE_UNREADABLE
         note = next((supply.note for supply in supplies if supply.pool == chosen.pool), None)

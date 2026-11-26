@@ -62,11 +62,11 @@ quality verdicts with their limiting rows, the report's paths, the cleanup, and 
 waits, `refused` for a comment the hygiene scan or a field check refused, `none` before anything
 was written. **Its exit code is the verdict's**: 0 for a completed profile that meets its applicable
 floors, at every load it measured; 1 for a measured miss of a completed profile; 2 for invalid,
-incomplete or inconclusive evidence, an invocation that failed or was interrupted (whatever it
-measured: its verdict rows still show a miss), or a refusal. The publication changes no exit code:
+incomplete or inconclusive evidence, an invocation that failed (a fault of the driver among
+them) or was interrupted (whatever it measured: its verdict rows still show a miss), or a refusal. The publication changes no exit code:
 `status` shows it, and `publish --resume` delivers what waits, which needs no booking and no GPU
 and exits 0 once nothing is pending, 2 otherwise. `--for` bounds the whole invocation from its
-start, the wait for capacity included; the cells chosen keep the planner's allowance for that wait
+start, the preflight, the issue and the wait for capacity included; the cells chosen keep the planner's allowance for that wait
 out of the window, as `plan` prints the batches. The report prices the deployed pool's instance
 type unless `--rate` is given. `status` reads a run without taking it, even while a driver runs it,
 and `cancel` asks that driver to stop: it stops admissions and releases the booking it made.

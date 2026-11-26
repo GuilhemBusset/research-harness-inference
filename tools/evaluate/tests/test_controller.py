@@ -17,6 +17,7 @@ import io
 import itertools
 import json
 import math
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,7 @@ from unittest.mock import patch
 import pytest
 
 from evaluate import booking, cli, contracts, controller, phases, publisher, report
+from evaluate import live as lookups
 from evaluate import plan as planning
 from evaluate.contracts import Profile, Settings, TrialOutcome, TrialRecord
 from evaluate.journal import Journal
@@ -161,6 +163,9 @@ class Runtime:
 
     def source_commit(self) -> str:
         return "a" * 40
+
+    def clock(self) -> float:
+        return self.driver.pool.clock()
 
     def preflight(self, plan: Plan) -> Sequence[str]:
         self.driver.events.append("preflight")
@@ -481,11 +486,12 @@ def test_a_worker_error_releases_the_booking_and_a_resume_keeps_every_measured_c
     # The measured cells, the measured failure among them, are the attempts the first booking made.
     for cell in range(1, stop_at):
         assert after[before[cell]["ordinal"]] == before[cell]
+    interrupted = after[before[stop_at]["ordinal"]]
     with Journal.open(driver.runs, run_id) as journal:
         trials = journal.observations(before[failed]["ordinal"])
         assert any(isinstance(one, TrialRecord) and one.outcome is TrialOutcome.FAILED for one in trials)
-    # The interrupted attempt stays, with its observation, superseded by the fresh one.
-    interrupted = after[before[stop_at]["ordinal"]]
+        # The interrupted attempt stays, with the observation it made, superseded by the fresh one.
+        assert len(journal.observations(interrupted["ordinal"])) == 1
     assert interrupted["status"] == "interrupted" and interrupted["replaced_by"] is not None
     assert after[interrupted["replaced_by"]]["status"] == "complete"
     # Both bookings' cells in one report, on one timeline, each cell read once.
@@ -557,6 +563,166 @@ def test_a_restart_that_cannot_reach_github_still_releases_the_booking_the_run_h
     last = stored(driver.pool)
     assert last is not None and last != booked and last.set_by == booked.set_by and last.ends_at <= driver.pool.now
     assert driver.sent == [] and driver.github.writes() == [("POST", f"/repos/{REPO}/issues")]
+
+
+def test_a_restart_whose_measurement_cannot_be_prepared_still_stops_the_booking_it_holds(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver.pool.now = int(time.time())  # the live runtime reads the pool on the real clock
+
+    def died(*_args: object) -> None:
+        raise Died
+
+    driver.pool.after_put = died
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver)
+    (booked,) = booking_writes(driver)
+    sessions = Runtime(driver, controller.Scope(POOL, REPO)).access().sessions
+    monkeypatch.setattr(lookups.admin_main, "connect", lambda *_args: SimpleNamespace(sessions=lambda: sessions))
+    monkeypatch.setattr(publisher, "HttpTransport", lambda _token: driver.github)
+
+    def no_trial_image(*_args: object) -> Any:
+        raise lookups.Unresolved(controller.Check.HARNESS_VERSIONS)
+
+    monkeypatch.setattr(lookups, "resolve", no_trial_image)
+
+    @contextlib.contextmanager
+    def connect(scope: controller.Scope) -> Generator[controller.LiveRuntime]:
+        yield controller.LiveRuntime(scope, instruments=None, session=object, token="fixture")
+
+    argv = ["run", "--resume", only_run(driver), "--profile", "qualify", "--pool", POOL, "--students", "2"]
+    argv += ["--instances", "2", "--for", f"{WHOLE}m", "--issue", "new", "--repository", REPO, "--runs", str(driver.runs)]
+    assert cli.main(argv, connect=connect) == controller.Exit.INCOMPLETE
+
+    last = stored(driver.pool)
+    assert last is not None and last != booked and last.set_by == booked.set_by and driver.sent == []
+
+
+def test_a_session_the_driver_cannot_make_is_a_preflight_refusal_not_a_miss(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import boto3
+    from botocore.exceptions import NoRegionError
+
+    class NoRegion:
+        def client(self, _service: str) -> Any:
+            raise NoRegionError
+
+    monkeypatch.setattr(boto3.session, "Session", NoRegion)
+    monkeypatch.setattr(publisher, "HttpTransport", lambda *_args: FakeGitHub())
+    monkeypatch.setenv(controller.GITHUB_TOKEN_VARIABLE, "fixture")
+    argv = ["run", "--profile", "screen", "--pool", POOL, "--students", "8", "--instances", "1", "--for", "3h"]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.main([*argv, "--issue", "new", "--repository", REPO, "--runs", str(tmp_path)])
+    assert code == controller.Exit.INCOMPLETE and controller.Check.DEPLOYMENT.value in out.getvalue()
+
+
+def test_time_spent_before_the_booking_counts_against_the_window(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> None:
+    start, post = driver.pool.clock(), driver.github.post_issue
+
+    def slow(login: str, body: str) -> int:
+        driver.pool.sleep(8)
+        return post(login, body)
+
+    deadlines: list[float] = []
+    measure = Runtime.measure
+
+    async def recorded(self: Runtime, *args: Any, deadline_s: float, **kwargs: Any) -> phases.Ended:
+        deadlines.append(deadline_s)
+        return await measure(self, *args, deadline_s=deadline_s, **kwargs)
+
+    monkeypatch.setattr(driver.github, "post_issue", slow)
+    monkeypatch.setattr(Runtime, "measure", recorded)
+    run(driver, minutes=60)
+
+    (minutes,) = [one["payload"]["minutes"] for one in state(driver, only_run(driver))["intents"] if one["action"] == "book"]
+    assert deadlines and max(deadlines) <= start + 3600 and minutes == 60  # 59m52s left, booked whole minutes
+
+
+def test_capacity_is_read_from_the_selected_pool_alone(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> None:
+    from botocore.exceptions import ClientError
+
+    settings, read = driver.pool.get_function_configuration, driver.pool.get_item
+    others: list[str] = []
+
+    def with_another_pool(**request: Any) -> Any:
+        found = settings(**request)
+        variables = found["Environment"]["Variables"]
+        document = json.loads(variables["RHI_SCALER_SETTINGS"])
+        document["pools"]["other"] = {"entry": ENTRY}
+        variables["RHI_SCALER_SETTINGS"] = json.dumps(document)
+        return found
+
+    def denied_elsewhere(**request: Any) -> Any:
+        if request["Key"]["pool"] != POOL:
+            others.append(request["Key"]["pool"])
+            raise ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetItem")
+        return read(**request)
+
+    monkeypatch.setattr(driver.pool, "get_function_configuration", with_another_pool)
+    monkeypatch.setattr(driver.pool, "get_item", denied_elsewhere)
+
+    assert run(driver) == controller.Exit.PASS
+    assert others == [] and driver.sent == list(range(len(PLAN.cells)))
+
+
+def test_bookings_a_week_apart_make_one_report_of_every_cell_in_order(driver: Driver) -> None:
+    driver.script = Script(fail_at=3)
+    assert run(driver) == controller.Exit.INCOMPLETE
+    run_id = only_run(driver)
+    driver.pool.sleep(8 * 24 * 3600)
+    driver.script = Script()
+
+    assert run(driver, "--resume", run_id) == controller.Exit.PASS
+
+    kept = report.load(driver.runs / run_id / "bundle").attempts
+    assert sorted(one.record.cell for one in kept) == list(range(len(PLAN.cells)))
+    records = [one.record for one in kept]
+    assert all(later.started_ms >= earlier.ended_ms for earlier, later in itertools.pairwise(records))
+    # Each cell keeps the duration it measured.
+    with Journal.open(driver.runs, run_id) as journal:
+        measured = {one.cell: one.record for one in journal.attempts if one.reusable and one.record is not None}
+    assert all(one.ended_ms - one.started_ms == measured[one.cell].ended_ms - measured[one.cell].started_ms for one in records)
+
+
+def test_a_result_the_driver_stopped_before_commenting_is_commented_once_on_resume(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver.script = Script(fail_at=3)
+    assert run(driver) == controller.Exit.INCOMPLETE
+    run_id = only_run(driver)
+    driver.script = Script()
+
+    def died(*_args: object, **_kwargs: object) -> None:
+        raise Died
+
+    with monkeypatch.context() as patched:
+        patched.setattr(publisher.Publisher, "publish_run", died)
+        with pytest.raises(Died):
+            run(driver, "--resume", run_id)
+    sent = list(driver.sent)
+
+    assert run(driver, "--resume", run_id) == controller.Exit.PASS
+    assert run(driver, "--resume", run_id) == controller.Exit.PASS
+
+    assert driver.sent == sent  # nothing measured again
+    first, last = comments(driver)
+    assert ": failed" in first and ": completed" in last and "`released`" in last
+
+
+def test_evidence_the_report_rejects_is_commented_as_invalid(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> None:
+    def rejected(*_args: object, **_kwargs: object) -> Any:
+        raise report.ReportError(report.Refusal.UNREADABLE_BUNDLE)
+
+    monkeypatch.setattr(report, "regenerate", rejected)
+
+    assert run(driver) == controller.Exit.INCOMPLETE
+
+    (body,) = comments(driver)
+    assert ": failed" in body and "Reason: `invalid-evidence`" in body and "`released`" in body
 
 
 def test_a_comment_whose_answer_is_lost_is_found_by_its_marker_and_not_posted_again(driver: Driver) -> None:
@@ -871,6 +1037,37 @@ def test_a_resumed_booking_s_times_follow_the_earlier_booking_s_in_the_bundle(
     assert len({one.record.cell for one in kept}) > 2
     # One timeline, as the report reads it: no record starts before the one before it ended.
     assert all(later.record.started_ms >= earlier.record.ended_ms for earlier, later in itertools.pairwise(kept))
+
+
+def test_a_host_serves_the_release_of_its_latest_scrape(monkeypatch: pytest.MonkeyPatch) -> None:
+    wanted, other, revision = "sha256:" + "a" * 64, "sha256:" + "b" * 64, "f" * 40
+    release = json.dumps({"engine_image": "engine@" + wanted, "engine_flags": [], "model_revision": revision})
+    parameter = SimpleNamespace(get_parameter=lambda **_kwargs: {"Parameter": {"Value": release}})
+    session = SimpleNamespace(region_name="test", get_credentials=lambda: None, client=lambda _service: parameter)
+    keys = tuple(generate_key() for _ in range(PLAN.canary_identities))
+    monkeypatch.setattr(lookups.admin_main, "connect", lambda _session: SimpleNamespace(pools=lambda: None, secrets=None))
+    monkeypatch.setattr(lookups.admin_pools, "deployed", lambda _pools: {POOL: SimpleNamespace(instance_types=["g7e.2xlarge"], engine="vllm")})
+    monkeypatch.setattr(lookups, "_output", lambda *_args: "https://example.com")
+    monkeypatch.setattr(lookups.spike_keys, "read", lambda _secrets: SimpleNamespace(students=keys))
+    monkeypatch.setattr(lookups.image, "prepare", lambda: SimpleNamespace(image_id=wanted))
+    monkeypatch.setattr(lookups.workers, "Workers", lambda *_args, **_kwargs: contextlib.nullcontext(SimpleNamespace(start=None)))
+    said: list[tuple[str, float]] = []
+
+    def samples(_query: str, *, at: float) -> list[Any]:
+        labels = {"instance": "host", "model_revision": revision}
+        return [lookups.common.Series(labels={**labels, "image_digest": digest}, samples=((at - age, 1),)) for digest, age in said]
+
+    monkeypatch.setattr(lookups.common, "Workspace", lambda *_args: SimpleNamespace(read_samples=samples))
+    with contextlib.ExitStack() as stack:
+        resolved = lookups.resolve(controller.Scope(POOL, REPO, 1), PLAN, session, {}, stack)
+        # The host left the release: an older scrape of it, answered last, does not count.
+        said[:] = [(other, 1), (wanted, 16)]
+        assert resolved.releases() != [resolved.release]
+        said[:] = [(wanted, 1), (other, 16)]
+        assert resolved.releases() == [resolved.release]
+        # One scrape that says two releases says none.
+        said[:] = [(wanted, 1), (other, 1)]
+        assert resolved.releases() == [lookups.AMBIGUOUS]
 
 
 def test_a_gap_in_a_host_s_launch_series_is_no_whole_window() -> None:
