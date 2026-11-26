@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" font-family="sans-serif">
+<rect width="640" height="400" fill="white"/>
+<line x1="80" y1="340" x2="500" y2="340" stroke="black"/>
+<line x1="80" y1="30" x2="80" y2="340" stroke="black"/>
+<text x="80.00" y="356.00" font-size="11" text-anchor="middle">0</text>
+<text x="115.00" y="356.00" font-size="11" text-anchor="middle">1</text>
+<text x="150.00" y="356.00" font-size="11" text-anchor="middle">2</text>
+<text x="185.00" y="356.00" font-size="11" text-anchor="middle">3</text>
+<text x="220.00" y="356.00" font-size="11" text-anchor="middle">4</text>
+<text x="255.00" y="356.00" font-size="11" text-anchor="middle">5</text>
+<text x="290.00" y="356.00" font-size="11" text-anchor="middle">6</text>
+<text x="325.00" y="356.00" font-size="11" text-anchor="middle">7</text>
+<text x="360.00" y="356.00" font-size="11" text-anchor="middle">8</text>
+<text x="395.00" y="356.00" font-size="11" text-anchor="middle">9</text>
+<text x="430.00" y="356.00" font-size="11" text-anchor="middle">10</text>
+<text x="465.00" y="356.00" font-size="11" text-anchor="middle">11</text>
+<text x="500.00" y="356.00" font-size="11" text-anchor="middle">12</text>
+<polyline id="series_a" points="80.00,340.00 115.00,326.22 150.00,312.44 185.00,295.22 220.00,274.56 255.00,253.89 290.00,229.78 325.00,202.22 360.00,174.67 395.00,143.67 430.00,109.22 465.00,74.78 500.00,36.89" fill="none" stroke="#1f77b4" stroke-width="2"/>
+<line x1="515" y1="40" x2="535" y2="40" stroke="#1f77b4" stroke-width="2"/>
+<text x="540" y="44" font-size="12">Depot A</text>
+<polyline id="series_b" points="80.00,340.00 115.00,298.67 150.00,260.78 185.00,226.33 220.00,195.33 255.00,167.78 290.00,140.22 325.00,116.11 360.00,95.44 395.00,74.78 430.00,57.56 465.00,43.78 500.00,30.00" fill="none" stroke="#d62728" stroke-width="2"/>
+<line x1="515" y1="60" x2="535" y2="60" stroke="#d62728" stroke-width="2"/>
+<text x="540" y="64" font-size="12">Depot B</text>
+<text x="290.00" y="385" font-size="13" text-anchor="middle">Day</text>
+<text x="25" y="185.00" font-size="13" text-anchor="middle" transform="rotate(-90 25 185.00)">Parcels delivered in total</text>
+</svg>

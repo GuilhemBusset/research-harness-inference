@@ -1,0 +1,8 @@
+{
+  "x_label": "Day",
+  "y_label": "Parcels delivered in total",
+  "series_a": "Depot A",
+  "series_b": "Depot B",
+  "comparison": "largest_gap",
+  "delegate": true
+}

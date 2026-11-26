@@ -1,0 +1,8 @@
+{
+  "x_label": "Hour",
+  "y_label": "Units made in total",
+  "series_a": "Line A",
+  "series_b": "Line B",
+  "comparison": "largest_gap",
+  "delegate": true
+}
