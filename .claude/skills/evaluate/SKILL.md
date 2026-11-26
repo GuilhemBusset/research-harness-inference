@@ -44,10 +44,16 @@ Admission and the issue's creation are two steps. Admission only reads. It answe
 `refused: not-admitted`, with no run ID, when the driver's token cannot read the repository or the
 repository has no issues. It also refuses a selected issue that is missing or records another
 workload, or hosts or a `--for` the pool cannot hold. Nothing is created then. The issue is created
-after admission, by the admitted run, before any booking. If GitHub refuses that write (the token
-can read the repository but not open issues in it), `submit` has already returned a run ID.
-`inspect --submission <submission-id>` then shows no `issue`, `running: false` and `exit: 2`, and
-nothing was booked.
+after admission, by the admitted run, before any booking. The `issue` field shows a URL only once
+GitHub has confirmed the issue. If the run cannot get that confirmation, it stops before booking.
+`submit` has already returned a run ID, and `inspect --submission <submission-id>` then shows no
+`issue`, `running: false` and `exit: 2`. Two cases follow, and `publication` tells them apart:
+
+- `publication: pending`: the creation is in doubt. GitHub may have created the issue and the
+  answer was lost. `scripts/evaluate.sh publish --resume <run-id>` reconciles it and never opens a
+  second one.
+- any other `publication`: GitHub refused the write (the token can read the repository but not
+  open issues in it). No issue exists.
 
 ## The commands
 
@@ -94,8 +100,15 @@ or `--issue <number>`, and optionally `--suite`, `--question`, `--target`, `--in
 2. Until `issue:` appears or `running` is `false`, run `inspect --submission <submission-id>` again
    about every 30 seconds, for at most 10 minutes. The issue is created and confirmed before any
    host is booked, and the preflight may first build the trial image. If `running` is `false` with
-   no `issue`, the run ended before its issue existed and booked nothing. Report its `exit` and
-   `step`, and tell the operator to check the driver token's access to the repository's issues.
+   no `issue`, the driver could not confirm the experiment issue, and no host was booked. Report
+   the run ID, `exit` and `step`, then:
+   - if `publication` is `pending`, GitHub may have created the issue without the driver getting
+     its confirmation. Tell the operator to run `scripts/evaluate.sh publish --resume <run-id>`
+     in their own terminal. It needs no GPU, finds the original issue by the run's marker (or
+     creates it if GitHub never received the request), and never opens a second issue. After
+     that, `inspect` shows the issue;
+   - otherwise GitHub refused the write and no issue exists. Tell the operator to check the driver
+     token's access to the repository's issues.
 3. Report to the operator:
    - the experiment issue's URL. It is where the run's terminal comment will be;
    - the run ID and the submission ID;

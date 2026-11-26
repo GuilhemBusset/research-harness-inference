@@ -10,7 +10,9 @@ import dataclasses
 import io
 import json
 import os
+import re
 import secrets
+import shlex
 import shutil
 import socket
 import stat
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
 
     from evaluate.plan import Plan
 
+SKILL = Path(__file__).resolve().parents[3] / ".agents" / "skills" / "evaluate" / "SKILL.md"
 RUN: dict[str, Any] = {
     "profile": "qualify",
     "pool": POOL,
@@ -338,18 +341,24 @@ def test_the_issue_a_later_publication_confirmed_is_shown(host: Host) -> None:
 
 def test_an_issue_created_without_its_confirmation_is_pending_and_its_resume_shows_that_one_issue(host: Host) -> None:
     """GitHub creates the issue and the answer is lost: the run stops before booking, shows no
-    issue and a pending publication, and the publication's resume confirms that same issue."""
+    issue and a pending publication, and the command the `evaluate` skill gives the operator for
+    that state confirms that same issue."""
     github = host.services.fake.github
     github.faults.append(("POST", "lost-then-down"))
     host.start()
     sid = submission()
     run_id = host.call(op="submit", submission=sid, run=RUN)["run_id"]
     seen = host.settled(sid)
-    assert (seen["issue"], seen["publication"], seen["exit"]) == (None, "pending", controller.Exit.INCOMPLETE)
+    assert (seen["issue"], seen["running"], seen["publication"]) == (None, False, "pending")
+    assert seen["exit"] == controller.Exit.INCOMPLETE
     assert host.counts() == (1, 1, 0)
+    assert len(github.issues) == 1  # GitHub has it; the driver could not confirm it
 
+    given = re.findall(r"`scripts/evaluate\.sh (publish [^`]*<run-id>)`", SKILL.read_text(encoding="utf-8"))
+    assert given, "the skill gives the operator a recovery for a pending publication"
+    recovery = cli.parser().parse_args(shlex.split(given[0].replace("<run-id>", run_id)))
     github.down = False
-    assert controller.publish_resume(host.runs, run_id, connect=host.services, out=io.StringIO()) == 0
+    assert controller.publish_resume(host.runs, recovery.run_id, connect=host.services, out=io.StringIO()) == 0
     (number,) = github.issues
     assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
     assert host.counts() == (1, 1, 0)
