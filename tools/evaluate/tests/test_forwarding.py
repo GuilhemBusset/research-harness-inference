@@ -75,10 +75,12 @@ def event(data: object, name: str | None = None) -> bytes:
 
 
 def stream(route: Route, output_tokens: int | None = 5) -> tuple[bytes, bytes]:
-    """A whole answer in two parts, its text and its end; it reports usage unless `output_tokens` is `None`."""
+    """A whole answer in two parts, its text and its end, which says why the answer stopped; it
+    reports usage unless `output_tokens` is `None`."""
     if route is MESSAGES:
         delta = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": ANSWER_TEXT}}
-        usage = {"type": "message_delta", "delta": {}, "usage": {"input_tokens": 12, "output_tokens": output_tokens}}
+        counts = {"input_tokens": 12, "output_tokens": output_tokens}
+        usage = {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": counts}
         end = event({"type": "message_stop"}, "message_stop")
         return event(delta, "content_block_delta"), (
             b"" if output_tokens is None else event(usage, "message_delta")
@@ -89,7 +91,8 @@ def stream(route: Route, output_tokens: int | None = 5) -> tuple[bytes, bytes]:
         end = event({"type": "response.completed", "response": usage}, "response.completed")
         return event(delta, "response.output_text.delta"), end
     usage = {"choices": [], "usage": {"prompt_tokens": 12, "completion_tokens": output_tokens}}
-    end = (b"" if output_tokens is None else event(usage)) + event("[DONE]")
+    stop = event({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+    end = stop + (b"" if output_tokens is None else event(usage)) + event("[DONE]")
     return event({"choices": [{"index": 0, "delta": {"content": ANSWER_TEXT}}]}), end
 
 
@@ -647,6 +650,52 @@ def test_a_count_reported_before_the_output_does_not_give_back_what_was_generate
         assert settled(forwarder)
         evidence = forwarder.evidence()
     assert (len(gateway.calls), sum(generated)) == (1, 2)
+    assert fails(evidence, FailureReason.TOKEN_LIMIT)
+
+
+@pytest.mark.parametrize("route", list(Route))
+def test_a_token_that_only_ends_the_answer_is_not_given_back_by_the_count_that_opened_it(
+    gateway: Gateway, route: Route
+) -> None:
+    # The one token generated matches a stop sequence: it ends the answer and comes in no event of
+    # output. The stream counted nothing when it opened, and its closing events report no usage.
+    opened = {"input_tokens": 3, "output_tokens": 0}
+    role = {"index": 0, "delta": {"role": "assistant"}}
+    opening, closing = {
+        MESSAGES: (
+            event({"type": "message_start", "message": {"usage": opened}}),
+            event({"type": "message_delta", "delta": {"stop_reason": "stop_sequence"}})
+            + event({"type": "message_stop"}),
+        ),
+        RESPONSES: (
+            event({"type": "response.in_progress", "response": {"usage": opened}}),
+            event({"type": "response.completed", "response": {}}),
+        ),
+        CHAT: (
+            event({"choices": [role], "usage": {"prompt_tokens": 3, "completion_tokens": 0}}),
+            event({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + event("[DONE]"),
+        ),
+    }[route]
+    generated = []
+
+    def answer(call: Call) -> None:
+        generated.append(1)
+        call.begin()
+        call.write(opening)
+        call.write(closing)
+
+    gateway.play = answer
+    with forwarding(gateway, tokens=31_999) as forwarder:
+        assert ask(forwarder, asking(route, limit=1), route)[0] == 200
+        assert settled(forwarder)
+        [measured] = forwarder.evidence().requests
+        assert (measured.attempt.outcome, measured.attempt.output_counted) == (RequestOutcome.COMPLETED, False)
+        # The count of nothing releases nothing: the last token is charged, and no request follows.
+        assert (measured.charged_tokens, forwarder.budget.generated_tokens) == (1, 32_000)
+        assert ask(forwarder, asking(route, limit=1, text="made-up next turn"), route)[0] == 429
+        assert settled(forwarder)
+        evidence = forwarder.evidence()
+    assert (len(gateway.calls), sum(generated)) == (1, 1)
     assert fails(evidence, FailureReason.TOKEN_LIMIT)
 
 

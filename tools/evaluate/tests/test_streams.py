@@ -36,6 +36,12 @@ def chat(delta: dict[str, object]) -> bytes:
     return event({"choices": [{"index": 0, "delta": delta}]})
 
 
+def chat_stop(index: int, output_tokens: int | None = None) -> bytes:
+    """The chunk in which a choice says why it stopped, with a count of the output if one is given."""
+    reported = {} if output_tokens is None else {"usage": {"completion_tokens": output_tokens}}
+    return event({"choices": [{"index": index, "delta": {}, "finish_reason": "stop"}], **reported})
+
+
 def opening(route: Route, *, usage: bool = True) -> bytes:
     """The first event of a stream. On Messages it reports the input, unless `usage` is false."""
     if route is MESSAGES:
@@ -85,7 +91,8 @@ def tool_arguments(route: Route) -> bytes:
 
 
 def usage_event(route: Route, output_tokens: int | None) -> bytes:
-    """The event before the last that reports the usage. Responses has none: its last event does."""
+    """The events before the last that say why the answer stopped and report the usage. Responses
+    has none: its last event does both."""
     if route is MESSAGES:
         delta = {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}
         reported = {} if output_tokens is None else {"usage": {"output_tokens": output_tokens}}
@@ -93,7 +100,7 @@ def usage_event(route: Route, output_tokens: int | None) -> bytes:
     if route is RESPONSES or output_tokens is None:
         return b""
     counts = {"prompt_tokens": 20, "prompt_tokens_details": {"cached_tokens": 5}, "completion_tokens": output_tokens}
-    return event({"choices": [], "usage": counts})
+    return chat_stop(0) + event({"choices": [], "usage": counts})
 
 
 def last_event(route: Route, output_tokens: int | None, kind: str = "response.completed") -> bytes:
@@ -424,6 +431,50 @@ def test_an_output_count_is_the_answers_own_only_when_no_output_follows_it(route
     assert (counted.output_counted, followed.output_counted, silent.output_counted) == (True, False, False)
     assert followed.usage is not None
     assert followed.usage.output_tokens == 7
+
+
+@routes
+def test_a_count_from_before_the_answer_stopped_is_not_its_own_though_no_output_follows(route: Route) -> None:
+    # A last token that only ends the answer, as a stop sequence does, comes in no event of output:
+    # the count that opened the stream is not the count of the answer.
+    role = {"index": 0, "delta": {"role": "assistant"}}
+    early, stop = {
+        MESSAGES: (opening(MESSAGES), usage_event(MESSAGES, None)),
+        RESPONSES: (last_event(RESPONSES, 0, "response.in_progress"), b""),
+        CHAT: (event({"choices": [role], "usage": {"completion_tokens": 0}}), chat_stop(0)),
+    }[route]
+
+    attempt = replay(route, (100, early + stop), (200, last_event(route, None)))
+
+    assert attempt.outcome is RequestOutcome.COMPLETED
+    assert attempt.usage is not None
+    assert attempt.usage.output_tokens is not None
+    assert not attempt.output_counted
+
+
+def test_a_chat_count_is_the_answers_own_once_every_choice_asked_for_has_stopped() -> None:
+    def read(choices: int, *stops: bytes) -> Attempt:
+        reader = Attempts().send(CHAT, 0, choices=choices)
+        reader.answered(200)
+        reader.feed(b"".join(stops) + last_event(CHAT, None), 100)
+        return reader.end(110)
+
+    one, first_of_two, both = read(1, chat_stop(0, 3)), read(2, chat_stop(0, 3)), read(2, chat_stop(0, 3), chat_stop(1, 6))
+
+    assert (one.output_counted, first_of_two.output_counted, both.output_counted) == (True, False, True)
+
+
+@routes
+def test_a_count_of_part_of_the_answer_gives_no_speed(route: Route) -> None:
+    early = usage_event(route, 7) or last_event(route, 7, "response.in_progress")
+    body = [(100, opening(route) + text(route)), (200, early), (1000, text(route))]
+
+    attempt = replay(route, *body, (1100, ending(route, None)))
+
+    assert (attempt.outcome, attempt.output_counted) == (RequestOutcome.COMPLETED, False)
+    assert attempt.usage is not None
+    assert attempt.usage.output_tokens == 7
+    assert (attempt.output_tokens_per_second, attempt.eligible) == (None, False)
 
 
 def test_a_count_that_was_not_reported_is_missing_on_its_own() -> None:
