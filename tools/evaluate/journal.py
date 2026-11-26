@@ -17,9 +17,15 @@ of `evaluate.contracts`.
 
 **One owner.** `Journal.create` and `Journal.open` take an exclusive lock on the run for the life
 of the handle. A second handle on the same run, from this process or another, is refused with
-`Refusal.RUN_ALREADY_OWNED`. So is the handle itself in a process forked from its owner: a child
-inherits the lock's descriptor, and the run is still its parent's. The lock is the operating
-system's, so it ends with the process that held it: a driver that died leaves nothing to clear.
+`Refusal.RUN_ALREADY_OWNED`. The lock is the operating system's, so it ends with the process that
+held it: a driver that died leaves nothing to clear.
+
+A process forked from the owner does not own the run. A fork copies the lock's descriptor, and a
+copy left open would keep the lock after the owner exits, for as long as the child lives. So the
+child closes its copies at the fork (`os.register_at_fork`), which leaves the lock with the
+parent alone: once the owner is gone a restarted driver can open the run, whatever the owner
+forked is still doing. The handle the child inherited is refused every change, as a second owner
+is. A process started with `exec` holds nothing either: the descriptor is not inheritable.
 
 **Transitions.** The state changes one transition at a time. Each is written whole: to a file
 beside the journal, flushed to disk, then renamed over it, and the directory flushed. A reader
@@ -323,15 +329,35 @@ def _seal(lines: bytes) -> tuple[int, str]:
     return lines.count(b"\n"), "sha256:" + hashlib.sha256(lines).hexdigest()
 
 
+# The descriptors of the locks this process holds.
+_held: set[int] = set()
+
+
 def _lock(directory: Path) -> int:
-    """The run's lock, held by the returned descriptor until it is closed."""
+    """The run's lock, held by the returned descriptor until it is released."""
     fd = os.open(directory / _LOCK, os.O_RDWR | os.O_CREAT, _PRIVATE_FILE)
+    _held.add(fd)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        os.close(fd)
+        _release(fd)
         raise JournalError(Refusal.RUN_ALREADY_OWNED) from None
     return fd
+
+
+def _release(fd: int) -> None:
+    _held.discard(fd)
+    os.close(fd)
+
+
+def _leave_the_locks_to_the_parent() -> None:
+    """In a process just forked: closes its copies of the locks' descriptors. The locks stay with
+    the parent, which still has its own, and end with it instead of with the last of its children."""
+    while _held:
+        os.close(_held.pop())
+
+
+os.register_at_fork(after_in_child=_leave_the_locks_to_the_parent)
 
 
 # --- The state, written and read -------------------------------------------------------------
@@ -413,7 +439,7 @@ class Journal:
     def __init__(self, directory: Path, lock: int, state: _State) -> None:
         self.directory = directory
         self._lock: int | None = lock
-        # The process that took the lock. A forked one inherits the descriptor, not the run.
+        # The process that took the lock. A forked one inherits the handle, not the run.
         self._owner = os.getpid()
         self._state = state
 
@@ -460,7 +486,8 @@ class Journal:
     def close(self) -> None:
         """Gives the run up. It writes nothing: what is saved is what each transition saved."""
         if self._lock is not None:
-            os.close(self._lock)
+            if os.getpid() == self._owner:  # a forked process closed its copy at the fork
+                _release(self._lock)
             self._lock = None
 
     def __enter__(self) -> Self:

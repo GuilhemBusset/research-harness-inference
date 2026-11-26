@@ -166,6 +166,22 @@ journal.intend(Action.DELIVER, {"body": "Run finished."})
 sys.exit(0 if refusals == 3 else 1)
 """
 
+# A driver that saves a booking intent, forks a process that outlives it, and exits. The child
+# never touches the journal: it waits for the end of its input, says so, and leaves.
+OUTLIVED_DRIVER = """
+import os, sys
+from pathlib import Path
+from evaluate.journal import Action, Journal
+
+journal = Journal.create(Path(sys.argv[1]))
+journal.adopt_issue(12)
+journal.intend(Action.BOOK, {"minutes": 45})
+if os.fork() == 0:
+    os.read(0, 1)
+    os.write(1, b"left")
+os._exit(0)
+"""
+
 
 class Died(Exception):
     """Stands for the driver's death inside a write."""
@@ -414,6 +430,24 @@ def test_a_forked_process_does_not_own_the_run_of_its_parent(tmp_path: Path) -> 
     with Journal.open(tmp_path, run_id) as journal:
         assert [intent.action for intent in journal.intents] == [Action.DELIVER]
         assert (journal.attempts[0].status, journal.attempts[0].observed) == (AttemptStatus.COMPLETE, 0)
+
+
+def test_a_run_is_recovered_while_a_process_its_owner_forked_is_still_alive(tmp_path: Path) -> None:
+    environment = {**os.environ, "PYTHONPATH": str(REPOSITORY / "tools")}
+    command = [sys.executable, "-c", OUTLIVED_DRIVER, str(tmp_path)]
+    with subprocess.Popen(command, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE) as driver:
+        assert driver.stdin is not None
+        assert driver.stdout is not None
+        assert driver.wait() == 0  # the owner is gone, and the lock with it
+
+        (run_id,) = journals.runs(tmp_path)
+        with Journal.open(tmp_path, run_id) as recovered:
+            pending = recovered.pending()
+            assert (pending.step, pending.intent and pending.intent.action) == (Step.RECONCILE_BOOKING, Action.BOOK)
+
+        # The child was there all along: it leaves only now, at the end of its input.
+        driver.stdin.close()
+        assert driver.stdout.read() == b"left"
 
 
 def test_a_run_is_kept_private_under_the_ignored_output_directory(tmp_path: Path) -> None:
