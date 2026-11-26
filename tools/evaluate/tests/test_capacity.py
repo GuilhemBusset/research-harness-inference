@@ -300,6 +300,16 @@ def test_midstream_and_connection_failures_are_failed_attempts_and_no_sample():
     assert cell.engine.delivered_usage_missing == 1
 
 
+def test_an_opening_usage_with_no_output_is_not_delivered():
+    planned = floor_cell()
+    at = planned.identity.cell
+    # The stream reported one output token in its opening event, then was cut before any output.
+    cut = request(at, 99, outcome=RequestOutcome.TRUNCATED_STREAM, output=False, tokens=1)
+    cell = read_one(evidence(planned, [*requests(at, 99), cut]))
+    assert cell.failures.failed == 1
+    assert cell.engine is not None and cell.engine.delivered_output_tokens == 99 * 21
+
+
 def test_a_slow_first_output_counts_whatever_the_request_came_to():
     planned = floor_cell()
     at = planned.identity.cell
@@ -410,6 +420,21 @@ def test_driver_lag_beyond_the_tolerance_invalidates_the_cell(lag_ms, verdict):
     assert cell.driver_lag_p95_ms == lag_ms and cell.verdict is verdict
 
 
+def test_warm_up_traffic_does_not_dilute_the_driver_lag():
+    planned = floor_cell()
+    at = planned.identity.cell
+    steady = requests(at, 94) + requests(at, 6, offset=94, lag_ms=1000)
+    warm = requests(at, 30, offset=100, traffic=Traffic.WARM_UP)
+    cell = read_one(evidence(planned, steady + warm))
+    assert cell.driver_lag_p95_ms == 1000
+    assert cell.verdict is Verdict.INVALID and cell.reasons == (Reason.DRIVER_LAG,)
+    # A lagging warm-up is held to the tolerance as well.
+    lagging = read_one(
+        evidence(planned, requests(at, 100) + requests(at, 30, offset=100, lag_ms=1000, traffic=Traffic.WARM_UP))
+    )
+    assert lagging.verdict is Verdict.INVALID and lagging.reasons == (Reason.DRIVER_LAG,)
+
+
 def test_a_saturated_driver_and_a_skipped_opening_invalidate_the_cell():
     planned = floor_cell()
     saturated = read_one(evidence(planned, invalid_flags=(InvalidFlag.DRIVER_SATURATION,)))
@@ -440,6 +465,21 @@ def test_exactly_one_short_of_the_minimum_is_insufficient(budget, needed):
     streams, floors = verdict(requests(at, needed - 1) + [request(at, needed, tokens=1)])
     assert streams is Verdict.INSUFFICIENT_EVIDENCE and floors[Floor.TTFT_P95] is Check.MET
     assert floors[Floor.SPEED_P50] is floors[Floor.SPEED_P10] is Check.INSUFFICIENT
+
+
+def test_a_conversation_opened_in_the_drain_is_accounted_for_and_gives_no_sample():
+    planned = floor_cell()
+    at = planned.identity.cell
+    # 100 later turns and 99 streams when admissions close; a conversation then opens 10 s into the
+    # drain (request 9,090 is eligible at 1,010 s) and streams its first turn.
+    rows = [*requests(at, 99), request(at, 99, tokens=1)]
+    for outcome, failed in ((RequestOutcome.COMPLETED, 0), (RequestOutcome.ERROR_EVENT, 1)):
+        late = request(at, 9090, turn=0, outcome=outcome)
+        assert late.eligible_ms == ADMITTED + 10_000
+        cell = read_one(evidence(planned, [*rows, late]))
+        assert (cell.failures.attempts, cell.failures.failed, cell.opened_in_drain_requests) == (101, failed, 1)
+        assert (cell.speeds.count, cell.first_turns.count) == (99, 0)
+        assert cell.verdict is not Verdict.PASS
 
 
 # --- Repetitions -------------------------------------------------------------------------------------
@@ -523,6 +563,19 @@ def test_a_multihost_example_with_different_service_times_is_recomputed_through_
     assert engine.host_cost_estimate_per_million_output_usd == pytest.approx(
         1.5 * seconds / 3600 * PRICE / ((45_000 + 40_800) / 1e6)
     )
+
+
+def test_the_pool_queue_is_unknown_without_overlapping_host_observations():
+    planned = floor_cell()
+    waiting = HostMetric.WAITING_REQUESTS
+    # Host 1 is observed early and then scrapes give nothing; host 2 only late.
+    given = {
+        (1, waiting): lambda at: 8.0 if at < 400_000 else None,
+        (2, waiting): lambda at: 9.0 if at > 800_000 else None,
+    }
+    engine = read_one(evidence(planned, given=given)).engine
+    assert engine is not None and (engine.waiting_requests_mean, engine.waiting_requests_peak) == (None, None)
+    assert [host.gauges[waiting].peak for host in engine.hosts] == [8.0, 9.0]
 
 
 def test_cost_is_undefined_when_nothing_was_generated():

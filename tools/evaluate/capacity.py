@@ -27,7 +27,8 @@ repetitions is reported beside them.
 
 - `invalid`: the evidence cannot qualify (`Reason`): the record is incomplete, flagged, skipped an
   opening or left a start with no outcome; the driver lagged beyond the tolerance at p95,
-  measured from each request's eligible time to its send; the scheduler's tally is missing, has a
+  measured from each request's eligible time to its send, over the steady sends (warm-up traffic
+  cannot dilute it) and over every send; the scheduler's tally is missing, has a
   send with no outcome, or does not reconcile with the request rows (their number, their distinct
   request ordinals, their outcomes, and the streams it found eligible: a request row does not say
   whether its output count closed the answer, the tally does); a request sent in the window ended
@@ -55,7 +56,8 @@ a 200) or before (a transport error, an HTTP refusal), over every attempt sent: 
 its Wilson 95% interval (a descriptive interval over requests) and the count by cause. With no
 failure the share is an observed floor. Requests that reported no usage are counted apart. In a
 steady cell, a request tagged as warm-up traffic is accounted for and left out of every reading:
-it is not steady state.
+it is not steady state. The drain lets admitted work finish: a conversation that opens after
+admissions closed is in the attempts and the failures, and gives no time to first output or speed.
 
 **Hosts.** A host of a cell is an ordinal its samples carry: telemetry keeps one for each host
 across the run, so a cell's hosts need not start at 0. A counter is read over the window, from its
@@ -65,11 +67,13 @@ further apart than that and no null between them. A gap leaves the counter missi
 Each rise is added, and a drop is a restart from zero whose new value is added in full, as S5's
 `counted_of` reads it. Engine throughput is each host's output-token increase over the elapsed
 seconds of the window through drain, the same window for every host, and the pool's is their sum;
-delivered tokens are the output every request reported to the client, a failed one included. The
+delivered tokens are the output every request that had a first output reported, a failed one
+included: a count with no output behind it (an opening usage before a cut) reached no one. The
 cached share is the cached input over all input the engines counted, reported and not held to a
 floor. Queue depth and GPU utilization are the mean and peak of each host's samples inside the
-window; the pool's queue is read from its totals at each scrape, each host at its latest sample,
-so that its peak is of requests waiting at once.
+window; the pool's queue is read from its totals at each scrape, each host at its latest sample
+within the allowance, so that its peak is of requests waiting at once. A null scrape is kept: with
+no scrape where every host's latest sample has a value, the pool's queue is unknown.
 
 **Host cost** is an estimate: the seconds each host was in service at the price the caller gives
 for a host-hour, per million output tokens the engines generated. With no host time or no
@@ -275,6 +279,9 @@ class CellReading:
     """The floors what was observed falls outside of, whether or not it has its samples."""
     warm_up_requests: int
     """Requests tagged as warm-up traffic in a steady cell: accounted for, and in no reading."""
+    opened_in_drain_requests: int
+    """Requests of conversations that opened after admissions closed: failed attempts if they
+    failed, and no sample of time to first output or speed."""
     ttft_samples_min: int
     stream_samples_min: int
     driver_lag_p95_ms: float | None
@@ -438,20 +445,28 @@ def _gauge(samples: Sequence[HostSample], record: CellRecord) -> Level:
     return Level(fmean(inside) if inside else None, max(inside, default=None))
 
 
-def _pool_level(by_host: Sequence[Sequence[HostSample]], record: CellRecord) -> Level:
-    """A gauge of the pool: at each scrape of the window, the sum of each host's latest sample,
-    once every host has one."""
+def _pool_level(by_host: Sequence[Sequence[HostSample]], record: CellRecord, allowance: int) -> Level:
+    """A gauge of the pool: at each scrape of the window, the sum of each host's latest sample, when
+    every host has one within the allowance and none of them is a null scrape. With no such scrape
+    the pool's level is unknown; each host's own samples are still read."""
     series = [
         sorted(
-            (sample.at_ms, sample.value)
-            for sample in samples
-            if sample.value is not None and record.started_ms <= sample.at_ms <= record.ended_ms
+            (
+                (sample.at_ms, sample.value)
+                for sample in samples
+                if record.started_ms <= sample.at_ms <= record.ended_ms
+            ),
+            key=lambda pair: pair[0],
         )
         for samples in by_host
     ]
     totals = []
     for at in sorted({at for one in series for at, _ in one}):
-        latest = [one[index - 1][1] for one in series if (index := bisect_right(one, (at, math.inf)))]
+        latest = []
+        for one in series:
+            index = bisect_right([when for when, _ in one], at)
+            if index and at - one[index - 1][0] <= allowance and (value := one[index - 1][1]) is not None:
+                latest.append(value)
         if series and len(latest) == len(series):
             totals.append(sum(latest))
     return Level(fmean(totals) if totals else None, max(totals, default=None))
@@ -501,6 +516,7 @@ def _engine(evidence: CellEvidence, requests: Sequence[RequestRecord], plan: Pla
             for host in hosts
         ],
         record,
+        allowance,
     )
     gpu = [host.gauges[HostMetric.GPU_UTILIZATION].mean for host in hosts]
     counts = [None if one.usage is None else one.usage.output_tokens for one in requests]
@@ -510,7 +526,7 @@ def _engine(evidence: CellEvidence, requests: Sequence[RequestRecord], plan: Pla
         hosts=tuple(hosts),
         output_tokens=output,
         output_tokens_per_s=None if output is None or not seconds else output / seconds,
-        delivered_output_tokens=sum(tokens for tokens in counts if tokens is not None),
+        delivered_output_tokens=sum(tokens for tokens in output_seen if tokens is not None),
         delivered_usage_missing=sum(tokens is None for tokens in output_seen),
         input_tokens=whole,
         cached_input_tokens=cached,
@@ -532,7 +548,11 @@ _FLAG_REASONS = {flag: Reason(flag.value) for flag in InvalidFlag}
 
 
 def _reasons(
-    evidence: CellEvidence, requests: Sequence[RequestRecord], engine: Engine, lag: float | None, tolerance: float
+    evidence: CellEvidence,
+    requests: Sequence[RequestRecord],
+    engine: Engine,
+    lags: Sequence[float | None],
+    tolerance: float,
 ) -> tuple[Reason, ...]:
     record = evidence.record
     found = [_FLAG_REASONS[flag] for flag in record.invalid_flags]
@@ -542,7 +562,7 @@ def _reasons(
         found.append(Reason.SKIPPED_OPENING)
     if record.conversations_outstanding:
         found.append(Reason.OUTSTANDING_START)
-    lags = [value for value in (lag, record.driver_lag_p95_ms) if value is not None]
+    lags = [value for value in (*lags, record.driver_lag_p95_ms) if value is not None]
     if any(value > tolerance for value in lags):
         found.append(Reason.DRIVER_LAG)
     if not _accounted(requests, evidence.tally):
@@ -606,10 +626,28 @@ def _minimums(plan: Plan) -> tuple[int, int]:
     return max(MIN_SAMPLES, sampling.ttft_samples_min), max(MIN_SAMPLES, sampling.stream_samples_min)
 
 
+def _lag(requests: Sequence[RequestRecord]) -> float | None:
+    """The driver's scheduling lag at p95: each send against the time it was eligible."""
+    return _at([float(one.sent_ms - one.eligible_ms) for one in requests], 95)
+
+
+def _admitted(requests: Sequence[RequestRecord], record: CellRecord) -> list[RequestRecord]:
+    """The requests of conversations admitted before admissions closed. The drain lets admitted work
+    finish: a conversation that opened in it (its first turn eligible after admissions ended) is
+    accounted for and gives no sample."""
+    late = {
+        (one.student, one.conversation)
+        for one in requests
+        if one.turn == 0 and one.eligible_ms > record.admissions_ended_ms
+    }
+    return [one for one in requests if (one.student, one.conversation) not in late]
+
+
 def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_per_host_hour: float) -> CellReading:
     ttft_min, stream_min = _minimums(plan)
     requests: list[RequestRecord] = []
     read: list[RequestRecord] = []
+    sampled: list[RequestRecord] = []
     engine = None
     lag = None
     reasons: tuple[Reason, ...] = ()
@@ -622,15 +660,17 @@ def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_p
         ]
         # Warm-up traffic in a steady cell is accounted for, and is not steady state.
         read = [one for one in requests if not (planned.steady_state and one.traffic is Traffic.WARM_UP)]
-        lag = _at([float(one.sent_ms - one.eligible_ms) for one in requests], 95)
+        sampled = _admitted(read, record)
+        # The steady sends are the driver's steady-state lag; every send is held to the tolerance too.
+        lag = _lag(read)
         engine = _engine(evidence, read, plan, usd_per_host_hour)
         tolerance = float(plan.spec.protocol["driver"]["scheduling_lag_p95_ms_max"])
-        reasons = _reasons(evidence, requests, engine, lag, tolerance)
+        reasons = _reasons(evidence, requests, engine, (lag, _lag(requests)), tolerance)
     later, first = (
-        _latency([one for one in read if one.turn > 0]),
-        _latency([one for one in read if one.turn == 0]),
+        _latency([one for one in sampled if one.turn > 0]),
+        _latency([one for one in sampled if one.turn == 0]),
     )
-    speeds, failures = _speeds(read), _failures(read)
+    speeds, failures = _speeds(sampled), _failures(read)
     floors, observed_misses = _floors(plan, later, speeds, failures, engine)
     verdict = Verdict.INSUFFICIENT_EVIDENCE if evidence is None else _verdict(reasons, floors)
     return CellReading(
@@ -643,6 +683,7 @@ def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_p
         floors=floors,
         observed_misses=observed_misses,
         warm_up_requests=len(requests) - len(read),
+        opened_in_drain_requests=len(read) - len(sampled),
         ttft_samples_min=ttft_min,
         stream_samples_min=stream_min,
         driver_lag_p95_ms=lag,
