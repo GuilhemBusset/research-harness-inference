@@ -83,8 +83,11 @@ lost or cut before a count or an output came, is no first answer: the question s
 one comes, in that cell or in a later one. `Evidence` holds what the cells driven with it have
 shown, for each key on a gateway, pool and prefix, and takes it from the records of requests
 alone; a caller passes one to every cell of a run. A cell given none starts with nothing shown,
-so each of its students must show it there. A cell with a student who has not shown it is flagged
-`missing_evidence` and does not count.
+so each of its students must show it there. A class opening is where its students meet its prefix:
+it is the fresh prefix on a warm engine only if each of them shows it in that very cell, so what an
+earlier try of the opening showed, cancelled or not, counts for nothing in the next, and a try
+whose student reads the prefix back does not count. A cell with a student who has not shown it is
+flagged `missing_evidence` and does not count.
 
 **What is recorded** is ordinals, times on the run's clock, counts and labels: no key, no host,
 no text of a request or an answer. `Summary` tells the three kinds of traffic apart (`Segment`),
@@ -180,7 +183,8 @@ class Stop(StrEnum):
 
 class Fresh(StrEnum):
     """Whether served usage showed the cell's prefix uncached for each student of the cell who had
-    not shown it yet. A cell whose students all showed it in earlier cells has nothing to show."""
+    it to show: in a class opening all of them, in another cell those who had not shown it yet. A
+    cell whose students all showed it in earlier cells has nothing to show."""
 
     VERIFIED = "verified"
     UNVERIFIED = "unverified"
@@ -259,7 +263,8 @@ class Summary:
     prefix_hash: str | None
     # Whether the conversations were drawn to the plan's sizes. A cell sent with others does not count.
     sizes_planned: bool
-    # The students nothing had shown fresh when the cell started, and whether usage has shown each since.
+    # The students who had the fresh prefix to show in the cell, and whether usage showed it for each:
+    # every student of a class opening, elsewhere those nothing had shown fresh when the cell started.
     fresh_students: tuple[int, ...]
     fresh_prefix: Fresh
     arrivals: tuple[Arrival, ...]
@@ -675,11 +680,15 @@ class _Drive:
         return attempt
 
     def _shown(self, requests: Sequence[RequestRecord], prefix: str | None) -> tuple[tuple[int, ...], Fresh]:
-        """The students of the cell nothing had shown fresh when it started, and whether usage has
-        shown each of them fresh since. What the cell's requests show is kept in the evidence."""
+        """The students of the cell who had the fresh prefix to show in it, and whether usage has
+        shown it for each of them. Outside a class opening they are those nothing had shown fresh
+        when the cell started, and what the cell's requests show is kept in the evidence. In a
+        class opening they are all its students, and only the cell's own requests show it: an
+        earlier try of the opening shows nothing of how this one started."""
         if prefix is None:
             return (), Fresh.NOT_REQUIRED
-        gateway, evidence, keys = self.gateway, self.evidence, self.keys
+        gateway, keys = self.gateway, self.keys
+        evidence = Evidence() if self.rule.segment is Segment.OPENING else self.evidence
         students = sorted({one.student for one in self.slots})
         owed = tuple(student for student in students if not evidence.fresh(gateway, keys[student], prefix))
         for student in owed:
@@ -771,7 +780,8 @@ async def run_cell(
     and a cell sent with others does not count. `first_request` is the ordinal of the first
     request it sends. `evidence` is what the cells driven before have shown of each student's
     prefix cache, and takes what this one shows: without it nothing was shown before, and every
-    student of the cell must meet the prefix uncached here.
+    student of the cell must meet the prefix uncached here, as every student of a class opening
+    must whatever was shown before.
 
     `ReplayError`, with nothing sent, for fewer distinct keys than the cell has identities, for a
     warm-up or a live cell that nothing would end, and for a suite that replays on another route.

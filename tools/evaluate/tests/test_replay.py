@@ -656,6 +656,33 @@ def test_a_class_opening_never_counts_without_usage_that_shows_each_student_fres
     assert not ran.valid
 
 
+def test_a_class_opening_started_again_has_its_fresh_prefix_to_show_again() -> None:
+    cell = cell_of(SCREEN, Phase.CLASS_OPENING, Shape.HANDS_ON)
+    # It is cancelled before its second student arrives: only the first was answered, and their
+    # first answer read nothing from the cache.
+    shown = replay.Evidence()
+    cancel_at = START + SCREEN.cells[cell].arrivals_ms[1] - 1
+    partial, pool = run(SCREEN, cell, evidence=shown, cancel_at=cancel_at)
+    assert {one.student for one in partial.requests} == {0}
+    assert partial.requests[0].usage is not None
+    assert partial.requests[0].usage.cached_input_tokens == 0
+    assert not partial.valid
+
+    # Started again on that engine with what the first try showed, the first student reads the
+    # prefix back: no student of this try is taken as fresh from the other, and it does not count.
+    again, _pool = run(SCREEN, cell, pool=pool, evidence=shown)
+    opening = min(again.requests, key=lambda one: one.sent_ms)
+    assert opening.usage is not None
+    assert (opening.student, opening.usage.cached_input_tokens) == (0, pool.later)
+    assert (again.summary.fresh_students, again.summary.fresh_prefix) == ((0, 1, 2), Fresh.UNVERIFIED)
+    assert not again.valid
+
+    # With students who have not met the prefix, the same try counts.
+    others = KEYS[SCREEN.canary_identities :]
+    apart, _pool = run(SCREEN, cell, keys=others, pool=Pool(pool.clock, others), evidence=shown)
+    assert (apart.summary.fresh_students, apart.summary.fresh_prefix, apart.valid) == ((0, 1, 2), Fresh.VERIFIED, True)
+
+
 @pytest.mark.parametrize(
     ("phase", "stop"),
     [(Phase.CAPACITY_SWEEP, Stop.CANCELLED), (Phase.CAPACITY_SWEEP, Stop.DEADLINE), (Phase.WARM_UP, Stop.FINISHED)],
