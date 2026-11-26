@@ -24,6 +24,7 @@ from contracts import (
     CellStatus,
     ContractError,
     FailureReason,
+    GpuType,
     Grade,
     GraderOutcome,
     Harness,
@@ -33,6 +34,7 @@ from contracts import (
     HostMetric,
     HostSample,
     Instance,
+    InstanceType,
     InvalidFlag,
     InvalidReason,
     Manifest,
@@ -57,7 +59,16 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
 TOOL = Path(__file__).resolve().parents[1]
-DROP = object()
+
+
+class _Drop:
+    """The mark of a key to leave out. Its name is the same in every process that collects."""
+
+    def __repr__(self) -> str:
+        return "DROP"
+
+
+DROP = _Drop()
 
 
 def digest(letter: str) -> str:
@@ -125,8 +136,8 @@ def workload(**changes: Any) -> Workload:
 def settings(**changes: Any) -> contracts.Settings:
     declared: dict[str, Any] = dict(
         host_count=1,
-        instance_type="g7e.2xlarge",
-        gpu_type="L40S",
+        instance_type=InstanceType.G7E_2XLARGE,
+        gpu_type=GpuType.RTX_PRO_6000,
         gpus_per_host=1,
         model_revision="1" * 40,
         tokenizer_revision="2" * 40,
@@ -417,11 +428,13 @@ def test_other_text_than_one_document_is_refused() -> None:
 
 
 # What must never reach a public record, in the shapes it comes in. Each is a documentation
-# placeholder or made up: an address, a host, a path, an account as text and as a number, the ID
-# of a deployed instance, an IP address, a name, a line of a prompt.
+# placeholder or made up: an address, a host, a host spelled like an instance type, a path, an
+# account as text and as a number, the ID of a deployed instance, an IP address, a name, a line of
+# a prompt.
 PRIVATE = [
     "student@example.com",
     "gateway.example.com",
+    "lab1-alice.large",
     "/srv/eval/run-1/trial-3/output.json",
     "123456789012",
     123456789012,
@@ -502,6 +515,22 @@ def test_missing_usage_is_not_zero_usage() -> None:
     assert read[1].usage.output_tokens == 0
     assert len({contracts.content_hash(record) for record in read}) == 3
     assert json.loads(contracts.dumps(missing))["usage"] is None
+
+    # A stream cut short keeps the input it reported and has no output count: not a count of zero.
+    cut = request(outcome=RequestOutcome.TRUNCATED_STREAM, finish_reason=None)
+    partial = contracts.loads(edited(cut, "usage.output_tokens", None), RequestRecord)
+    silent = contracts.loads(edited(cut, "usage.output_tokens", 0), RequestRecord)
+    assert partial.usage == Usage(input_tokens=20_000, cached_input_tokens=18_000, output_tokens=None)
+    assert silent.usage is not None
+    assert silent.usage.output_tokens == 0
+    assert contracts.loads(contracts.dumps(partial), RequestRecord) == partial != silent
+    assert contracts.content_hash(partial) != contracts.content_hash(silent)
+    assert not partial.usage_missing
+    # No count at all has one written form, the null usage.
+    with pytest.raises(ContractError, match="null usage"):
+        Usage(input_tokens=None, cached_input_tokens=None, output_tokens=None)
+    with pytest.raises(ContractError, match="cached"):
+        Usage(input_tokens=10, cached_input_tokens=11, output_tokens=None)
 
     # Missing is written: a record that says nothing about usage is not one that had none.
     for path in ("usage", "usage.cached_input_tokens", "first_output_ms", "trial"):
@@ -595,6 +624,15 @@ def test_what_was_observed_is_kept_apart_from_what_was_requested() -> None:
     )
     assert contracts.content_hash(blind) != contracts.content_hash(known)
 
+    # The hardware is a public name of a fixed list, and a host has the GPUs of its type.
+    assert (read.observed.instance_type, read.observed.gpu_type) == (InstanceType.G7E_2XLARGE, GpuType.RTX_PRO_6000)
+    assert json.loads(contracts.dumps(known))["observed"]["gpu_type"] == "RTX PRO 6000"
+    upgrade = settings(instance_type=InstanceType.G7E_24XLARGE, gpus_per_host=4, tensor_parallelism=4)
+    assert contracts.loads(contracts.dumps(manifest(requested=upgrade)), Manifest).requested == upgrade
+    for path, wrong in (("instance_type", "g7e.3xlarge"), ("gpu_type", "H200"), ("gpus_per_host", 4)):
+        with pytest.raises(ContractError):
+            contracts.parse(edited(known, f"observed.{path}", wrong))
+
     for path in ("observed.vllm_version", "requested.step_budget_tokens", "observed", "workload.limits.drain_ms"):
         with pytest.raises(ContractError, match="null"):
             contracts.parse(edited(known, path, DROP))
@@ -622,13 +660,22 @@ def test_a_plan_names_each_required_cell_and_trial_once() -> None:
         dict(cells=(*cells, replace(cells[0], cell=3))),  # the same cell twice
         dict(trials=(trials[1], trials[0])),
         dict(trials=(*trials, replace(trials[0], trial=2))),  # the same attempt twice
-        dict(trials=(replace(trials[0], cell=0),)),  # a trial in the capacity sweep
-        dict(trials=(replace(trials[0], harness=Harness.PI),)),  # a harness the plan does not pin
+        dict(trials=(*trials, replace(trials[0], trial=2, cell=0, attempt=1))),  # a trial in the capacity sweep
+        dict(trials=(replace(trials[0], harness=Harness.PI), trials[1])),  # a harness the plan does not pin
         dict(harnesses=planned.harnesses[::-1]),
     ]
     for fields in refused:
         with pytest.raises(ContractError):
             workload(**fields)
+
+    # A live cell is in the plan for its trials: with none to run it is refused, built or read.
+    for left in (trials[:1], trials[1:], ()):
+        with pytest.raises(ContractError, match="live cell"):
+            workload(trials=tuple(replace(one, trial=at) for at, one in enumerate(left)))
+    with pytest.raises(ContractError, match="live cell"):
+        contracts.parse(edited(manifest(), "workload.trials", [planned.trials[0].to_json()]))
+    # A capacity or warm-up cell has none, and a plan of such cells only is a plan.
+    assert workload(cells=(replace(cells[0], phase=Phase.WARM_UP), replace(cells[0], cell=1)), trials=()).trials == ()
 
 
 # --- The records ------------------------------------------------------------------------------
@@ -690,6 +737,16 @@ def test_records_hold_ordinals_labels_and_digests_only() -> None:
     assert not flagged.valid_for_qualification
     assert cell().valid_for_qualification
     assert not cell(status=CellStatus.INCOMPLETE).valid_for_qualification
+    # So does a cell that skipped an opening, whether it skipped one or all of them.
+    for started in (39, 0):
+        skipped = cell(conversations_started=started, conversations_completed=0, conversations_abandoned=0)
+        read = contracts.loads(contracts.dumps(skipped), CellRecord)
+        assert (read.conversations_planned, read.conversations_started, read.conversations_skipped) == (
+            40,
+            started,
+            40 - started,
+        )
+        assert not read.valid_for_qualification
     # A scrape that gave nothing is a sample with no value, not a sample of zero.
     gap = contracts.loads(contracts.dumps(host_sample(value=None)), HostSample)
     assert gap.value is None

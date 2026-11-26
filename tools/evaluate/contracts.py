@@ -9,12 +9,13 @@ is not part of it.
 **What may be written.** The repository is public, so the format has no field that holds free
 text. Every value is one of:
 
-- a label of an enumeration of this module;
+- a label of an enumeration of this module. Hardware is one too: an instance type and a GPU model
+  are labels of `InstanceType` and `GpuType`, by their public names, and nothing spelled like one;
 - a bounded integer: an ordinal local to the run (a student, a host, a trial, a cell), a count, a
   seed, or a time in milliseconds since the start of the run;
 - a bounded, finite number. No number of the format reaches twelve digits;
-- a public digest (`sha256:` and 64 hexadecimal digits), a 40-digit commit, a three-part version,
-  an EC2 instance type or a GPU model, each held to its grammar;
+- a public digest (`sha256:` and 64 hexadecimal digits), a 40-digit commit or a three-part
+  version, each held to its grammar;
 - a task or instance ID, made of a family of `Family` and two-digit numbers (`TaskId`).
 
 A name, an address, a host, a path, an account, a resource ID or a line of model text fits none
@@ -24,7 +25,8 @@ a host sample carries the unit its metric fixes.
 
 **Missing is written.** A value that was not observed is `null` under its key. A key left out is
 refused, like a key the format does not have, so "no usage reported" and "zero tokens" are two
-different records.
+different records. Each count of a usage is missing on its own: a stream cut before its last
+usage event keeps the input it reported and has no output count.
 
 **Documents.** `Manifest`, `Suite`, `GraderOutcome`, `RequestRecord`, `TrialRecord`, `HostSample`
 and `CellRecord` are the documents. Each is written with its `kind` and the `schema_version`, as
@@ -287,15 +289,6 @@ Digest = Annotated[str, _Text(r"sha256:[0-9a-f]{64}", "a digest, `sha256:` and 6
 Commit = Annotated[str, _Text(r"[0-9a-f]{40}", "a commit, 40 hexadecimal digits")]
 # Three parts exactly: an address has four.
 Version = Annotated[str, _Text(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}", "a version, MAJOR.MINOR.PATCH")]
-InstanceType = Annotated[
-    str,
-    _Text(
-        r"[a-z]{1,3}[0-9]{1,2}[a-z]{0,4}(-[a-z0-9]{1,6})?"
-        r"\.(nano|micro|small|medium|large|xlarge|[0-9]{1,2}xlarge|metal)",
-        "an EC2 instance type",
-    ),
-]
-GpuType = Annotated[str, _Text(r"[A-Z]{1,2}[0-9]{1,3}[A-Z]{0,2}", "a GPU model, such as L40S")]
 
 
 class Family(StrEnum):
@@ -375,6 +368,31 @@ class PathCategory(StrEnum):
     IN_REGION = "in_region"
     CROSS_REGION = "cross_region"
     PUBLIC_INTERNET = "public_internet"
+
+
+class InstanceType(StrEnum):
+    """The instance types of the pools the system design declares (its section 4.2), by
+    their public names. A grammar would take a host spelled like a type, so there is none: a pool
+    on another type adds its label here, with its GPUs below."""
+
+    G7E_2XLARGE = "g7e.2xlarge"
+    G7E_24XLARGE = "g7e.24xlarge"
+    P5EN_48XLARGE = "p5en.48xlarge"
+
+
+class GpuType(StrEnum):
+    """The GPU models of those instance types, by their public names."""
+
+    RTX_PRO_6000 = "RTX PRO 6000"
+    H200 = "H200"
+
+
+# The GPUs of each instance type: the model, and how many a host has.
+INSTANCE_GPUS = {
+    InstanceType.G7E_2XLARGE: (GpuType.RTX_PRO_6000, 1),
+    InstanceType.G7E_24XLARGE: (GpuType.RTX_PRO_6000, 4),
+    InstanceType.P5EN_48XLARGE: (GpuType.H200, 8),
+}
 
 
 class Quantization(StrEnum):
@@ -634,7 +652,8 @@ class CellIdentity(Record):
 
 @dataclass(frozen=True, kw_only=True)
 class TrialIdentity(Record):
-    """A trial the plan requires: one attempt of an instance on a harness, in a live cell."""
+    """A trial the plan requires: one attempt of an instance on a harness, in a live cell. Every
+    live cell of a plan has one at least; a capacity or warm-up cell has none."""
 
     trial: Ordinal
     cell: Ordinal
@@ -674,6 +693,9 @@ class Workload(Record):
             live = trial.cell < len(self.cells) and self.cells[trial.cell].phase in LIVE_PHASES
             _fail(not live, self, "a trial runs in a live cell of the plan")
             _fail(trial.harness not in pinned, self, "a trial's harness is pinned")
+        tried = {trial.cell for trial in self.trials}
+        idle = any(cell.phase in LIVE_PHASES and cell.cell not in tried for cell in self.cells)
+        _fail(idle, self, "a live cell has a trial to run")
         attempts = {dataclasses.replace(trial, trial=0) for trial in self.trials}
         _fail(len(attempts) != len(self.trials), self, "a trial is planned once")
 
@@ -701,6 +723,12 @@ class Settings(Record):
     speculative_decoding: SpeculativeDecoding | None
     renderer_digest: Digest | None
     gateway_profile_digest: Digest | None
+
+    def check(self) -> None:
+        if self.instance_type is not None:
+            gpu_type, gpus = INSTANCE_GPUS[self.instance_type]
+            _fail(self.gpu_type not in (None, gpu_type), self, "the GPU is the one of the instance type")
+            _fail(self.gpus_per_host not in (None, gpus), self, "a host has the GPUs of its instance type")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -760,15 +788,18 @@ def _ascending(*times: int | None) -> bool:
 
 @dataclass(frozen=True, kw_only=True)
 class Usage(Record):
-    """The tokens a response reported. Zero is a report; no report is `usage: null`."""
+    """The tokens a response reported. Zero is a report. A count that was not reported is `null`
+    on its own, whatever the others are; no count at all is no usage, and is `usage: null`."""
 
-    input_tokens: Count
+    input_tokens: Count | None
     cached_input_tokens: Count | None
-    output_tokens: Count
+    output_tokens: Count | None
 
     def check(self) -> None:
-        cached = self.cached_input_tokens
-        _fail(cached is not None and cached > self.input_tokens, self, "cached input is part of the input")
+        counts = (self.input_tokens, self.cached_input_tokens, self.output_tokens)
+        _fail(all(count is None for count in counts), self, "with no count at all is written as a null usage")
+        whole, cached = self.input_tokens, self.cached_input_tokens
+        _fail(whole is not None and cached is not None and cached > whole, self, "cached input is part of the input")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -812,6 +843,8 @@ class RequestRecord(Document):
 
     @property
     def usage_missing(self) -> bool:
+        """Whether the response reported no count at all. One count can still be missing: it is
+        `None` in `usage`."""
         return self.usage is None
 
 
@@ -886,7 +919,8 @@ class HostSample(Document):
 @dataclass(frozen=True, kw_only=True)
 class CellRecord(Document):
     """What a cell of the plan came to: its window, its conversations and its flags. A flagged
-    cell is invalid for qualification and keeps every observation."""
+    cell is invalid for qualification and keeps every observation. So does a cell that skipped an
+    opening: a planned conversation it did not start."""
 
     KIND = "cell"
     cell: Ordinal
@@ -910,8 +944,15 @@ class CellRecord(Document):
         _fail(not counted, self, "conversations end once started, and start once planned")
 
     @property
+    def conversations_skipped(self) -> int:
+        return self.conversations_planned - self.conversations_started
+
+    @property
     def valid_for_qualification(self) -> bool:
-        return self.status is CellStatus.COMPLETE and not self.invalid_flags
+        """Whether the record lets the cell count: complete, every planned conversation started
+        and no flag. The driver's lag is kept as measured: the record does not hold the tolerance,
+        and whoever writes it flags a lag over the tolerance as `driver_saturation`."""
+        return self.status is CellStatus.COMPLETE and not self.invalid_flags and not self.conversations_skipped
 
 
 # --- Writing and reading ---------------------------------------------------------------------
