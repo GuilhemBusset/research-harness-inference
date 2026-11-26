@@ -25,18 +25,28 @@ waits, and the two that only the completion's answer is missing (`rhi_lifecycle.
 are under `/run`, which is empty at every start of the instance, beside the settings the boot
 program writes there.
 
+The host's docker also says what the engine runs with. The engine's unit gives its container
+the release's flags after the image's own command, and labels the container with their number
+(`FLAGS_LABEL`; `services/engine/units/rhi-engine.service`). `Host.engine_arguments` asks docker
+for the container that runs now, and takes that many arguments from the end of its record: the
+flags of the engine in service, and not those of a release that is only wanted, or of a start
+that docker refused. They can hold values of the deployment, such as the model bucket's name:
+the agent keeps them in memory, makes a public fingerprint of them (`rhi_lifecycle.launch`) and
+writes them nowhere.
+
 A command that fails raises `HostError`, which names the action and the exit status and repeats
 nothing the command or AWS printed. So does a command that is still running when the time its
 caller gave it has passed: it is stopped, because the run of a canary has a deadline
-(`rhi_lifecycle.canary`). Two answers are read, compared and never repeated: the state systemd
-gives the engine's unit, a word of systemd's own vocabulary, and the names of the files beside the
-records.
+(`rhi_lifecycle.canary`). Three answers are read and never repeated: the state systemd gives the
+engine's unit, a word of systemd's own vocabulary, the names of the files beside the records, and
+docker's record of the engine's container.
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
 import subprocess
 import time
@@ -46,6 +56,14 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 ENGINE_UNIT = "rhi-engine"
+
+# The engine's container, as its unit names it, and the label the unit gives it: the number of
+# the release's flags, which are the last arguments of the container.
+ENGINE_CONTAINER = "rhi-engine"
+FLAGS_LABEL = "rhi-engine-flags"
+# What docker is asked of the container: whether it runs, its labels and its arguments, as one
+# JSON list.
+_LAUNCH_FORMAT = "[{{json .State.Running}},{{json .Config.Labels}},{{json .Args}}]"
 
 # The host's console device: the kernel writes it to the serial console of an instance.
 CONSOLE = "/dev/console"
@@ -129,6 +147,28 @@ class Host:
         if not state:
             raise HostError("state", returncode)
         return state != "inactive"
+
+    def engine_arguments(self) -> tuple[str, ...] | None:
+        """The release's flags the engine's container was started with, in order, when the
+        container runs now. None when docker's record does not give them: no such container, one
+        that does not run, or one a unit without `FLAGS_LABEL` started. A host that could not be
+        asked raises `HostError`."""
+        command = ("docker", "container", "inspect", "--format", _LAUNCH_FORMAT, ENGINE_CONTAINER)
+        returncode, answer = self._read("inspect", command)
+        if returncode != 0:
+            return None
+        try:
+            running, labels, arguments = json.loads(answer)
+            count = labels[FLAGS_LABEL]
+        except (ValueError, TypeError, LookupError):
+            return None
+        if running is not True or not isinstance(count, str) or not count.isascii() or not count.isdigit():
+            return None
+        if not isinstance(arguments, list) or not all(isinstance(argument, str) for argument in arguments):
+            return None
+        if int(count) > len(arguments):
+            return None
+        return tuple(arguments[len(arguments) - int(count) :])
 
     def begin_launch(self) -> None:
         """Put on record that a launch is under way on the host."""

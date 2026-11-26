@@ -18,9 +18,21 @@ import httpx
 import pytest
 from botocore.exceptions import ClientError
 
+from rhi_common import launch_settings
 from rhi_lifecycle import release
 from rhi_lifecycle.host import Host, HostError
-from rhi_lifecycle.launch import ENGINE_URL, METADATA_URL, NO_ACTION, Engine, Launch, Metadata, Outcome, fetch
+from rhi_lifecycle.launch import (
+    ENGINE_URL,
+    METADATA_URL,
+    NO_ACTION,
+    Engine,
+    Launch,
+    Metadata,
+    Outcome,
+    fetch,
+    identity,
+    settings_fingerprint,
+)
 from rhi_mock_engine.app import Settings, create_app
 
 if TYPE_CHECKING:
@@ -50,6 +62,11 @@ VALUE: dict[str, Any] = {
         "secret_id": "rhi/coursework/engine",
     },
 }
+
+# The arguments of a vllm pool's engine that the tests of the fingerprint vary: the model, in a
+# bucket named after the placeholder account, and the step budget.
+MODEL = f"s3://rhi-models-123456789012-us-east-1/coursework/{'c' * 40}/"
+STEP_BUDGET = "--max-num-batched-tokens"
 
 IN_SERVICE = "InService"
 # A hook with no timeout of its own waits this long (evidence E10), four times what the launch
@@ -86,6 +103,12 @@ class World(Host):
         self.pull_fails = False
         self.pull_limits: list[float | None] = []
         self.start_fails = False
+        # The engine's flags, as the boot program wrote them for the unit, and what docker holds of
+        # the engine's container: the flags it was started with, None while none runs. `asked`
+        # says whether docker can be asked.
+        self.flags: tuple[str, ...] = tuple(VALUE["engine_flags"])
+        self.launched: tuple[str, ...] | None = None
+        self.asked = True
         # The record of a launch under way: whether the host keeps one, and one that its steps
         # passed, whether each can be written, and what the two were at each of the steps named.
         self.on_record = False
@@ -144,6 +167,13 @@ class World(Host):
         if self.start_fails:
             raise HostError("start", 1)
         self.started_at = self.now
+        # The unit gives the container the flags that are on the host at this start.
+        self.launched = self.flags
+
+    def engine_arguments(self) -> tuple[str, ...] | None:
+        if not self.asked:
+            raise HostError("inspect")
+        return self.launched
 
     def begin_launch(self) -> None:
         if self.record_fails:
@@ -343,6 +373,82 @@ def test_failures_abandon(on_disk: bool, failure: Callable[[World], None], steps
     # The steps up to the one that failed, then one completion.
     assert world.calls == [*steps, "complete"]
     assert world.completions == [completion("ABANDON")]
+
+
+def releasing(world: World, *flags: str) -> World:
+    """`world`, whose pool's release now carries `flags`: in the parameter, in the record on disk
+    and among the flags the boot program wrote, which the next start of the engine takes."""
+    assert world.parameter is not None
+    world.parameter["engine_flags"] = list(flags)
+    world.held.write_text(json.dumps({**VALUE, "engine_flags": list(flags)}))
+    world.flags = flags
+    return world
+
+
+def test_two_launches_of_one_image_and_model_with_different_step_budgets_have_different_fingerprints(
+    tmp_path: Path,
+) -> None:
+    found = []
+    for budget in ("4096", "8192"):
+        (tmp_path / budget).mkdir()
+        world = releasing(World(tmp_path / budget, on_disk=True), MODEL, "--max-model-len", "65536", STEP_BUDGET, budget)
+        assert world.launch().run() is Outcome.CONTINUED
+        current = release.read_current(world, NAME)
+        assert current is not None
+        found.append((identity(current.release), settings_fingerprint(world)))
+
+    (first, small), (second, large) = found
+    # The image digest and the model revision tell the two launches apart no more than before.
+    assert first == second
+    assert launch_settings.UNAVAILABLE not in (small, large)
+    assert small != large
+
+
+def test_the_fingerprint_is_the_running_engines_whatever_the_release_says_since(tmp_path: Path) -> None:
+    world = releasing(World(tmp_path, on_disk=True), MODEL, STEP_BUDGET, "4096")
+    # No engine runs yet: what the release wants is no evidence.
+    assert settings_fingerprint(world) == launch_settings.UNAVAILABLE
+    assert world.launch().run() is Outcome.CONTINUED
+    launched = settings_fingerprint(world)
+    assert launched == launch_settings.fingerprint([MODEL, STEP_BUDGET, "4096"])
+
+    # The pool's release gets another step budget: the parameter, the record on disk and the
+    # flags for the next start all say so. The engine that runs was started with none of them.
+    releasing(world, MODEL, STEP_BUDGET, "8192")
+    assert settings_fingerprint(world) == launched
+    # Only another start gives an engine the new budget.
+    world.start_engine()
+    assert settings_fingerprint(world) == launch_settings.fingerprint([MODEL, STEP_BUDGET, "8192"]) != launched
+
+
+def no_container(world: World) -> None:
+    # As under a unit that does not label its container, or when the engine's start failed.
+    world.launched = None
+
+
+def no_answer(world: World) -> None:
+    world.asked = False
+
+
+def unknown_argument(world: World) -> None:
+    world.launched = (MODEL, "--chat-template", "/srv/template.jinja")
+
+
+@pytest.mark.parametrize("missing", [no_container, no_answer, unknown_argument])
+def test_launch_evidence_the_host_does_not_give_is_unavailable(
+    missing: Callable[[World], None], tmp_path: Path
+) -> None:
+    world = releasing(World(tmp_path, on_disk=True), MODEL, STEP_BUDGET, "4096")
+    assert world.launch().run() is Outcome.CONTINUED
+    missing(world)
+    assert settings_fingerprint(world) == launch_settings.UNAVAILABLE
+
+
+def test_an_engine_whose_start_failed_has_no_fingerprint(tmp_path: Path) -> None:
+    world = releasing(World(tmp_path, on_disk=True), MODEL, STEP_BUDGET, "4096")
+    failed_start(world)
+    assert world.launch().run() is Outcome.ABANDONED
+    assert settings_fingerprint(world) == launch_settings.UNAVAILABLE
 
 
 def test_a_launch_is_on_record_until_auto_scaling_has_taken_its_completion(tmp_path: Path) -> None:

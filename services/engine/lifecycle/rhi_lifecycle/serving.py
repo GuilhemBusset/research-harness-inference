@@ -18,6 +18,19 @@ does not know to be idle.
 `model_revision` carry what the heartbeat carries. The pipeline's verification and the deployments
 dashboard read it.
 
+**The launch, as a metric.** Two instances can serve one image and one model revision with
+different engine arguments, so `rhi_lifecycle_launch_info` is 1 and its label
+`settings_fingerprint` is the fingerprint of the settings the engine in service was started with
+(`launch.settings_fingerprint`; `rhi_common.launch_settings` says what it covers and what it
+leaves out). It is read from the host's record of the container that runs, never from the release
+the instance holds or the one its pool wants, at each check of the engine below: when the duties
+start, and every minute. A check that waits for a restarted engine's health route reads nothing,
+and the agent takes the fingerprint back before it restarts the engine: until the engine it
+started answers, no fingerprint is given for it. Where there is none to give the label says
+`unavailable`: an instance whose unit is older than the reading, a container that does not run,
+arguments the contract does not know. That is a gap in the evidence and changes nothing else:
+the heartbeat and `rhi_lifecycle_release_info` are as they were, with the labels they had.
+
 **The cache capacity, as a metric.** The answer of the engine's `/metrics` that each heartbeat
 fetches also goes to `rhi_lifecycle.cache`, which reads the engine's cache capacity in tokens where
 the engine's row says and exports it as a number. The reading starts with the heartbeat, so once
@@ -74,6 +87,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge
 from prometheus_client.parser import text_string_to_metric_families
 
 from rhi_common.engine_metrics import Kind, Name, Quantity, metric_names
+from rhi_common.launch_settings import UNAVAILABLE
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import launch, metrics
 from rhi_lifecycle.cache import Capacity
@@ -99,6 +113,7 @@ STAGE = "serving"
 NO_MODEL = launch.NO_MODEL
 
 RELEASE_METRIC = "rhi_lifecycle_release_info"
+LAUNCH_METRIC = "rhi_lifecycle_launch_info"
 RESTARTS_METRIC = "rhi_lifecycle_engine_restarts"
 
 _LOG = logging.getLogger(__name__)
@@ -200,6 +215,16 @@ class Serving:
             ("image_digest", "model_revision"),
             registry=registry,
         ).labels(image_digest=self._image_digest, model_revision=self._model_revision).set(1)
+        # The fingerprint of the settings the engine in service was started with, as the check
+        # last read it. Only the check's thread writes it.
+        self._launch = Gauge(
+            LAUNCH_METRIC,
+            "The engine in service: the fingerprint of the settings it was started with.",
+            ("settings_fingerprint",),
+            registry=registry,
+        )
+        self._fingerprint = UNAVAILABLE
+        self._launch.labels(settings_fingerprint=UNAVAILABLE).set(1)
         self._restarts = Counter(
             RESTARTS_METRIC,
             "Restarts of the engine after a completion it did not answer while it counted no token.",
@@ -276,12 +301,14 @@ class Serving:
         return progressed_at is not None and self._clock() - progressed_at <= PROBE_INTERVAL_SECONDS
 
     def check(self) -> bool:
-        """Send the engine a completion of one token. When none comes back and the engine has
-        counted no token for a minute, restart its unit. Says whether the engine was restarted."""
+        """Read what the engine in service was started with, and send the engine a completion of
+        one token. When none comes back and the engine has counted no token for a minute, restart
+        its unit. Says whether the engine was restarted."""
         if self._starting:
             if not self._engine.healthy():
                 return False
             self._starting = False
+        self._label(launch.settings_fingerprint(self._host))
         secret = self._secret()
         if secret is None:
             _LOG.warning("the pool's secret cannot be read: the engine is not checked this minute")
@@ -293,6 +320,8 @@ class Serving:
             # Busy, not hung: a restart would kill every request it runs (section 4.3).
             _LOG.warning("the engine did not answer a completion, and it counts tokens: it is not restarted")
             return False
+        # The engine that had the fingerprint is stopped, whatever becomes of the restart.
+        self._label(UNAVAILABLE)
         try:
             self._host.restart_engine()
         except HostError:
@@ -302,6 +331,15 @@ class Serving:
         self._restarts.inc()
         _LOG.warning("the engine did not answer a completion and counts no token: its unit was restarted")
         return True
+
+    def _label(self, fingerprint: str) -> None:
+        """Say `fingerprint` in the launch metric, in place of the one it said."""
+        if fingerprint == self._fingerprint:
+            return
+        # The one before goes first: a scrape between the two reads none, never both.
+        self._launch.clear()
+        self._launch.labels(settings_fingerprint=fingerprint).set(1)
+        self._fingerprint = fingerprint
 
     def _secret(self) -> str | None:
         """The pool's bearer secret, as it is now, or None when it cannot be read."""

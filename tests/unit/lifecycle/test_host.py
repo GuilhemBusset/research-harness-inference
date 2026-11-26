@@ -6,6 +6,7 @@ systemd, a privileged process or AWS."""
 from __future__ import annotations
 
 import base64
+import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -20,6 +21,12 @@ REGISTRY = "123456789012.dkr.ecr.us-east-1.amazonaws.com"
 IMAGE = f"{REGISTRY}/rhi/engine@sha256:{'a' * 64}"
 PASSWORD = "the-password-of-the-token"
 TOKEN = base64.b64encode(f"AWS:{PASSWORD}".encode()).decode()
+
+# Docker's record of an engine's container, as the engine's unit starts one: the first process is
+# a shell, with its script, then the image's command, then the release's flags.
+SHELL = ["-c", "the script of the first process", "rhi-engine", "engine", "serve"]
+FLAGS = [f"s3://rhi-models-123456789012-us-east-1/coursework/{'c' * 40}/", "--max-num-batched-tokens", "4096"]
+LABEL = "rhi-engine-flags"
 
 # Every command runs behind these: nsenter on the host's first process, into its namespaces.
 IN_THE_HOST = ["--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid", "--"]
@@ -228,6 +235,8 @@ def test_a_command_that_cannot_be_run_is_reported(tmp_path: Path) -> None:
         Host(Ecr(), nsenter=str(tmp_path / "missing")).launch_begun()
     with pytest.raises(HostError):
         Host(Ecr(), nsenter=str(tmp_path / "missing")).launch_passed()
+    with pytest.raises(HostError):
+        Host(Ecr(), nsenter=str(tmp_path / "missing")).engine_arguments()
 
 
 def test_a_systemd_that_gives_the_engines_unit_no_state_has_not_said_that_it_is_stopped(nsenter: Nsenter) -> None:
@@ -275,3 +284,43 @@ def test_a_host_that_does_not_list_its_run_folder_has_not_said_that_no_launch_is
         host(nsenter).launch_begun()
 
     assert (raised.value.action, raised.value.returncode) == ("record", 3)
+
+
+def test_the_running_engines_flags_are_the_last_arguments_docker_holds_of_its_container(nsenter: Nsenter) -> None:
+    nsenter.say(json.dumps([True, {LABEL: "3", "another": "label"}, [*SHELL, *FLAGS]]))
+
+    assert host(nsenter).engine_arguments() == tuple(FLAGS)
+    # One question to docker: whether the container runs, its labels and its arguments.
+    asked = "[{{json .State.Running}},{{json .Config.Labels}},{{json .Args}}]"
+    assert nsenter.calls() == [[*IN_THE_HOST, "docker", "container", "inspect", "--format", asked, "rhi-engine"]]
+
+    # A release with no flag, the mock pool's: the container was given none, and that is known.
+    nsenter.say(json.dumps([True, {LABEL: "0"}, SHELL]))
+    assert host(nsenter).engine_arguments() == ()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # A container of a unit that does not label it, as the units of an older release.
+        [True, {}, [*SHELL, *FLAGS]],
+        [True, None, [*SHELL, *FLAGS]],
+        # A container that does not run.
+        [False, {LABEL: "3"}, [*SHELL, *FLAGS]],
+        # A label that is not the number of some of the container's arguments.
+        [True, {LABEL: "9"}, [*SHELL, *FLAGS]],
+        [True, {LABEL: "three"}, [*SHELL, *FLAGS]],
+        [True, {LABEL: 3}, [*SHELL, *FLAGS]],
+        [True, {LABEL: "3"}, None],
+        "no record",
+    ],
+)
+def test_no_flags_are_given_when_dockers_record_does_not_give_them(answer: object, nsenter: Nsenter) -> None:
+    nsenter.say(json.dumps(answer))
+    assert host(nsenter).engine_arguments() is None
+
+
+def test_no_flags_are_given_when_docker_has_no_container_of_the_engine(nsenter: Nsenter) -> None:
+    # docker's own answer for a container it does not have is an exit status that is not zero.
+    nsenter.fail_on("inspect")
+    assert host(nsenter).engine_arguments() is None

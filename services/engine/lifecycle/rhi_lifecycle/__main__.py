@@ -247,6 +247,9 @@ class _Host(Host):
     def engine_started(self) -> bool:
         return self._host.engine_started()
 
+    def engine_arguments(self) -> tuple[str, ...] | None:
+        return self._host.engine_arguments()
+
     def begin_launch(self) -> None:
         self._host.begin_launch()
 

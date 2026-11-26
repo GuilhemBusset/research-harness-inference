@@ -84,6 +84,13 @@ row keeps the stage it was abandoned in. The boot is over when the agent starts,
 it. A row that cannot be written changes nothing else: the launch goes on. The time a write takes
 is its stage's.
 
+**What the engine was started with.** The release parameter says what a pool should run, and it
+can change while an engine runs. What an engine does run with is on the host alone: the arguments
+of its container, as docker holds them (`Host.engine_arguments`). `settings_fingerprint` makes
+the public fingerprint of those (`rhi_common.launch_settings`), and says `UNAVAILABLE` whenever
+the host gives none or gives arguments the contract does not know. It reads no release: neither
+the parameter nor the record on disk can change what it says of a running engine.
+
 Every action on the host goes through `rhi_lifecycle.host`. Nothing here repeats what AWS, docker
 or the engine answered.
 """
@@ -104,6 +111,7 @@ from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
+from rhi_common import launch_settings
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import release, stages
 from rhi_lifecycle.host import Host, HostError
@@ -274,6 +282,17 @@ def identity(served: release.Release) -> tuple[str, str]:
     # The digest is what follows the repository in the image's reference.
     digest = served.engine_image.rpartition("@")[2]
     return digest, NO_MODEL if served.model_revision is None else served.model_revision
+
+
+def settings_fingerprint(host: Host) -> str:
+    """The fingerprint of the settings the engine that runs on `host` was started with, or
+    `launch_settings.UNAVAILABLE`: the host cannot be asked, no engine's container runs there, its
+    unit recorded no flags, or the flags are not ones the contract knows."""
+    try:
+        arguments = host.engine_arguments()
+    except HostError:
+        return launch_settings.UNAVAILABLE
+    return launch_settings.UNAVAILABLE if arguments is None else launch_settings.fingerprint(arguments)
 
 
 @dataclass(frozen=True)

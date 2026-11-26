@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from rhi.pools import vllm_command
+from rhi_common import launch_settings
 from rhi_common.pool_config import parse_pools
 
 if TYPE_CHECKING:
@@ -295,3 +296,27 @@ def test_no_effort_mapping_in_the_engine(changes: dict[str, object]) -> None:
     # The gateway's request profile maps reasoning effort (section 6.2): the engine never does.
     arguments = vllm_command.arguments(pool(changes), bucket=BUCKET)
     assert not [argument for argument in arguments if "reasoning-effort" in argument.replace("_", "-")]
+
+
+# Every serving setting that adds an argument, at once.
+EVERY_SETTING: dict[str, object] = {**SECTION_4_2, "prefix_caching": False, **DRAFT_HEAD, **EXCEPTION}
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{}, EVERY_SETTING, {**EVERY_SETTING, **DOWNLOAD}],
+    ids=["plain", "every-setting", "every-setting-on-download"],
+)
+def test_every_argument_of_a_release_is_one_the_launch_fingerprint_knows(changes: dict[str, object]) -> None:
+    # An argument this module adds and the contract does not know would leave every launch with no
+    # fingerprint (`rhi_common.launch_settings`).
+    arguments = vllm_command.arguments(pool(changes), bucket=BUCKET)
+    known = launch_settings.fingerprint(arguments)
+    assert known != launch_settings.UNAVAILABLE
+    # The bucket's name holds the account and the region: another deployment has the same fingerprint.
+    elsewhere = vllm_command.arguments(pool(changes), bucket="rhi-models-111122223333-us-east-1")
+    assert elsewhere != arguments
+    assert launch_settings.fingerprint(elsewhere) == known
+    # The step budget is a setting of the pool that the fingerprint tells apart.
+    budget = vllm_command.arguments(pool({**changes, "step_budget_tokens": 4096}), bucket=BUCKET)
+    assert launch_settings.fingerprint(budget) not in (known, launch_settings.UNAVAILABLE)

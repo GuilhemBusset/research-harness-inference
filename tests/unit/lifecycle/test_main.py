@@ -251,6 +251,9 @@ class World(Host):
     def engine_started(self) -> bool:
         return self.app is not None
 
+    def engine_arguments(self) -> tuple[str, ...] | None:
+        return None if self.app is None else tuple(VALUE["engine_flags"])
+
     def begin_launch(self) -> None:
         self.launching = True
 

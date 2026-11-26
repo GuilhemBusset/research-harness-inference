@@ -34,6 +34,14 @@
 # leaves the file empty, and the container starts with the image's command alone. Without the
 # file the engine does not start.
 #
+# What the engine was started with. The container carries the label rhi-engine-flags, the number
+# of the flags it was given: they are its last arguments, after the image's command, whose length
+# only the image knows. The lifecycle agent asks docker for the arguments of the container that
+# runs, takes that many from their end, and reports a public fingerprint of the settings among
+# them (rhi_lifecycle.host and rhi_common.launch_settings). So what it reports is what this start
+# gave the engine, and a start that docker refuses leaves nothing to report. The label comes after
+# the options of a drop-in, and docker keeps the last value a label is given: no drop-in sets it.
+#
 # More options. A drop-in gives the container more options of `docker run` in RHI_ENGINE_OPTIONS,
 # with Environment=, and restates nothing of this file (gpu/rhi-engine.service.d/gpu.conf).
 # systemd puts no variable's value into an Environment= line, so the start shell reads the words
@@ -77,6 +85,7 @@ ExecStart=/bin/bash -c ' \
     exec docker run --rm --name rhi-engine --interactive --network host \
         --volume /var/lib/rhi/engine-cache:/var/cache/rhi-engine \
         --env XDG_CACHE_HOME=/var/cache/rhi-engine "$${options[@]}" \
+        --label "rhi-engine-flags=$${#flags[@]}" \
         --entrypoint /bin/sh "$$RHI_ENGINE_IMAGE" -c "$$1" rhi-engine "$${command[@]}" "$${flags[@]}" \
         < <(printf %%s "$$secret")' \
     rhi-engine \
