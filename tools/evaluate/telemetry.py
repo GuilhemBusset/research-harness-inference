@@ -25,9 +25,21 @@ workspace: read no sooner than `readable_from` says.
 **What a series says of a window** is in the samples that bound it: from its last sample at or
 before the start to its first at or after the drain. A scrape that fell on the drain closes the
 window; otherwise the next one does, since it holds what the last answers added. No later sample
-adds anything. Those samples cover the window when the first is within `ALLOWANCE_SECONDS`
-before the start, the last is at or after the drain, and no two that follow each other are
-further apart than `ALLOWANCE_SECONDS`. A sample that is no number is no sample.
+adds anything. One scrape of a target holds every series of a metric, so the scrape that closes
+the window is the target's: the first at or after the drain that any series of the metric on
+that host, or on that task of the gateway, has a sample of. A series that first appears in a
+later scrape, a new identity at the gateway or a new fingerprint of a host, is not the window's;
+one that reported in the window and missed that scrape is closed by its own next one.
+The same holds at the start for what an agent said: a value last said before the scrape that
+opens the window was not said of it. The margin is the scrapes that bound the window, at both
+edges and for everyone: what a bounding scrape is the first to show may have happened inside.
+
+Those samples cover the window when the first is within `ALLOWANCE_SECONDS` before the start,
+the last is at or after the drain, and no two that follow each other are further apart than
+`ALLOWANCE_SECONDS`. A sample that is no number is no sample: every series read here is a
+count, a level or a constant one, so a number is finite, not below zero and within the
+contracts' bound for a count. A series scraped in the window with no number in it is a hole in
+the evidence, never a zero.
 
 **The hosts** are the instances whose lifecycle agent reported a release
 (`rhi_lifecycle_release_info`) for some seconds of the window, in service within a scrape of
@@ -50,43 +62,49 @@ fingerprint matches, because a fingerprint cannot be read back into settings. Th
 themselves are kept: each host's (`Host.launch_fingerprints`), and the pool's beside the
 requested one.
 
-**Each treatment** is one part of the requested settings, and is verified only when the
-telemetry shows that part served the whole window on every host (`Treatment`). For the engine's
-arguments the evidence is the launch fingerprint, `settings_fingerprint` of
-`rhi_lifecycle_launch_info`: every host says one fingerprint, with no hole, through its time in
-service, the same on every host, and it is the one requested. Two hosts of one image and one
-model revision with two fingerprints are a verified release and unverified launch settings. A
-treatment that is not verified has one `Reason`, and its observations are kept. A part the
-request does not declare is unverified too, as `not_declared`: nothing holds the pool to it.
+**Each treatment** is one part of the requested settings, and is verified only when the telemetry
+shows that part served the whole window on every host (`Treatment`). For the engine's arguments the
+evidence is the launch fingerprint, `settings_fingerprint` of `rhi_lifecycle_launch_info`: every
+host says one fingerprint, with no hole, through its time in service, the same on every host, and it
+is the one requested. Two hosts of one image and one model revision with two fingerprints are a
+verified release and unverified launch settings. A fingerprint says what an engine was started with,
+and the engine says what it runs: when a host's engine said, at any time of the window, an effective
+setting other than the one requested, the launch settings are `contradicted`, whatever the
+fingerprints say, and the matching fingerprint stays in the reading as observed. A text the table of
+`EFFECTIVE` does not know says nothing either way. A treatment that is not verified has one
+`Reason`, and its observations are kept. A part the request does not declare is unverified too, as
+`not_declared`: nothing holds the pool to it.
 
 **Each host's metrics**, from the window's start through the drain (`contracts.HostMetric`): the
 increase of the output, input, cached input and computed input token counters and of the
-preemptions; the mean and the peak of the running and waiting requests and of the GPU
-utilization. The computed input is the engine's own count of it, where its row has one
-(`Further.COMPUTED_INPUT_TOKENS`): input less cached input is not it. A counter that restarted
-is counted across the restart, and the restart is recorded. A counter with no sample before the
-start counts the rises its samples show and nothing for its first value, which is no work of the
-window. A series the workspace gave nothing of reads `None`, never zero, with the coverage
-`missing`; one that does not cover the window reads what its samples give, with the coverage
-`incomplete`. A gauge of several series (an engine index each) is read at the scrapes every one
-of them reported, and is incomplete as soon as one of them is. The pool's total of a counter is
-the sum over the hosts that reported it.
+preemptions; the mean and the peak of the running and waiting requests and of the GPU utilization.
+The computed input is the engine's own count of it, where its row has one
+(`Further.COMPUTED_INPUT_TOKENS`): input less cached input is not it. A counter that restarted is
+counted across the restart, and the restart is recorded. A counter with no sample before the start
+counts the rises its samples show and nothing for its first value, which is no work of the window. A
+series the workspace gave nothing of reads `None`, never zero, with the coverage `missing`; one that
+does not cover the window reads what its samples give, with the coverage `incomplete`. A gauge of
+several series (an engine index each) is read at the scrapes every one of them reported, and is
+incomplete as soon as one of them is, or as soon as those joint scrapes do not cover the window:
+series that never reported together give no level at all. The pool's total of a counter is the sum
+over the hosts that reported it.
 
 **The node's own liveness completion** (`rhi_lifecycle.serving`) goes to the engine and not
 through the gateway. Its tokens are engine work like any other and stay in the totals and the
 rates; nothing flags them.
 
 **Other traffic** is read at the gateway, in aggregate: the increase of
-`rhi_gateway_student_requests_total` over every identity of the pool, and over the canary
-cohort's. An identity's series begins with its first request, so one that begins in the window
-counts from zero. What the pool counted beyond the cohort came from someone else, a student or a
-deployment's smoke test, and is `external_traffic`. What the cohort counted must be what the
-driver says reached the gateway: its attempts, retries included, and the side queries of its
-harnesses; a difference is `unreconciled_counters`. Matching counts say nothing of seconds the
-gateway's counters do not cover: each of its tasks must have been scraped through the whole
-window, and each series through the drain once it began, or the window lacks evidence
-(`gateway_coverage_incomplete`). The same margins hold for everyone: a request of someone else
-between the scrapes that bound the window counts as overlapping.
+`rhi_gateway_student_requests_total` over every identity of the pool, and over the canary cohort's.
+An identity's series begins with its first request, so one that begins in the window counts from
+zero. What the pool counted beyond the cohort came from someone else, a student or a deployment's
+smoke test, and is `external_traffic`. What the cohort counted must be what the driver says reached
+the gateway: its attempts, retries included, and the side queries of its harnesses; a difference is
+`unreconciled_counters`. Matching counts say nothing of seconds the gateway's counters do not cover:
+each of its tasks must have been scraped through the whole window, and each series through the drain
+once it began, with samples that are numbers, or the window lacks evidence
+(`gateway_coverage_incomplete`). A task first scraped a scrape or more after the drain was not there
+in the window. The same margins hold for everyone: a request of someone else between the scrapes
+that bound the window counts as overlapping.
 
 **Setup probes** the driver sent well before the window are in the scrape the increase runs
 from, and in no count. One sent after that scrape is in the increase, and no counter tells it
@@ -99,10 +117,13 @@ so (`setup_probes_unplaced`) instead of reconciling.
 
 **Warm-up, cache and preflight.** For each host: the output tokens its engine counted during the
 warm-up, by the same rule as the window's; whether its required series cover the warm-up; and
-whether the host is so shown to have worked, beyond what its liveness completions alone would
-give. The cache capacity its lifecycle agent reported, the cache usage at the window's start and
-its peak, and whether those series cover the window. The `Preflight` the driver took before the
-run is kept with the reading.
+whether the host is so shown to have worked, beyond what its liveness completions alone would give.
+A warm-up warms the engine that did it. When the scrapes up to the window's start show another
+engine since the warm-up began, a counter that restarted, or a second fingerprint or release, the
+tokens are kept and the host is not warmed (`warm_up_engine_replaced`). A restart inside the window
+is the window's: it is counted across and recorded, and flags nothing. The cache capacity its
+lifecycle agent reported, the cache usage at the window's start and its peak, and whether those
+series cover the window. The `Preflight` the driver took before the run is kept with the reading.
 
 **A window that cannot qualify** has `Reading.reasons`, each of which stands for one
 `contracts.InvalidFlag` (`FLAG_OF`). The reading keeps every observation all the same.
@@ -120,11 +141,20 @@ import math
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
+from functools import partial
 from itertools import pairwise
 from statistics import fmean
 from typing import TYPE_CHECKING, Any
 
-from evaluate.contracts import INSTANCE_GPUS, HostMetric, InstanceType, InvalidFlag, KvDtype, Settings
+from evaluate.contracts import (
+    INSTANCE_GPUS,
+    MAX_COUNT,
+    HostMetric,
+    InstanceType,
+    InvalidFlag,
+    KvDtype,
+    Settings,
+)
 from rhi_common.engine_metrics import Further, Kind, Quantity, cache_capacity, further_names, metric_names
 from rhi_dashboards.gpu import COMPUTE as GPU_UTILIZATION_METRIC
 from rhi_gateway.metrics import REQUESTS as GATEWAY_REQUESTS_METRIC
@@ -233,12 +263,16 @@ class Reason(StrEnum):
     """The hosts did not all report the same, or one reported two."""
     UNEXPECTED = "unexpected"
     """What every host reported is not what was requested."""
+    CONTRADICTED = "contradicted"
+    """A host's engine itself said a setting other than the requested one."""
     HOST_TURNOVER = "host_turnover"
     """A host was in service for a part of the window only."""
     ENGINE_SERIES_MISSING = "engine_series_missing"
     PREEMPTION_COVERAGE_MISSING = "preemption_coverage_missing"
     WARM_UP_INCOMPLETE = "warm_up_incomplete"
     """Not every host was shown to work during a warm-up its required series cover."""
+    WARM_UP_ENGINE_REPLACED = "warm_up_engine_replaced"
+    """A host's engine was replaced after the warm-up began and before the window did."""
     CACHE_EVIDENCE_MISSING = "cache_evidence_missing"
     GATEWAY_COUNTERS_MISSING = "gateway_counters_missing"
     GATEWAY_COVERAGE_INCOMPLETE = "gateway_coverage_incomplete"
@@ -256,6 +290,7 @@ FLAG_OF = {
     Reason.ENGINE_SERIES_MISSING: InvalidFlag.MISSING_EVIDENCE,
     Reason.PREEMPTION_COVERAGE_MISSING: InvalidFlag.MISSING_EVIDENCE,
     Reason.WARM_UP_INCOMPLETE: InvalidFlag.MISSING_EVIDENCE,
+    Reason.WARM_UP_ENGINE_REPLACED: InvalidFlag.MISSING_EVIDENCE,
     Reason.CACHE_EVIDENCE_MISSING: InvalidFlag.MISSING_EVIDENCE,
     Reason.GATEWAY_COUNTERS_MISSING: InvalidFlag.MISSING_EVIDENCE,
     Reason.GATEWAY_COVERAGE_INCOMPLETE: InvalidFlag.MISSING_EVIDENCE,
@@ -365,7 +400,8 @@ class Counted:
 
 @dataclass(frozen=True)
 class Level:
-    """A gauge of one host over the window, at the scrapes every one of its series reported."""
+    """A gauge of one host over the window, at the scrapes every one of its series reported:
+    `None` when they reported at no scrape together, which is never complete coverage."""
 
     mean: float | None
     peak: float | None
@@ -406,8 +442,12 @@ class Host:
     """What the engine counted during the warm-up; `None` with no warm-up or no sample in it."""
     warm_up_coverage: Coverage
     """Whether the host's required series and its preemptions cover the warm-up."""
+    engine_replaced: bool
+    """Whether the telemetry shows another engine on the host between the warm-up's start and the
+    window's: a counter that restarted, or a second fingerprint or release."""
     warmed: bool
-    """Whether they do, and the tokens are more than the host's own liveness completions give."""
+    """Whether the series cover the warm-up, the tokens are more than the host's own liveness
+    completions give, and the engine that counted them is the one the window measured."""
     cache: Cache
 
     @property
@@ -545,12 +585,15 @@ _PREFLIGHT = (
 
 def preflight(reader: Reader, pool: str, engine: str, at: float) -> Preflight:
     """Whether the evidence a reading needs can be read at `at`, before anything is measured: the
-    hosts that report a release, and each key that one of them does not report (a fingerprint
-    that is none counts as not reported), or that the gateway does not."""
+    hosts that report a release, and each key that one of them does not report, or that the
+    gateway does not. A series reports when it has a sample that is a number (`_usable`), and a
+    fingerprint that is none counts as not reported."""
     held, span = selectors(pool, engine), range_of(ALLOWANCE_SECONDS)
 
     def now(key: Key) -> list[Series]:
-        return reader.read_samples(f"{held[key]}[{span}]", at=at) if key in held else []
+        if key not in held:
+            return []
+        return [one for one in reader.read_samples(f"{held[key]}[{span}]", at=at) if _scraped(one)]
 
     hosts = set(_by_host(now(Source.RELEASE)))
     missing: list[Key] = []
@@ -576,9 +619,43 @@ def _by_host(series: Iterable[Series]) -> dict[str, list[Series]]:
     return found
 
 
+def _usable(value: float) -> bool:
+    """Whether a sample's value is one to count with. Every series read here is a count, a level
+    or a constant one: a finite number from zero to the bound of the contracts' counts."""
+    return math.isfinite(value) and 0 <= value <= MAX_COUNT
+
+
 def _scraped(one: Series) -> list[Sample]:
     """The series' samples in the order of their times, a sample that is no number left out."""
-    return sorted((at, value) for at, value in one.samples if not math.isnan(value))
+    return sorted((at, value) for at, value in one.samples if math.isfinite(at) and _usable(value))
+
+
+def _closed(series: Iterable[Series], window: Window) -> list[Series]:
+    """The series of one metric of one target, without what was scraped after the window closed.
+    One scrape of a target holds every series of the metric, so the scrape that closes the
+    window is the first at or after its drain that any of them has a sample of. A later scrape
+    says nothing of a window already closed, and a series that begins with one is not the
+    window's: it is left out. A series that reported in the window and has no sample of the
+    closing scrape keeps its own next one: the scrape it missed is a hole like any other."""
+    series = list(series)
+    closing = min((at for one in series for at, _ in _scraped(one) if at >= window.drained), default=math.inf)
+    found = []
+    for one in series:
+        kept = [held for held in one.samples if held[0] <= closing]
+        times = [at for at, _ in _scraped(one)]
+        reported = any(window.started - ALLOWANCE_SECONDS <= at < window.drained for at in times)
+        if reported and not any(window.drained <= at <= closing for at in times):
+            kept += [held for held in sorted(one.samples) if held[0] > closing and _usable(held[1])][:1]
+        if kept:
+            found.append(dataclasses.replace(one, samples=tuple(kept)))
+    return found
+
+
+def _unreadable(one: Series, window: Window) -> bool:
+    """Whether the series was scraped in the window and nothing it said there is a number: its
+    evidence exists and cannot be used, which is a hole and not an absence."""
+    inside = [value for at, value in one.samples if window.started <= at <= window.drained]
+    return bool(inside) and not any(_usable(value) for value in inside)
 
 
 def _bounding(one: Series, window: Window) -> list[Sample]:
@@ -616,12 +693,16 @@ def _shown(times: Iterable[float], low: float, high: float) -> Reason | None:
 def _risen(one: Series, window: Window, *, from_zero: bool) -> tuple[float, int, list[float]] | None:
     """One counter series over the window: its increase, its restarts and the times of the
     samples that bound the window. `None` for a series that is not the window's: its last sample
-    is more than the allowance before the start. One scraped just before the start and never
-    after stopped with the window, and counts nothing over times that do not cover it. A series
-    with no sample before the start counts from zero when `from_zero`, as one that began with
-    its first event; else from its first sample, whose value shows no work of the window."""
+    is more than the allowance before the start, or its first a scrape or more after the drain,
+    when a target that was there in the window would have been scraped sooner. One scraped just
+    before the start and never after stopped with the window, and counts nothing over times
+    that do not cover it. A series with no sample before the start counts from zero when
+    `from_zero`, as one that began with its first event; else from its first sample, whose value
+    shows no work of the window."""
     held = _bounding(one, window)
     if not held or held[-1][0] < window.started - ALLOWANCE_SECONDS:
+        return None
+    if held[0][0] >= window.drained + SCRAPE_SECONDS:
         return None
     start = window.started if from_zero or held[0][0] <= window.started else held[0][0]
     # S5's increase is by instance: the series is given one name here, whatever labels it has.
@@ -637,6 +718,7 @@ def _counted(series: Sequence[Series], window: Window) -> Counted:
     if not any(times[-1] > window.started for _, _, times in risen):
         return Counted(None, 0, Coverage.MISSING)
     complete = all(_covers(times, window) for _, _, times in risen)
+    complete = complete and not any(_unreadable(one, window) for one in series)
     return Counted(
         sum(increase for increase, _, _ in risen),
         sum(resets for _, resets, _ in risen),
@@ -648,16 +730,21 @@ def _gauge(
     series: Sequence[Series], window: Window, combine: Callable[[list[float]], float]
 ) -> tuple[list[Sample], Coverage]:
     """One gauge of one host: one number at each scrape every one of its series reported, from
-    the samples that bound the window, and whether each of those series covers it. A series with
-    no sample in the window is not one of them; one that stopped within the allowance before the
-    window still makes the gauge incomplete."""
+    the samples that bound the window, and whether those scrapes cover it, as each of the series
+    must. A series with no sample in the window is not one of them; one that stopped within the
+    allowance before the window still makes the gauge incomplete, and so does one whose samples
+    of the window are no numbers."""
     near = [dict(_bounding(one, window)) for one in series]
     near = [one for one in near if one and max(one) >= window.started - ALLOWANCE_SECONDS]
     held = [one for one in near if any(window.started <= at <= window.drained for at in one)]
     if not held:
         return [], Coverage.MISSING
-    complete = all(_covers(sorted(one), window) for one in near)
     times = sorted(set.intersection(*(set(one) for one in held)))
+    complete = (
+        _covers(times, window)
+        and all(_covers(sorted(one), window) for one in near)
+        and not any(_unreadable(one, window) for one in series)
+    )
     scrapes = [(at, combine([one[at] for one in held])) for at in times]
     return scrapes, Coverage.COMPLETE if complete else Coverage.INCOMPLETE
 
@@ -692,8 +779,18 @@ def _times(series: Iterable[Series], labels: Sequence[str]) -> dict[tuple[str, .
 
 
 def _said(by: Mapping[tuple[str, ...], list[float]], window: Window) -> dict[tuple[str, ...], float]:
-    """The seconds of the window each value was reported for, those reported for none left out."""
-    seconds = {said: seconds_covered(taken, window.started, window.drained) for said, taken in by.items()}
+    """The seconds of the window each value was reported for, those reported for none left out.
+    The scrapes that say what held in the window are the ones that bound it, from the last at or
+    before its start to the first at or after its drain, whichever value each one said: a value
+    last said before the first of them, or first said after the last, was not said of the
+    window. As in S5, a sample shows its value for a scrape either side of it."""
+    every = [at for taken in by.values() for at in taken]
+    opened = max((at for at in every if at <= window.started), default=-math.inf)
+    closed = min((at for at in every if at >= window.drained), default=math.inf)
+    seconds = {
+        said: seconds_covered([at for at in taken if opened <= at <= closed], window.started, window.drained)
+        for said, taken in by.items()
+    }
     return {said: held for said, held in seconds.items() if held > 0}
 
 
@@ -707,16 +804,19 @@ def _held(value: str | None, grammar: re.Pattern[str]) -> str | None:
     return value if value is not None and grammar.fullmatch(value) else None
 
 
-def _effective(series: Sequence[Series], window: Window) -> dict[str, object]:
-    """What one host's engine said of each setting of `EFFECTIVE`: its meaning where every
-    series of the host that reported in the window said the same text, through the window."""
-    reported = [one for one in series if any(window.started <= at <= window.drained for at, _ in _scraped(one))]
-    whole = _shown((at for one in reported for at, _ in _scraped(one)), window.started, window.drained) is None
-    found: dict[str, object] = {}
+def _effective(series: Sequence[Series], window: Window) -> tuple[dict[str, object], dict[str, set[object]]]:
+    """What one host's engine said of each setting of `EFFECTIVE`. First the setting it had: the
+    meaning of the one text it said, when it said it through the window. Then every meaning it
+    said in the window, for however long: any of them other than the requested one contradicts
+    the request."""
+    whole = _shown((at for one in series for at, _ in _scraped(one)), window.started, window.drained) is None
+    held: dict[str, object] = {}
+    every: dict[str, set[object]] = {}
     for setting, (label, meanings) in EFFECTIVE.items():
-        text = _only(one.labels.get(label) for one in reported)
-        found[setting] = meanings.get(text) if whole and text is not None else None
-    return found
+        texts = [text for (text,) in _said(_times(series, (label,)), window)]
+        every[setting] = {meanings[text] for text in texts if text in meanings}
+        held[setting] = meanings.get(texts[0]) if whole and len(texts) == 1 else None
+    return held, every
 
 
 def _match(declared: Sequence[object], observed: Sequence[object]) -> Reason | None:
@@ -729,9 +829,14 @@ def _match(declared: Sequence[object], observed: Sequence[object]) -> Reason | N
     return None if all(asked == seen for asked, seen in pairs) else Reason.UNEXPECTED
 
 
-def _launch(requested: str | None, hosts: Sequence[tuple[tuple[str, ...], bool]]) -> Reason | None:
+def _launch(
+    requested: str | None, hosts: Sequence[tuple[tuple[str, ...], bool]], *, contradicted: bool
+) -> Reason | None:
     """The launch settings' reason, from each host's fingerprints in the window and whether one
-    fingerprint, and nothing else, was said through the host's time in service."""
+    fingerprint, and nothing else, was said through the host's time in service. An engine that
+    itself said a setting other than the requested one comes first: no fingerprint outweighs it."""
+    if contradicted:
+        return Reason.CONTRADICTED
     if _held(requested, _FINGERPRINT) is None:
         return Reason.NOT_DECLARED
     fingerprints = {one for said, _ in hosts for one in said}
@@ -746,17 +851,24 @@ def _launch(requested: str | None, hosts: Sequence[tuple[tuple[str, ...], bool]]
 
 def _traffic(series: Sequence[Series], window: Window, driver: Driver) -> Traffic:
     expected = driver.attempts + driver.side_queries
+    # A task of the gateway is one target: its closing scrape is every one of its identities'.
+    by_task: dict[str, list[Series]] = {}
+    for one in series:
+        by_task.setdefault(one.labels.get("instance", ""), []).append(one)
+    series = [one for held in by_task.values() for one in _closed(held, window)]
     risen = [(one, found) for one in series if (found := _risen(one, window, from_zero=True)) is not None]
     if not any(times[-1] > window.started for _, (_, _, times) in risen):
         return Traffic(None, None, None, expected, 0, driver.setup_probes == 0, Coverage.MISSING)
     # Each task of the gateway must show scrapes through the whole window, by any of its series:
     # only then did a series that begins in the window begin with its first request. And each
-    # series, once it began, must go on to the drain.
+    # series, once it began, must go on to the drain, with samples that are numbers.
     tasks: dict[str, set[float]] = {}
     for one, (_, _, times) in risen:
         tasks.setdefault(one.labels.get("instance", ""), set()).update(times)
-    complete = all(_covers(sorted(times), window) for times in tasks.values()) and all(
-        times[-1] >= window.drained and _unbroken(times) for _, (_, _, times) in risen
+    complete = (
+        all(_covers(sorted(times), window) for times in tasks.values())
+        and all(times[-1] >= window.drained and _unbroken(times) for _, (_, _, times) in risen)
+        and not any(_unreadable(one, window) for one in series)
     )
     pool = sum(increase for _, (increase, _, _) in risen)
     cohort = [found for one, found in risen if one.labels.get("alias", "") in driver.cohort]
@@ -802,7 +914,9 @@ def _reasons(hosts: Sequence[Host], traffic: Traffic) -> tuple[Reason, ...]:
             reasons.add(Reason.PREEMPTION_COVERAGE_MISSING)
         if Coverage.INCOMPLETE in (*covered, preemptions, host.cache.coverage):
             reasons.add(Reason.INCOMPLETE_COVERAGE)
-        if not host.warmed:
+        if host.engine_replaced:
+            reasons.add(Reason.WARM_UP_ENGINE_REPLACED)
+        elif not host.warmed:
             reasons.add(Reason.WARM_UP_INCOMPLETE)
         if host.cache.capacity_tokens is None or host.cache.usage_at_start is None:
             reasons.add(Reason.CACHE_EVIDENCE_MISSING)
@@ -820,19 +934,57 @@ def _reasons(hosts: Sequence[Host], traffic: Traffic) -> tuple[Reason, ...]:
     return tuple(sorted(reasons))
 
 
-def _warm_up(of: Callable[[Key], list[Series]], warm_up: Window | None) -> tuple[float | None, Coverage, bool]:
-    """What one host's engine counted during the warm-up, whether the host's required series and
-    its preemptions cover it, and whether the host is so shown to have worked: more tokens than
-    a liveness completion of one token each minute gives between the samples that bound it."""
+def _between(scraped: Sequence[Sample], low: float, high: float) -> list[Sample]:
+    """The samples from the last at or before `low` to the last at or before `high`."""
+    before = [sample for sample in scraped if sample[0] <= low]
+    return [*before[-1:], *(sample for sample in scraped if low < sample[0] <= high)]
+
+
+def _replaced(of: Callable[[Key], list[Series]], low: float, high: float) -> bool:
+    """Whether one host's telemetry shows another engine between `low` and `high`: one of its
+    counters dropped between two samples, or its agent said a second fingerprint or a second
+    release. Read from the last scrape at or before `low` to the last at or before `high`: what
+    a later one shows may have happened after `high`."""
+    for metric in COUNTERS:
+        for one in of(metric):
+            held = _between(_scraped(one), low, high)
+            if any(after < before for (_, before), (_, after) in pairwise(held)):
+                return True
+    said = {Source.LAUNCH: ("settings_fingerprint",), Source.RELEASE: ("image_digest", "model_revision")}
+    for source, labels in said.items():
+        by = _times(of(source), labels)
+        opened = max((at for taken in by.values() for at in taken if at <= low), default=low)
+        if sum(any(opened <= at <= high for at in taken) for taken in by.values()) > 1:
+            return True
+    return False
+
+
+def _warm_up(
+    of: Callable[[Key], list[Series]], warm_up: Window | None, window: Window
+) -> tuple[float | None, Coverage, bool, bool]:
+    """What one host's engine counted during the warm-up; whether the host's required series and
+    its preemptions cover it; whether the engine was replaced between the warm-up's start and
+    the window's; and whether the host is so shown to have warmed the engine the window
+    measured: the series cover the warm-up, that engine was not replaced, and it counted more
+    tokens than a liveness completion of one token each minute gives between the samples that
+    bound the warm-up. What an engine that was replaced counted is kept, and warmed nothing."""
     if warm_up is None:
-        return None, Coverage.MISSING, False
-    worked = _counted(of(HostMetric.OUTPUT_TOKENS_TOTAL), warm_up).increase
+        return None, Coverage.MISSING, False, False
+
+    def during(metric: HostMetric) -> list[Series]:
+        return _closed(of(metric), warm_up)
+
+    worked = _counted(during(HostMetric.OUTPUT_TOKENS_TOTAL), warm_up).increase
     coverage = _worst(
-        _counted(of(metric), warm_up).coverage if metric in COUNTERS else _gauge(of(metric), warm_up, GAUGES[metric])[1]
+        _counted(during(metric), warm_up).coverage
+        if metric in COUNTERS
+        else _gauge(during(metric), warm_up, GAUGES[metric])[1]
         for metric in (*REQUIRED, HostMetric.PREEMPTIONS_TOTAL)
     )
+    replaced = _replaced(of, warm_up.started, window.started)
     liveness = int((warm_up.seconds + 2 * ALLOWANCE_SECONDS) // PROBE_INTERVAL_SECONDS) + 1
-    return worked, coverage, coverage is Coverage.COMPLETE and worked is not None and worked > liveness
+    warmed = coverage is Coverage.COMPLETE and not replaced and worked is not None and worked > liveness
+    return worked, coverage, replaced, warmed
 
 
 def resolve(
@@ -842,7 +994,11 @@ def resolve(
     ones, each treatment verified or not, each host's metrics and the pool's totals, the gateway's
     traffic, and the reasons the window cannot qualify."""
     ordinals = Ordinals() if ordinals is None else ordinals
-    by_key = {key: _by_host(series) for key, series in answers.items() if key is not Source.GATEWAY_REQUESTS}
+    scraped = {key: _by_host(series) for key, series in answers.items() if key is not Source.GATEWAY_REQUESTS}
+    # What each host's series say of the window: nothing scraped after it closed.
+    by_key = {
+        key: {instance: _closed(series, window) for instance, series in held.items()} for key, held in scraped.items()
+    }
     # A host is an instance that reported a release in the window, or anything else in it.
     instances = {
         instance
@@ -855,10 +1011,13 @@ def resolve(
     identities: set[tuple[str, str]] = set()
     launched: list[tuple[tuple[str, ...], bool]] = []
     effective: list[dict[str, object]] = []
+    spoken: list[dict[str, set[object]]] = []
     for instance in sorted(instances | set(by_key.get(Source.RELEASE, {}))):
 
-        def of(key: Key, instance: str = instance) -> list[Series]:
-            return by_key.get(key, {}).get(instance, [])
+        def of(
+            key: Key, instance: str = instance, held: Mapping[Key, dict[str, list[Series]]] = by_key
+        ) -> list[Series]:
+            return held.get(key, {}).get(instance, [])
 
         releases = _times(of(Source.RELEASE), ("instance_type", "image_digest", "model_revision"))
         served = _said(releases, window)
@@ -882,11 +1041,14 @@ def resolve(
             and _shown((at for one in of(Source.LAUNCH) for at, _ in _scraped(one)), low, high) is None
         )
         launched.append((fingerprints, whole))
-        effective.append(_effective(of(Source.CACHE_CONFIG), window))
+        setting, meanings = _effective(of(Source.CACHE_CONFIG), window)
+        effective.append(setting)
+        spoken.append(meanings)
 
         counters = {metric: _counted(of(metric), window) for metric in COUNTERS}
         output = counters[HostMetric.OUTPUT_TOKENS_TOTAL].increase
-        worked, warm_up_coverage, warmed = _warm_up(of, driver.warm_up)
+        # The warm-up is before the window: it is read from the series as they were scraped.
+        worked, warm_up_coverage, replaced, warmed = _warm_up(partial(of, held=scraped), driver.warm_up, window)
         kind = _only(kind for kind, _, _ in served)
         hosts.append(
             Host(
@@ -902,6 +1064,7 @@ def resolve(
                 output_tokens_per_s=None if output is None else output / window.seconds,
                 warm_up_output_tokens=worked,
                 warm_up_coverage=warm_up_coverage,
+                engine_replaced=replaced,
                 warmed=warmed,
                 cache=_cache(of(Source.CACHE_CAPACITY), of(Source.CACHE_USAGE), window),
             )
@@ -947,6 +1110,13 @@ def resolve(
     else:
         membership = _match((asked.host_count, asked.instance_type), (seen.host_count, seen.instance_type))
     release = _match((asked.engine_image_digest, asked.model_revision), (image, revision))
+    # A host whose engine said, at any time of the window, a setting other than the requested one.
+    contradicted = any(
+        getattr(asked, name) is not None and said != {getattr(asked, name)}
+        for meanings in spoken
+        for name, said in meanings.items()
+        if said
+    )
     if release is not Reason.NOT_DECLARED:
         if len(identities) > 1:
             release = Reason.MIXED
@@ -957,7 +1127,7 @@ def resolve(
     treatments = {
         Treatment.HOSTS: membership,
         Treatment.RELEASE: release,
-        Treatment.LAUNCH_SETTINGS: _launch(requested.launch_fingerprint, launched),
+        Treatment.LAUNCH_SETTINGS: _launch(requested.launch_fingerprint, launched, contradicted=contradicted),
         Treatment.TOKENIZER: _match((asked.tokenizer_revision,), (seen.tokenizer_revision,)),
         Treatment.GATEWAY_PROFILE: _match((asked.gateway_profile_digest,), (seen.gateway_profile_digest,)),
     }

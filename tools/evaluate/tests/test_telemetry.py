@@ -200,10 +200,15 @@ DRIVER = Driver(
 
 
 def reading(
-    workspace: Workspace, *, window: Window = WINDOW, driver: Driver = DRIVER, ordinals: Ordinals | None = None
+    workspace: Workspace,
+    *,
+    window: Window = WINDOW,
+    requested: Requested = REQUESTED,
+    driver: Driver = DRIVER,
+    ordinals: Ordinals | None = None,
 ) -> telemetry.Reading:
     answers = telemetry.read(workspace, POOL, VLLM, window, driver.warm_up)
-    return telemetry.resolve(answers, window, REQUESTED, driver, ordinals)
+    return telemetry.resolve(answers, window, requested, driver, ordinals)
 
 
 def increases(read: telemetry.Reading, metric: HostMetric) -> list[float | None]:
@@ -322,6 +327,53 @@ def test_the_effective_settings_an_engine_exposes_are_observed_where_every_host_
     # A host that said it for the start of the window only did not say it through the window.
     workspace.find(CACHE_CONFIG, instance=HOST_B)[0].times = tuple(at for at in SCRAPES if at < 1_100)
     assert reading(workspace).observed.kv_dtype is None
+
+
+def test_a_fingerprint_first_said_after_the_scrape_that_closed_the_window_is_not_the_windows() -> None:
+    workspace = clean()
+    # The agent is scraped on the drain, and says another fingerprint from 14 seconds later on.
+    launch = workspace.find(LAUNCH, instance=HOST_A)[0]
+    launch.times = (*(at for at in SCRAPES if at < END), END)
+    workspace.add(LAUNCH, lambda _: 1, (END + 14, END + 29), instance=HOST_A, settings_fingerprint=OTHER_FINGERPRINT)
+    read = reading(workspace)
+    assert (read.unverified, read.reasons) == ((), ())
+    assert read.hosts[0].launch_fingerprints == (FINGERPRINT,)
+
+    # With no scrape on the drain the next one closes the window, and what it is the first to say
+    # may have begun inside.
+    launch.times = tuple(at for at in SCRAPES if at < END)
+    workspace.find(LAUNCH, settings_fingerprint=OTHER_FINGERPRINT)[0].times = (END + 3, END + 18)
+    assert reading(workspace).treatments[Treatment.LAUNCH_SETTINGS] is Reason.MIXED
+
+
+def test_an_engine_that_says_another_setting_contradicts_a_matching_fingerprint() -> None:
+    asked = Requested(replace(REQUESTED.settings, prefix_caching=True), FINGERPRINT)
+    workspace = clean()
+    for host, enabled in ((HOST_A, "True"), (HOST_B, "False")):
+        workspace.add(CACHE_CONFIG, lambda _: 1, instance=host, engine="0", enable_prefix_caching=enabled)
+    read = reading(workspace, requested=asked)
+
+    assert read.unverified == (Treatment.LAUNCH_SETTINGS,)
+    assert read.treatments[Treatment.LAUNCH_SETTINGS] is Reason.CONTRADICTED
+    # The fingerprint is the requested one on every host, and is kept as what was observed.
+    assert (read.requested_launch_fingerprint, read.observed_launch_fingerprint) == (FINGERPRINT, FINGERPRINT)
+    assert read.flags == ()
+
+    # Every engine says what was requested: the fingerprint verifies the launch settings.
+    workspace.find(CACHE_CONFIG, instance=HOST_B)[0].labels["enable_prefix_caching"] = "True"
+    read = reading(workspace, requested=asked)
+    assert (read.unverified, read.observed.prefix_caching) == ((), True)
+
+    # An engine that said it for a part of the window only still said it.
+    workspace.add(
+        CACHE_CONFIG,
+        lambda _: 1,
+        tuple(at for at in SCRAPES if 1_100 < at < 1_200),
+        instance=HOST_A,
+        engine="0",
+        enable_prefix_caching="False",
+    )
+    assert reading(workspace, requested=asked).treatments[Treatment.LAUNCH_SETTINGS] is Reason.CONTRADICTED
 
 
 def test_no_gateway_provenance_leaves_only_the_request_side_unverified() -> None:
@@ -448,6 +500,20 @@ def test_a_gauge_is_incomplete_when_one_of_its_series_stops() -> None:
     assert read.reasons == (Reason.INCOMPLETE_COVERAGE,)
 
 
+def test_a_gauge_whose_series_share_no_scrape_has_no_level_and_does_not_cover_the_window() -> None:
+    workspace = clean()
+    # Two engine indexes report on alternate scrapes: each has a sample every 30 seconds.
+    workspace.find(RUNNING, instance=HOST_A)[0].times = SCRAPES[::2]
+    workspace.add(RUNNING, lambda _: 1, SCRAPES[1::2], instance=HOST_A, engine="1")
+    read = reading(workspace)
+
+    running = read.hosts[0].gauges[HostMetric.RUNNING_REQUESTS]
+    assert (running.mean, running.peak, running.coverage) == (None, None, Coverage.INCOMPLETE)
+    assert Reason.INCOMPLETE_COVERAGE in read.reasons
+    assert read.flags == (InvalidFlag.MISSING_EVIDENCE,)
+    assert read.hosts[1].gauges[HostMetric.RUNNING_REQUESTS].coverage is Coverage.COMPLETE
+
+
 def test_a_series_that_stopped_as_the_window_began_leaves_its_host_incomplete() -> None:
     workspace = clean()
     # A second engine index counted up to the scrape before the window, and was not seen again.
@@ -572,6 +638,37 @@ def test_smoke_traffic_through_the_gateway_is_external_and_the_nodes_liveness_is
     assert smoked.unverified == ()
 
 
+def test_an_identity_first_seen_after_the_gateways_closing_scrape_is_not_the_windows() -> None:
+    workspace = clean()
+    # The task is scraped on the drain, and someone's first request shows 18 seconds later.
+    for counter in workspace.find(GATEWAY):
+        counter.times = tuple(sorted((*counter.times, END)))
+    workspace.add(GATEWAY, lambda _: 1, (END + 18,), alias="late-smoke", instance=TASK)
+    read = reading(workspace)
+    assert (read.traffic.pool_requests, read.traffic.external_requests) == (40, 0)
+    assert (read.traffic.reconciled, read.reasons) == (True, ())
+
+    # With no scrape on the drain, the one at 1303 closes the window: a request it is the first
+    # to show is between the scrapes that bound the window, and overlaps.
+    workspace = clean()
+    workspace.add(GATEWAY, lambda _: 1, (END + 3, END + 18), alias="late-smoke", instance=TASK)
+    read = reading(workspace)
+    assert (read.traffic.external_requests, read.reasons) == (1, (Reason.EXTERNAL_TRAFFIC,))
+
+
+def test_gateway_samples_that_are_no_numbers_are_missing_evidence_and_not_counted() -> None:
+    workspace = clean()
+    workspace.find(GATEWAY, alias=COHORT[0])[0].value = lambda _: float("inf")
+    read = reading(workspace)
+
+    # The other identity's 16 requests are kept; the first one's count is unknown, not zero.
+    assert (read.traffic.cohort_requests, read.traffic.coverage) == (16, Coverage.INCOMPLETE)
+    assert not read.traffic.reconciled
+    assert read.reasons == (Reason.GATEWAY_COVERAGE_INCOMPLETE, Reason.UNRECONCILED_COUNTERS)
+    assert read.flags == (InvalidFlag.MISSING_EVIDENCE, InvalidFlag.UNRECONCILED_COUNTERS)
+    assert increases(read, HostMetric.OUTPUT_TOKENS_TOTAL) == [3_000, 6_000]
+
+
 def with_probe(first_alias: int) -> Workspace:
     """The clean workspace with `first_alias` requests of the first identity in the window, and
     a setup probe it sent at 995: after the scrape at 988, so in the first scrape of the window."""
@@ -691,6 +788,41 @@ def test_a_host_that_only_answered_its_own_liveness_was_not_warmed_up() -> None:
     assert reading(clean(), driver=replace(DRIVER, warm_up=None)).reasons == (Reason.WARM_UP_INCOMPLETE,)
 
 
+def test_the_warm_up_of_an_engine_replaced_before_the_window_does_not_warm_its_replacement() -> None:
+    def replaced_at_970(*, fingerprint: bool, counter: bool) -> telemetry.Reading:
+        workspace = clean()
+        if fingerprint:
+            workspace.find(LAUNCH, instance=HOST_A)[0].times = tuple(at for at in SCRAPES if at >= 970)
+            workspace.add(
+                LAUNCH,
+                lambda _: 1,
+                tuple(at for at in SCRAPES if at < 970),
+                instance=HOST_A,
+                settings_fingerprint=OTHER_FINGERPRINT,
+            )
+        if counter:
+            # The new engine counts from zero, and generates nothing before the window.
+            output = workspace.find(OUTPUT, instance=HOST_A)[0]
+            before = output.value
+            output.value = lambda at: before(at) if at < 970 else 10 * within(at, START, END)
+        return reading(workspace)
+
+    for read in (
+        replaced_at_970(fingerprint=True, counter=True),
+        replaced_at_970(fingerprint=True, counter=False),
+        replaced_at_970(fingerprint=False, counter=True),
+    ):
+        first, second = read.hosts
+        # What the earlier engine counted is kept, and warmed nothing the window measured.
+        assert (first.warm_up_output_tokens, first.engine_replaced, first.warmed) == (600, True, False)
+        assert (second.engine_replaced, second.warmed) == (False, True)
+        assert read.reasons == (Reason.WARM_UP_ENGINE_REPLACED,)
+        assert read.flags == (InvalidFlag.MISSING_EVIDENCE,)
+        # The window itself had one engine, of the requested fingerprint, throughout.
+        assert read.unverified == ()
+        assert first.counters[HostMetric.OUTPUT_TOKENS_TOTAL].increase == 3_000
+
+
 def test_a_warm_up_is_shown_by_a_rise_its_scrapes_cover() -> None:
     # The first sample of the counter, after the warm-up began, holds 500 tokens, and it never
     # rises during the warm-up: a value is not work.
@@ -747,6 +879,12 @@ def test_missing_cache_and_preemption_evidence_shows_in_the_preflight_and_the_re
         Source.CACHE_CAPACITY,
         HostMetric.PREEMPTIONS_TOTAL,
     )
+    # A series whose samples are no numbers reports nothing either.
+    unreadable = clean()
+    unreadable.find(PREEMPTIONS, instance=HOST_A)[0].value = lambda _: float("nan")
+    assert telemetry.preflight(unreadable, POOL, VLLM, at=START).missing == (HostMetric.PREEMPTIONS_TOTAL,)
+    assert Reason.PREEMPTION_COVERAGE_MISSING in reading(unreadable).reasons
+
     read = reading(workspace)
     assert read.hosts[0].cache.capacity_tokens is None
     assert set(read.reasons) == {
