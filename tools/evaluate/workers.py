@@ -11,9 +11,10 @@ workspace of its own on this host. `Workers.start` makes it from a `Spec`:
 - *Nothing of this host is mounted as it is.* The task's files and each assigned tool are copied
   into the workspace, and only those copies are bound into the container, read-only. A source
   that is a sealed folder (the grader's fixtures, the reference answers), holds one or lies in
-  one is refused, and so is one that holds the checkout or the home folder, or that lies in a
-  hidden entry of the home folder (`.aws`, `.ssh`, `.config`, ...): the configuration and the
-  credentials of this host. A copy keeps links as links and refuses a socket or a device.
+  one is refused, and so is one that holds the checkout or the home folder, or that is, holds
+  or lies in a hidden entry of the home folder (`.aws`, `.ssh`, `.config`, ...): the
+  configuration and the credentials of this host, also where such an entry is a link to a
+  folder kept elsewhere. A copy keeps links as links and refuses a socket or a device.
 - *A fresh home.* The root file system is read-only. Home, the working folder, the temporary
   folder and the output folder are memory file systems of a fixed size, empty at the start, and
   the task's files are copied into the working folder. No variable of this machine is passed.
@@ -391,25 +392,47 @@ def _home() -> tuple[Path, ...]:
         return ()
 
 
-def _host_configuration(path: Path, homes: Sequence[Path]) -> bool:
-    """Whether a resolved path is, or lies in, a hidden entry of a home folder: where the
-    configuration and the credentials of this host's user are kept (`.aws`, `.ssh`, `.config`)."""
-    return any(home in path.parents and path.relative_to(home).parts[0].startswith(".") for home in homes)
-
-
 def _within(path: Path, other: Path) -> bool:
     return path == other or other in path.parents
+
+
+def host_configuration(homes: Sequence[Path]) -> tuple[Path, ...]:
+    """Where the configuration and the credentials of this host's user are kept: each hidden
+    entry of a home folder (`.aws`, `.ssh`, `.config`), resolved, so that an entry which is a
+    link names the folder the configuration is really in. Refused: a home folder that cannot be
+    read, since what it keeps cannot be told from a task's files."""
+    kept: list[Path] = []
+    for home in homes:
+        try:
+            names = [entry.name for entry in os.scandir(home) if entry.name.startswith(".")]
+        except (FileNotFoundError, NotADirectoryError):  # a home folder that is not there keeps nothing
+            continue
+        except OSError as error:
+            raise Refused("the home folder cannot be read, so this host's configuration cannot be kept out") from error
+        kept.extend((home / name).resolve() for name in names)
+    return tuple(kept)
+
+
+def _in_host_configuration(path: Path, homes: Sequence[Path], kept: Sequence[Path]) -> bool:
+    """Whether a resolved path is, or lies in, the host's configuration: a hidden entry of a home
+    folder by its name, or the place one of them leads to."""
+    named = any(home in path.parents and path.relative_to(home).parts[0].startswith(".") for home in homes)
+    return named or any(_within(path, entry) for entry in kept)
 
 
 def check_source(source: Path, sealed: Sequence[Path], outside: Sequence[Path], homes: Sequence[Path] = ()) -> Path:
     """The folder a worker's files are copied from, resolved. Refused when it is not a folder,
     when it is, holds or lies in a sealed folder, when it holds a folder that stays outside, or
-    when it lies in the host's configuration (a hidden entry of one of `homes`)."""
+    when it is, holds or lies in the host's configuration: a hidden entry of one of `homes`, by
+    whatever path it is named and wherever a link has moved it."""
     resolved = source.resolve()
     if not resolved.is_dir():
         raise Refused(f"{source} is not a folder")
-    if _host_configuration(resolved, homes):
+    configuration = host_configuration(homes)
+    if _in_host_configuration(resolved, homes, configuration):
         raise Refused(f"{source} lies in the configuration of this host, which stays outside the workers")
+    if any(_within(entry, resolved) for entry in configuration):
+        raise Refused(f"{source} holds configuration of this host, which stays outside the workers")
     for kept in sealed:
         if _within(resolved, kept.resolve()) or _within(kept.resolve(), resolved):
             raise Refused(f"{source} is sealed from the workers")
@@ -680,7 +703,7 @@ class Workers:
         self._homes = _home()
         self._outside = (REPO, self.root, *self._homes)
         # What a worker writes is given to the next one from here, so this is a source as well.
-        if _host_configuration(self.root, self._homes):
+        if _in_host_configuration(self.root, self._homes, host_configuration(self._homes)):
             raise Refused("the scratch folder lies in the configuration of this host")
         self._runtime: Runtime = runtime if runtime is not None else Docker()
         self._workers: list[Worker] = []
