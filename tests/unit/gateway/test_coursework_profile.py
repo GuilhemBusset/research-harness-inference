@@ -83,6 +83,46 @@ REQUEST = {
     "thinking": {"type": "adaptive"},
     "output_config": {"effort": "high"},
 }
+# Claude Code's request after the model searched for a deferred MCP tool: the result of `ToolSearch`
+# names the tool found with a tool reference, and stays in the history of every later request.
+FOUND_TOOL = "mcp__notes__read_note"
+SEARCH_TURNS: list[dict[str, Any]] = [
+    {"role": "user", "content": [{"type": "text", "text": "Read the note titled plan."}]},
+    {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "toolu_01", "name": "ToolSearch", "input": {"query": "notes"}}],
+    },
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_01",
+                "content": [
+                    {"type": "text", "text": "One tool was found."},
+                    {"type": "tool_reference", "tool_name": FOUND_TOOL},
+                ],
+            }
+        ],
+    },
+]
+SEARCH_REQUEST = {
+    **REQUEST,
+    "tools": [
+        {
+            "name": "ToolSearch",
+            "description": "Find the deferred tools that match a query.",
+            "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
+        },
+        {
+            "name": FOUND_TOOL,
+            "description": "Read one note by its title.",
+            "input_schema": {"type": "object", "properties": {"title": {"type": "string"}}},
+            "defer_loading": True,
+        },
+    ],
+    "messages": SEARCH_TURNS,
+}
 ANSWER = {
     "type": "message",
     "role": "assistant",
@@ -199,21 +239,26 @@ def test_the_gateway_starts() -> None:
 
     started(gateway, scenario)
 
-    # The coursework pool's profile was built, its three entries in order, and the Messages filter runs it.
+    # The coursework pool's profile was built, its four entries in order, and the Messages filter runs it.
     built = profile.build(settings.pools)["coursework"]
-    assert [item.name for item in built.entries] == ["reasoning_effort", "system_in_place", "document_as_text"]
+    assert [item.name for item in built.entries] == [
+        "reasoning_effort",
+        "system_in_place",
+        "document_as_text",
+        "tool_reference_as_text",
+    ]
     messages_filter = gateway.forwarding.filters[routes.MESSAGES]
     assert isinstance(messages_filter, BodyFilter)
     assert "coursework" in messages_filter.profiles
 
 
-@pytest.mark.usefixtures("aws")
-def test_a_claude_code_request_reaches_the_coursework_engine_in_the_form_the_model_accepts() -> None:
+def received(request: dict[str, Any]) -> dict[str, Any]:
+    """The body the coursework pool's engine receives for a request Claude Code sends, which it answers."""
     key = issue_key()
     sent: list[dict[str, Any]] = []
 
-    def engine(request: httpx.Request) -> httpx.Response:
-        sent.append(json.loads(request.content))
+    def engine(asked: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(asked.content))
         return httpx.Response(200, json=ANSWER)
 
     clients = replace(aws_clients(), elbv2=Targets())
@@ -222,12 +267,18 @@ def test_a_claude_code_request_reaches_the_coursework_engine_in_the_form_the_mod
     async def scenario(client: httpx.AsyncClient) -> None:
         while not gateway.readiness.pool("coursework").ready:
             await asyncio.sleep(0.01)
-        answer = await client.post("/v1/messages?beta=true", headers={"Authorization": f"Bearer {key}"}, json=REQUEST)
+        answer = await client.post("/v1/messages?beta=true", headers={"Authorization": f"Bearer {key}"}, json=request)
         assert (answer.status_code, answer.json()) == (200, ANSWER)
 
     started(gateway, scenario)
 
     [body] = sent
+    return body
+
+
+@pytest.mark.usefixtures("aws")
+def test_a_claude_code_request_reaches_the_coursework_engine_in_the_form_the_model_accepts() -> None:
+    body = received(REQUEST)
     assert body["model"] == "coursework"
     # Effort high becomes xhigh, the one the model's template accepts above medium.
     assert body["output_config"]["effort"] == "xhigh"
@@ -243,4 +294,20 @@ def test_a_claude_code_request_reaches_the_coursework_engine_in_the_form_the_mod
     assert result["content"] == [
         {"type": "text", "text": "PDF file read"},
         {"type": "text", "text": document_as_text.SENTENCE},
+    ]
+
+
+@pytest.mark.usefixtures("aws")
+def test_a_tool_reference_reaches_the_coursework_engine_as_a_line_of_text_in_its_place() -> None:
+    body = received(SEARCH_REQUEST)
+    assert body["model"] == "coursework"
+    # The search's call and its result stay a pair, and the deferred tool stays declared.
+    sent_turns = body["messages"]
+    assert sent_turns[:2] == SEARCH_TURNS[:2]
+    assert body["tools"] == SEARCH_REQUEST["tools"]
+    [result] = sent_turns[2]["content"]
+    assert result["tool_use_id"] == "toolu_01"
+    assert result["content"] == [
+        {"type": "text", "text": "One tool was found."},
+        {"type": "text", "text": f"[tool reference: {FOUND_TOOL}]"},
     ]

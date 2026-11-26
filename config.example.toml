@@ -248,10 +248,11 @@ parked = false
 #
 # Its request profile is that of section 6.2, step 4, for the model's defects in vLLM (evidence
 # E28): the reasoning effort mapped to a value the model's template accepts, a system message
-# placed mid-conversation sent as user content in its place, and a document block replaced by a
-# line of text. The effort mapping is section 17's: low and medium unchanged; high, xhigh and max
-# as xhigh. The upgrade pool of phase 4 shares the model's template and parsers, and so this
-# profile (section 6.1).
+# placed mid-conversation sent as user content in its place, a document block replaced by a line
+# of text, and a tool reference inside a tool result replaced by a line of text that names the
+# tool. The effort mapping is section 17's: low and medium unchanged; high, xhigh and max as
+# xhigh. The upgrade pool of phase 4 shares the model's template and parsers, and so this profile
+# (section 6.1).
 #
 # Its zones are the zones its group launches in (section 5.4): each is one of the key `zones`
 # above, at least one, none named twice. A pool lists the zones that offer its instance types,
@@ -275,7 +276,7 @@ prefix_caching = true
 step_budget_tokens = 8192
 tool_call_parser = "qwen3_coder"
 reasoning_parser = "qwen3"
-request_profile = ["reasoning_effort", "system_in_place", "document_as_text"]
+request_profile = ["reasoning_effort", "system_in_place", "document_as_text", "tool_reference_as_text"]
 reasoning_effort = { low = "low", medium = "medium", high = "xhigh", xhigh = "xhigh", max = "xhigh" }
 
 # What the pool is expected to measure, each a low and a high bound, which the inference dashboard

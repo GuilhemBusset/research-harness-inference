@@ -44,10 +44,11 @@ reference inside a tool result), and its `Tool` object.
 
 **What the request profile rewrites is kept as it is sent** (sections 6.1 and 6.2, step 4): the
 reasoning effort (`output_config.effort`; the vLLM project's replay of Claude Code's traffic
-records `{"effort":"high"}` there `[E28]`), a system message wherever it sits in `messages`, and a
-document block. This list refuses none of them, whatever the pool's model does with them.
+records `{"effort":"high"}` there `[E28]`), a system message wherever it sits in `messages`, a
+document block, and a tool reference inside a tool result. This list refuses none of them, whatever
+the pool's model does with them.
 
-**Three entries are not like their neighbours:**
+**Four entries are not like their neighbours:**
 
 - `thinking` is kept whole, with any type and any field: the engine reads it from vLLM 0.33 on
   (section 6.1). Its `budget_tokens` is not clamped with the output limit.
@@ -56,6 +57,10 @@ document block. This list refuses none of them, whatever the pool's model does w
   field the reference does not give a location or the switch is dropped like any other.
 - `source` is described as the object of an image or a document. On a search result it is a
   string, which the filter keeps as it is.
+- `name`, on an item of a tool result, is no field of the reference, which names a tool
+  reference's tool in `tool_name`. vLLM reads `name` where an item has no `tool_name`, and so does
+  the request profile's entry for tool references (`rhi_gateway.profile.tool_reference_as_text`),
+  which is given the filtered body: the name is kept for it to read.
 
 **Blocks this endpoint cannot serve are replaced, never refused** (section 6.2, step 4; ADR 0003,
 decision 7). A block the engine refuses stays in the conversation's history, so every later
@@ -231,6 +236,9 @@ _IN_A_TOOL_RESULT: Final[dict[str, Spec]] = {
     "content": Items(Fields(_TEXT)),
     # `ToolReferenceBlockParam`
     "tool_name": KEEP,
+    # Not in the reference: where vLLM, and the request profile's entry for tool references, read
+    # the tool's name when an item has no `tool_name` (above).
+    "name": KEEP,
 }
 
 # `tools`, `Tool`: a tool the client defines and runs.
