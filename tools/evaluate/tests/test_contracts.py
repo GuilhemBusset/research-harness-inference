@@ -747,6 +747,17 @@ def test_records_hold_ordinals_labels_and_digests_only() -> None:
             40 - started,
         )
         assert not read.valid_for_qualification
+    # And a cell that left a start with no outcome when its drain ended, one start or all of them.
+    for completed, abandoned in ((38, 1), (0, 0)):
+        open_ended = cell(conversations_completed=completed, conversations_abandoned=abandoned)
+        read = contracts.loads(contracts.dumps(open_ended), CellRecord)
+        assert (read.conversations_started, read.conversations_completed, read.conversations_abandoned) == (
+            40,
+            completed,
+            abandoned,
+        )
+        assert read.conversations_outstanding == 40 - completed - abandoned
+        assert not read.valid_for_qualification
     # A scrape that gave nothing is a sample with no value, not a sample of zero.
     gap = contracts.loads(contracts.dumps(host_sample(value=None)), HostSample)
     assert gap.value is None

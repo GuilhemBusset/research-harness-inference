@@ -920,7 +920,8 @@ class HostSample(Document):
 class CellRecord(Document):
     """What a cell of the plan came to: its window, its conversations and its flags. A flagged
     cell is invalid for qualification and keeps every observation. So does a cell that skipped an
-    opening: a planned conversation it did not start."""
+    opening (a planned conversation it did not start) or left a start with no outcome (a started
+    conversation neither completed nor abandoned when the drain ended)."""
 
     KIND = "cell"
     cell: Ordinal
@@ -948,11 +949,19 @@ class CellRecord(Document):
         return self.conversations_planned - self.conversations_started
 
     @property
+    def conversations_outstanding(self) -> int:
+        """The conversations that started and neither completed nor were abandoned by the end of
+        the drain: starts with no outcome."""
+        return self.conversations_started - self.conversations_completed - self.conversations_abandoned
+
+    @property
     def valid_for_qualification(self) -> bool:
-        """Whether the record lets the cell count: complete, every planned conversation started
-        and no flag. The driver's lag is kept as measured: the record does not hold the tolerance,
-        and whoever writes it flags a lag over the tolerance as `driver_saturation`."""
-        return self.status is CellStatus.COMPLETE and not self.invalid_flags and not self.conversations_skipped
+        """Whether the record lets the cell count: complete, every planned conversation started,
+        every started one completed or abandoned, and no flag. The driver's lag is kept as
+        measured: the record does not hold the tolerance, and whoever writes it flags a lag over
+        the tolerance as `driver_saturation`."""
+        accounted = not self.conversations_skipped and not self.conversations_outstanding
+        return self.status is CellStatus.COMPLETE and not self.invalid_flags and accounted
 
 
 # --- Writing and reading ---------------------------------------------------------------------
