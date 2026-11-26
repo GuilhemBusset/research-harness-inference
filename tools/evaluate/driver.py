@@ -13,10 +13,14 @@ submit a run, to show one or to cancel one. The driver runs every run it admits 
 `controller.execute`, the controller the terminal's `run` uses, in a thread of its own: a client
 that exits, or loses the answer, leaves the run going.
 
-**The socket.** A Unix socket in a directory only the driver's user may enter (0700), itself
+**The socket.** A Unix socket in a directory only the driver's user may enter (0700: made so when
+it is not there, refused and left as it is when it is there and anyone else may enter it), itself
 0600, and every connection's peer, read from the kernel (`SO_PEERCRED`), must be that user: any
 other is refused before its request is read. One connection carries one request and one answer,
-each one JSON object on one line.
+each one JSON object on one line, and each connection is answered in a thread of its own: an
+admission waiting on GitHub or the pool holds up no inspect or cancel. A driver holds its socket
+by a lock beside it, and replaces a socket left at its path only when nothing answers on it: a
+second driver for the same socket, or the same runs, refuses to start (`InUse`).
 
 **The requests** are typed, and nothing else is: `submit` (a `submission` ID and the `run`'s
 fields, `RUN_FIELDS`), `inspect` and `cancel` (a `submission` or a `run_id`). A request is refused
@@ -24,15 +28,19 @@ before anything is dispatched, with a reason of `Refusal`, when it is not one JS
 names another operation (a generic command), when it has a field the operation does not take or
 lacks one it needs, when a value has the wrong type or range, when its booking bound is invalid
 (a managed booking needs `window_ms`: whole minutes, above zero, at most `MAX_WINDOW_MS`), and
-when it carries anything credential-like: a field whose name says so, or a value the public
-hygiene scanner finds anything in. A refused request reaches no service and writes nothing.
+when it carries anything credential-like: a field whose name says so, a value with an
+authorization or key header or a bearer token in it, or a value the public hygiene scanner finds
+anything in. A refused request reaches no service and writes nothing.
 
 **Admission.** A valid `submit` is then checked against the deployment, as `controller.admit`
-checks it, which only reads: the selected pool deployed with room for the hosts and the minutes
-(its `max_instances` and `session_max_hours`), the experiment's destination answering as the
-driver, a writable journal root, and the runtime's own checks. A request that fails is refused
-with the failed checks and nothing of it is kept. One that passes is admitted, in this order,
-before anything outside the driver is touched:
+checks it, which only reads and starts nothing on this host: the selected pool deployed with room
+for the hosts and the minutes (its `max_instances` and `session_max_hours`), the experiment's
+destination answering as the driver (a selected issue read from GitHub: it must exist, be the
+driver's and record the request's workload), the designated session with `--session existing`
+(on the pool, of the selected hosts, with time left), and a writable journal root. A request that
+fails is refused with the failed checks and nothing of it is kept. The runtime's own checks, which
+may prepare the trial image and start its containers, are the run's preflight, after step 2. One
+that passes is admitted, in this order, before anything outside the driver is touched:
 
 1. The submission's record is saved under `<runs>/submissions/`, created whole and never
    replaced: the submission ID, the digest of its fields, the whole typed request, the run ID
@@ -45,16 +53,20 @@ A submission ID maps to one run for good. The same ID with the same fields answe
 and starts nothing new; the same ID with other fields is refused (`submission-conflict`).
 
 **What an answer holds** (`ANSWER_FIELDS`): the submission and run IDs, the step the controller
-reached, the issue's URL once GitHub confirmed its creation, the ending, the exit code, the
-publication, and whether a cancel was asked for. Never the booking, its times, its writer marker,
-the journal or a credential: those stay in the driver and its private run directories.
+reached, the issue's URL once its number is journaled (GitHub confirmed it, in the run or in a
+later `publish --resume`), the ending, the exit code, the publication, and whether a cancel was
+asked for. Never the booking, its times, its writer marker, the journal or a credential: those
+stay in the driver and its private run directories.
 
 **Restart.** Nothing the driver needs lives only in its memory. A started driver reads every
 submission's record: a run with no exit recorded is created if its creation was cut short and
-resumed by its ID. Its `--for` still counts from its admission (`Request.started_s`), and its
-journal may hold one booking at most (`Request.bookings`): a resumed run that finds its booking
-released books no other. A cancel is kept beside the submission's record, so it holds through a
-run's preflight and through a restart.
+resumed by its ID. Its `--for` still counts from its admission (`Request.started_s`), and it makes
+one managed booking at most (`Request.bookings`): a resumed run that finds its booking released
+books no other, and one whose booking was intended but never set out to be written makes it. A
+run in a designated session resumes in that same session, untouched. A driver keeps its root
+until its last run has ended, however it was closed, so the next driver never takes a journal
+one of its runs still writes. A cancel is kept beside the submission's record, so it holds through
+a run's preflight and through a restart.
 
 **Cancel** asks the run to stop: before its issue nothing is created or booked; after, admissions
 stop and the booking it made is released (`controller`, step 4).
@@ -73,6 +85,7 @@ import re
 import secrets
 import signal
 import socket
+import stat
 import struct
 import tempfile
 import threading
@@ -95,6 +108,8 @@ MINUTE_MS = 60_000
 # The longest `--for` a request may carry. The deployed `session_max_hours` bounds it further.
 MAX_WINDOW_MS = 7 * 24 * 60 * MINUTE_MS
 MAX_REQUEST_BYTES = 64 * 1024
+# The connections answered at once: one more is closed unanswered.
+MAX_CONNECTIONS = 16
 MAX_INSTANCES = 1024
 MAX_STUDENTS = 1024
 _SUBMISSION = re.compile(r"[0-9a-f]{32}")
@@ -104,6 +119,13 @@ _TARGET = re.compile(r"[a-z0-9][a-z0-9-]{0,31}")
 # A field whose name says it carries a credential, wherever it is in a request.
 _CREDENTIAL_NAME = re.compile(
     r"token|secret|passw|credential|api[_-]?key|access[_-]?key|private[_-]?key|auth|cookie|signature", re.IGNORECASE
+)
+# Text that carries a credential the way a request to a service does, wherever it is in a request:
+# an authorization or key header, or a bearer token.
+_CREDENTIAL_TEXT = re.compile(
+    r"\b(?:proxy-)?authorization\s*:|\b(?:x-api-key|api-key|x-amz-security-token|cookie|set-cookie)\s*:"
+    r"|\bbearer\s+[A-Za-z0-9._~+/=-]{6,}",
+    re.IGNORECASE,
 )
 _SEED_MAX = 2**31 - 1
 _ISSUE_MAX = 999_999_999
@@ -305,7 +327,11 @@ def parse(raw: bytes, scan: Callable[[str, str], object]) -> Message:
         raise DriverError(Refusal.MALFORMED)
     keys: list[str] = []
     texts = list(_strings(message, keys))
-    if any(_CREDENTIAL_NAME.search(key) for key in keys) or any(scan(text, "evaluate-request.json") for text in texts):
+    if (
+        any(_CREDENTIAL_NAME.search(key) for key in keys)
+        or any(_CREDENTIAL_TEXT.search(text) for text in texts)
+        or any(scan(text, "evaluate-request.json") for text in texts)
+    ):
         raise DriverError(Refusal.CREDENTIAL)
     try:
         op = Op(message.get("op"))
@@ -395,11 +421,54 @@ def request_of(record: Mapping[str, Any], fallback_rate: tuple[float, str]) -> c
 # --- The driver --------------------------------------------------------------------------------
 
 
+class InUse(RuntimeError):
+    """Another driver holds the runs root or the socket: this one starts nothing."""
+
+
+def _locked(path: Path) -> int:
+    """The file's exclusive lock, held by the descriptor returned; `InUse` when another holds it."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        os.close(fd)
+        raise InUse(path.name) from error
+    return fd
+
+
+def _private_directory(folder: Path) -> None:
+    """The socket's directory: made 0700 when it is not there. One that is there is never
+    changed: it must be a directory of this user's that no one else may enter."""
+    with contextlib.suppress(FileExistsError):
+        folder.mkdir(mode=0o700, parents=True)
+    found = folder.lstat()
+    if not stat.S_ISDIR(found.st_mode) or found.st_uid != os.getuid() or found.st_mode & 0o077:
+        raise PermissionError("the socket's directory is not this user's alone")
+
+
+def _answers(socket_path: Path) -> bool:
+    """Whether something listens on the socket. Only a socket that refuses a connection is stale."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        probe.settimeout(2.0)
+        try:
+            probe.connect(str(socket_path))
+        except (ConnectionRefusedError, FileNotFoundError):
+            return False
+        except OSError:
+            return True
+        return True
+
+
 class Driver:
     """The driver of the runs under `root`, listening on `socket_path` for the user `owner` (this
     process's user unless given). `connect` opens the runtime of a scope, as `controller.execute`
     takes it: in the operator's driver, `controller.connect_live`, with the driver's credentials.
-    `on_admitted` runs once a submission's record is saved, before its journal is created."""
+    `on_admitted` runs once a submission's record is saved, before its journal is created.
+
+    One driver holds the root and the socket at a time, each by a lock: the root's from `start`
+    until its last run and its last connection have ended, whatever `close` was told to wait, so
+    that a driver started after it never takes a journal one of its runs still writes; the
+    socket's while it listens, so that a socket another driver answers on is never replaced."""
 
     def __init__(
         self,
@@ -416,64 +485,100 @@ class Driver:
         self.fallback_rate = fallback_rate
         self.on_admitted = on_admitted
         self.submissions = root / SUBMISSIONS
-        self._lock = threading.Lock()
+        # Guards the threads, the locks' descriptors and the admission locks.
+        self._guard = threading.Lock()
+        # One admission at a time for each submission ID; other IDs and other requests go on.
+        self._admitting: dict[str, threading.Lock] = {}
         self._workers: dict[str, threading.Thread] = {}
+        self._handlers: set[threading.Thread] = set()
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         self._stopping = threading.Event()
         self._listener: socket.socket | None = None
         self._server: threading.Thread | None = None
-        self._held: int | None = None
+        self._root_lock: int | None = None
+        self._socket_lock: int | None = None
         self._scan: Callable[[str, str], object] = publisher.hygiene_scan()
 
     # --- Lifetime ---
 
     def start(self) -> None:
-        """Takes the root for this driver alone, resumes every run its submissions left
-        unfinished, then listens."""
-        for folder in (self.root, self.submissions):
-            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        held = os.open(self.root / "driver.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        """Takes the root for this driver alone, then the socket, then resumes every run its
+        submissions left unfinished. `InUse` when another driver holds either: nothing is
+        changed then, of the root, the socket or the other driver."""
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.submissions.mkdir(mode=0o700, exist_ok=True)
+        self._root_lock = _locked(self.root / "driver.lock")
         try:
-            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            os.close(held)
+            self._listener = self._listen()
+            self._server = threading.Thread(target=self._serve, name="evaluate-driver", daemon=True)
+            self._server.start()
+            for record in self._records():
+                self._ensure_running(record)
+        except BaseException:
+            self.close(wait=0)
             raise
-        self._held = held
-        for record in self._records():
-            self._ensure_running(record)
-        self._listener = self._listen()
-        self._server = threading.Thread(target=self._serve, name="evaluate-driver", daemon=True)
-        self._server.start()
 
     def _listen(self) -> socket.socket:
         folder = self.socket_path.parent
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if folder.stat().st_uid != os.getuid():
-            raise PermissionError("the socket's directory is not the driver's user's")
-        folder.chmod(0o700)
-        if self.socket_path.is_socket():
-            # A socket left by a driver of this root that ended: this driver holds the root's lock.
+        _private_directory(folder)
+        self._socket_lock = _locked(folder / f"{self.socket_path.name}.lock")
+        if self.socket_path.exists() or self.socket_path.is_symlink():
+            # Only a socket no driver answers on is replaced; anything else is left as it is.
+            if not self.socket_path.is_socket() or _answers(self.socket_path):
+                raise InUse(self.socket_path.name)
             self.socket_path.unlink()
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        listener.bind(str(self.socket_path))
-        self.socket_path.chmod(0o600)
-        listener.listen(8)
-        listener.settimeout(0.2)
+        try:
+            listener.bind(str(self.socket_path))
+            self.socket_path.chmod(0o600)
+            listener.listen(16)
+            listener.settimeout(0.2)
+        except BaseException:
+            listener.close()
+            raise
         return listener
 
     def close(self, *, wait: float | None = 60.0) -> None:
-        """Stops listening, waits up to `wait` seconds for the runs, and gives the root up. A run
-        still going is resumed by the next driver of the root."""
+        """Stops listening and gives the socket up, then waits up to `wait` seconds for the runs.
+        The root is given up once every run and connection of this driver has ended: a run still
+        going is resumed by the next driver of the root after that. Closing again does nothing more."""
         self._stopping.set()
-        if self._server is not None:
-            self._server.join()
-        if self._listener is not None:
-            self._listener.close()
+        server = self._server
+        if server is not None and server is not threading.current_thread():
+            server.join()
+        with self._guard:
+            listener, self._listener = self._listener, None
+            held, self._socket_lock = self._socket_lock, None
+        if listener is not None:
+            listener.close()
+            # This driver holds the socket's lock: the path is still its own.
             self.socket_path.unlink(missing_ok=True)
-        for worker in list(self._workers.values()):
-            worker.join(wait)
-        if self._held is not None:
-            os.close(self._held)
-            self._held = None
+        if held is not None:
+            os.close(held)
+        for thread in self._busy():
+            thread.join(wait)
+        if not self._busy():
+            self._release_root()
+        else:
+            threading.Thread(target=self._release_root_when_idle, name="evaluate-driver-handover", daemon=True).start()
+
+    def _busy(self) -> list[threading.Thread]:
+        """This driver's runs and connections still going, but the calling thread."""
+        with self._guard:
+            threads = [*self._workers.values(), *self._handlers]
+        return [one for one in threads if one.is_alive() and one is not threading.current_thread()]
+
+    def _release_root_when_idle(self) -> None:
+        while busy := self._busy():
+            for thread in busy:
+                thread.join()
+        self._release_root()
+
+    def _release_root(self) -> None:
+        with self._guard:
+            held, self._root_lock = self._root_lock, None
+        if held is not None:
+            os.close(held)
 
     def serve_forever(self) -> None:
         """Starts the driver and keeps it until the process is interrupted or terminated. The runs
@@ -494,8 +599,9 @@ class Driver:
         return uid
 
     def _serve(self) -> None:
-        """One connection at a time. Whatever ends the loop otherwise than an `Exception` (the
-        process ending) ends the driver's answers, as its process ending would."""
+        """Each connection in a thread of its own, so that an admission waiting on GitHub or the
+        pool never holds up an inspect or a cancel. Whatever ends the loop otherwise than an
+        `Exception` (the process ending) ends the driver's answers, as its process ending would."""
         listener = self._listener
         assert listener is not None
         try:
@@ -504,10 +610,28 @@ class Driver:
                     connection, _ = listener.accept()
                 except TimeoutError:
                     continue
-                with connection:
-                    self._answer(connection)
+                if not self._slots.acquire(blocking=False):
+                    connection.close()  # too many at once: the client sees no answer, and asks again
+                    continue
+                handler = threading.Thread(target=self._connection, args=(connection,), daemon=True)
+                with self._guard:
+                    self._handlers.add(handler)
+                handler.start()
         except BaseException:  # noqa: BLE001 - the driver stops answering, as if its process had ended
             self._stopping.set()
+
+    def _connection(self, connection: socket.socket) -> None:
+        """One connection's request and answer. What ends it otherwise than an `Exception` (the
+        process ending) ends the driver's answers: this connection gets none."""
+        try:
+            with connection:
+                self._answer(connection)
+        except BaseException:  # noqa: BLE001 - the driver stops answering, as if its process had ended
+            self._stopping.set()
+        finally:
+            self._slots.release()
+            with self._guard:
+                self._handlers.discard(threading.current_thread())
 
     def _answer(self, connection: socket.socket) -> None:
         connection.settimeout(5.0)
@@ -539,9 +663,13 @@ class Driver:
 
     # --- Submissions ---
 
+    def _admission(self, submission: str) -> threading.Lock:
+        with self._guard:
+            return self._admitting.setdefault(submission, threading.Lock())
+
     def submit(self, message: Message) -> dict[str, Any]:
         assert message.submission is not None and message.run is not None
-        with self._lock:
+        with self._admission(message.submission):
             path = self.submissions / f"{message.submission}.json"
             wanted = digest(message.run)
             record = _read(path)
@@ -593,18 +721,20 @@ class Driver:
         return (self.submissions / f"{record['submission']}.cancel").exists()
 
     def _ensure_running(self, record: dict[str, Any]) -> None:
-        """Completes the run's creation and dispatches it, unless it ended or is running."""
+        """Completes the run's creation and dispatches it, unless it ended or is running. A driver
+        that is stopping starts no run: the next driver of the root resumes it."""
         submission = record["submission"]
-        worker = self._workers.get(submission)
-        if self._exit_of(record) is not None or (worker is not None and worker.is_alive()):
-            return
-        request = request_of(record, self.fallback_rate)
-        controller.create_run(self.root, request, record["run_id"])
-        worker = threading.Thread(
-            target=self._work, args=(record, request), name=f"run-{record['run_id']}", daemon=True
-        )
-        self._workers[submission] = worker
-        worker.start()
+        with self._guard:
+            worker = self._workers.get(submission)
+            if self._stopping.is_set() or self._exit_of(record) is not None or (worker is not None and worker.is_alive()):
+                return
+            request = request_of(record, self.fallback_rate)
+            controller.create_run(self.root, request, record["run_id"])
+            worker = threading.Thread(
+                target=self._work, args=(record, request), name=f"run-{record['run_id']}", daemon=True
+            )
+            self._workers[submission] = worker
+            worker.start()
 
     def _work(self, record: Mapping[str, Any], request: controller.Request) -> None:
         """One run, by the controller. Its output goes to the run's private log. Whatever ends it
@@ -624,20 +754,24 @@ class Driver:
             return
 
     def shown(self, record: Mapping[str, Any]) -> dict[str, Any]:
-        """What a client is told of a submission's run: allow-listed fields of its status."""
+        """What a client is told of a submission's run: allow-listed fields of its status, and the
+        issue's URL once its number is journaled, which only GitHub's confirmation does, whichever
+        invocation (the run's, or `publish --resume`) got it."""
         run_id = record["run_id"]
         try:
             status = controller.run_status(self.root, run_id)
+            number = controller.saved_state(self.root, run_id).get("issue_number")
         except controller.ControllerError:
-            status = {}
-        worker = self._workers.get(record["submission"])
-        issue = status.get("issue")
+            status, number = {}, None
+        confirmed = isinstance(number, int) and not isinstance(number, bool) and number > 0
+        with self._guard:
+            worker = self._workers.get(record["submission"])
         return {
             "ok": True,
             "submission": record["submission"],
             "run_id": run_id,
             "step": status.get("step", "admitted"),
-            "issue": issue if isinstance(issue, str) else None,
+            "issue": controller.issue_url(record["run"]["repository"], number) if confirmed else None,
             "ending": status.get("ending"),
             "exit": self._exit_of(record),
             "publication": status.get("publication"),

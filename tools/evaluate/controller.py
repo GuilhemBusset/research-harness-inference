@@ -57,9 +57,11 @@ operator changed is left to them.
 A booking that stays in doubt stops the invocation before it books again. An invocation that
 cannot go on (a preflight, GitHub or the issue refused) releases every booking its run holds.
 A run the operator's driver admitted (`evaluate.driver`) is checked first by `admit`, which only
-reads, journaled by `create_run` under the run ID its submission maps to, and then resumed by that
-ID: its `--for` counts from its admission and it books once at most, across the driver's restarts,
-and a cancel the driver keeps (`execute`'s `cancelled`) stops it before its issue as after.
+reads and starts nothing on the driver's host, journaled by `create_run` under the run ID its
+submission maps to, and then resumed by that ID: its `--for` counts from its admission, it makes
+one managed booking at most across the driver's restarts (an intent whose write was never set out
+is not one), a designated session it resumes in is the one it designated first, and a cancel the
+driver keeps (`execute`'s `cancelled`) stops it before its issue as after.
 
 **Scoped lookups.** Everything outside the driver comes through one `Runtime`, opened by `connect`
 for one `Scope`, the selected pool and the experiment's repository, and closed with the invocation:
@@ -138,6 +140,7 @@ if TYPE_CHECKING:
 
     from evaluate import replay, trials
     from evaluate.plan import Plan
+    from rhi_common.records import Session
 
 # How often the watcher of a running batch reads the cancel request and shows progress.
 WATCH_SECONDS = 1.0
@@ -231,9 +234,10 @@ class Request:
 
     A run a driver admitted (`evaluate.driver`) carries two more bounds, which hold across the
     driver's restarts: `started_s`, the time on the runtime's clock at which it was admitted, from
-    which `--for` counts instead of from this invocation's start; and `bookings`, the most bookings
-    its journal may ever hold, so that a resumed invocation that finds its booking released books
-    no other."""
+    which `--for` counts instead of from this invocation's start; and `bookings`, the most managed
+    bookings whose write it may ever set out, so that a resumed invocation that finds its booking
+    released books no other. With `bookings` given, a designated session is the one the run
+    designated first, whenever it resumes."""
 
     suite: str
     profile: Profile
@@ -668,13 +672,31 @@ class _Invocation:
             return True
         return self.journal is not None and (self.journal.directory / CANCEL).exists()
 
-    def booked_out(self) -> bool:
-        """Whether the run's journal already holds every booking the request authorizes."""
+    def _bookings(self) -> list[booking.Journal]:
+        """The booking journals of every booking the run's journal intended, in order."""
         assert self.journal is not None
-        if self.request.bookings is None:
+        return [
+            booking.Journal.load(self._booking_file(one))
+            for one in self.journal.intents
+            if one.action is Action.BOOK and one.status is not IntentStatus.RULED_OUT
+        ]
+
+    def booked_out(self) -> bool:
+        """Whether the run already made every managed booking the request authorizes. A booking
+        counts once its write was set out (its session saved before the write), whatever became
+        of it; an intent whose acquisition never got that far, or a designated session, which
+        writes nothing, does not."""
+        if self.request.bookings is None or self.request.existing:
             return False
-        held = [one for one in self.journal.intents if one.action is Action.BOOK and one.status is not IntentStatus.RULED_OUT]
-        return len(held) >= self.request.bookings
+        written = [one for one in self._bookings() if one.intended is not None]
+        return len(written) >= self.request.bookings
+
+    def first_designated(self) -> Session | None:
+        """The operator's session a driver's run first designated: the one a resumed run of it
+        measures in again, and no other (`book`)."""
+        if self.request.bookings is None or not self.request.existing:
+            return None
+        return next((one.designated for one in self._bookings() if one.designated is not None), None)
 
     def measured(self) -> int:
         assert self.journal is not None
@@ -701,6 +723,13 @@ class _Invocation:
             return [Check.MEASUREMENT]
         if Check.MEASUREMENT in failed:
             return failed
+        return failed + self.deployment_checks()
+
+    def deployment_checks(self) -> list[str]:
+        """The preflight's checks that only read, and start nothing on this host: a writable
+        journal root, the selected pool's deployed limits, and the destination answering as the
+        driver. What a driver checks at admission (`admit`), before the runtime's own checks."""
+        failed: list[str] = []
         try:
             self.root.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryFile(dir=self.root):
@@ -823,6 +852,30 @@ class _Invocation:
         left = 0 if session is None else int((rules.end(session, session_max_hours=sessions.session_max_hours) - now) * 1000)
         return left if left_for is None else min(left, left_for)
 
+    def designable(self) -> booking.Reason | None:
+        """Why the pool's session cannot be designated for this invocation, read as
+        `booking.Capacity.acquire` would designate it, and with nothing written: `None` when it is
+        on the pool, books the selected hosts, and leaves, from its start or now, at least the
+        warm-up and the cleanup before its end, or before `--for` when that comes first."""
+        request, plan = self.request, self.plan
+        try:
+            sessions = self.access.sessions
+            now = self.access.clock()
+            actual = pool_booking.read(sessions.pools.table, request.pool)
+        except (*_UNREAD, ControllerError):
+            return booking.Reason.POOL_STATE_UNREADABLE
+        end = None if actual is None else rules.end(actual, session_max_hours=sessions.session_max_hours)
+        if actual is None or end is None or now >= end:
+            return booking.Reason.SESSION_NOT_FOUND
+        if actual.instances != request.instances:
+            return booking.Reason.SESSION_COUNT_MISMATCH
+        if request.window_ms is not None:
+            end = min(end, self.started + request.window_ms / 1000)
+        least_ms = plan.reserved_ms(plan.cells[0]) + plan.spec.estimates.cleanup_ms
+        if (end - max(now, actual.starts_at)) * 1000 < least_ms:
+            return booking.Reason.WINDOW_TOO_SHORT
+        return None
+
     def _booking_file(self, intent: journals.Intent) -> Path:
         assert self.journal is not None
         return self.journal.directory / str(intent.payload["file"])
@@ -902,6 +955,7 @@ class _Invocation:
         if not self.request.existing:
             left_ms = window_ms if self.deadline is None else (self.deadline - self.access.clock()) * 1000
             minutes = max(0, math.floor(left_ms / MINUTE_MS))
+        earlier = self.first_designated()
         count = sum(one.action is Action.BOOK for one in journal.intents)
         name = f"booking-{count}.json"
         intent = journal.intend(Action.BOOK, {"file": name, "minutes": minutes, "instances": selection.instances})
@@ -910,6 +964,10 @@ class _Invocation:
         self.capacity = booking.Capacity(selection, self.access, saved, until=self._until())
         self.say("progress: booking" + ("" if minutes is None else f" {minutes} min") + ", waiting for the hosts")
         outcome = self.capacity.acquire(minutes=minutes)
+        if outcome.ready and earlier is not None and outcome.session != earlier:
+            # A driver's run resumes in the session it designated first: one the operator
+            # changed or replaced since is theirs, and nothing was written to it.
+            outcome = booking.Outcome(booking.Reason.BOOKING_CHANGED, None, booking.Cleanup.NOT_OWNED)
         journal.confirm(intent.ordinal, {"reason": outcome.reason, "cleanup": outcome.cleanup})
         return outcome
 
@@ -1296,11 +1354,16 @@ def _planned(request: Request) -> Plan:
 
 
 def admit(request: Request, *, connect: Connect, root: Path = journals.DEFAULT_ROOT) -> float:
-    """What a driver checks before it admits a request (`evaluate.driver`): the request's own
-    checks and plan, the runtime bound to its scope, and the whole preflight `execute` starts with,
-    the selected pool's deployed `max_instances` and `session_max_hours` against the hosts and
-    `--for` among it. It only reads: nothing is created, booked or sent. Returns the runtime's
-    clock, from which the admitted run's `--for` counts (`Request.started_s`); a refusal is a
+    """What a driver checks before it admits a request (`evaluate.driver`), with reads alone:
+    nothing is created, booked or sent, and nothing is started on this host (the runtime's own
+    checks, which may prepare the trial image and start its containers, are the run's preflight,
+    once it is journaled). The request's own checks and plan, the runtime bound to its scope, the
+    preflight's checks that only read (`deployment_checks`: the selected pool's deployed
+    `max_instances` and `session_max_hours` against the hosts and `--for`, the destination); a
+    selected experiment issue read from GitHub, which must exist, be the driver's and record the
+    request's workload; and, with `--session existing`, the designated session, which must be on
+    the pool, of the selected hosts, with time left for a batch. Returns the runtime's clock, from
+    which the admitted run's `--for` counts (`Request.started_s`); a refusal is a
     `ControllerError`."""
     plan = _planned(request)
     scope = Scope(request.pool, request.repository, request.instances)
@@ -1308,9 +1371,22 @@ def admit(request: Request, *, connect: Connect, root: Path = journals.DEFAULT_R
         if runtime.scope != scope or runtime.github().repository != scope.repository:
             raise ControllerError(Refusal.SCOPE_MISMATCH.value)
         invocation = _Invocation(request, plan, runtime, root, io.StringIO())
-        failed = invocation.preflight()
+        failed = invocation.deployment_checks()
         if failed:
             raise ControllerError(f"{Refusal.PREFLIGHT_FAILED.value}: {', '.join(failed)}")
+        if request.issue is not None:
+            try:
+                found = invocation.publisher.experiment(request.issue)
+            except PublishError as refused:
+                raise ControllerError(refused.reason.value) from refused
+            workload = plan.workload
+            wanted = (request.suite, request.profile, plan.workload_hash, (workload.input_seed, workload.schedule_seed))
+            if (found.suite, found.profile, found.workload, tuple(found.seeds)) != wanted:
+                raise ControllerError(Refusal.EXPERIMENT_MISMATCH.value)
+        if request.existing:
+            declined = invocation.designable()
+            if declined is not None:
+                raise ControllerError(declined.value)
         return invocation.started
 
 

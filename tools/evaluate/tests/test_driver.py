@@ -6,6 +6,8 @@ Each run goes through `controller.execute` as the terminal's does. No account, n
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import io
 import json
 import os
 import secrets
@@ -13,13 +15,15 @@ import shutil
 import socket
 import stat
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from evaluate import cli, controller
+from evaluate import booking, cli, controller
 from evaluate import driver as served
 from evaluate import journal as journals
 from evaluate.tests import test_controller as lab
@@ -44,16 +48,19 @@ RUN: dict[str, Any] = {
 
 
 class Services:
-    """The fake services behind the driver's `connect`: each scope it opened, and a hook that runs
-    in a runtime's preflight with the count of scopes opened so far."""
+    """The fake services behind the driver's `connect`: each scope it opened, and hooks that run
+    when a scope is opened and in a runtime's preflight, with the count of scopes opened so far."""
 
     def __init__(self, fake: lab.Driver) -> None:
         self.fake, self.scopes = fake, []
+        self.at_connect: Callable[[int], None] | None = None
         self.at_preflight: Callable[[int], None] | None = None
 
     @contextlib.contextmanager
     def __call__(self, scope: controller.Scope) -> Generator[lab.Runtime]:
         self.scopes.append(scope)
+        if self.at_connect is not None:
+            self.at_connect(len(self.scopes))
         yield Hooked(self, scope)
 
 
@@ -221,6 +228,122 @@ def test_a_driver_that_dies_after_releasing_its_booking_does_not_book_again_when
     assert host.counts() == (1, 1, 1)
 
 
+def test_a_restart_before_the_first_booking_write_makes_that_booking_once(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reached = threading.Event()
+
+    def interrupted(_self: booking.Capacity, *, minutes: int | None = None) -> booking.Outcome:
+        reached.set()
+        raise Died
+
+    sid = submission()
+    with monkeypatch.context() as patch:
+        patch.setattr(booking.Capacity, "acquire", interrupted)
+        first = host.start()
+        assert host.call(op="submit", submission=sid, run=RUN)["ok"]
+        assert reached.wait(10)
+        first.close()
+    assert host.counts() == (1, 1, 0)  # the booking was intended, never written
+
+    host.start()
+    assert host.settled(sid)["exit"] == controller.Exit.PASS
+    assert host.counts() == (1, 1, 1)
+
+
+def test_a_run_in_the_operator_s_session_resumes_in_that_session_untouched_after_a_restart(host: Host) -> None:
+    fake = host.services.fake
+    operator = lab.held_by_operator(fake)
+    reached = threading.Event()
+
+    def interrupted(_cell: int) -> None:
+        reached.set()
+        raise Died
+
+    fake.script.before_cell = interrupted
+    first = host.start()
+    sid = submission()
+    assert host.call(op="submit", submission=sid, run={**RUN, "session": "existing", "window_ms": None})["ok"]
+    assert reached.wait(10)
+    first.close()
+
+    fake.script.before_cell = None
+    host.start()
+    assert host.settled(sid)["exit"] == controller.Exit.PASS
+    assert lab.stored(fake.pool) == operator and host.counts() == (1, 1, 0)
+
+
+def test_a_driver_closed_while_its_run_measures_keeps_the_runs_until_it_ends_and_its_result_stands(
+    host: Host,
+) -> None:
+    reached, release = threading.Event(), threading.Event()
+
+    def pause(_cell: int) -> None:
+        if not reached.is_set():
+            reached.set()
+            release.wait(10)
+
+    host.services.fake.script.before_cell = pause
+    old = host.start()
+    sid = submission()
+    assert host.call(op="submit", submission=sid, run=RUN)["ok"]
+    assert reached.wait(10)
+    old.close(wait=0)
+    # Its run still writes its journal: no other driver takes the runs meanwhile.
+    with pytest.raises(served.InUse):
+        host.start()
+    release.set()
+    old.close()
+
+    host.start()
+    assert host.settled(sid)["exit"] == controller.Exit.PASS
+    assert host.counts() == (1, 1, 1)
+
+
+def test_the_issue_a_later_publication_confirmed_is_shown(host: Host) -> None:
+    host.services.fake.github.faults.append(("POST", "unsent"))
+    host.start()
+    sid = submission()
+    run_id = host.call(op="submit", submission=sid, run=RUN)["run_id"]
+    assert host.settled(sid)["issue"] is None
+
+    assert controller.publish_resume(host.runs, run_id, connect=host.services, out=io.StringIO()) == 0
+    (number,) = host.services.fake.github.issues
+    assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
+
+
+def test_a_run_is_inspected_and_cancelled_while_another_submission_waits_on_its_admission(host: Host) -> None:
+    measuring, admitting, release = threading.Event(), threading.Event(), threading.Event()
+
+    def hold_the_batch(_cell: int) -> None:
+        if not measuring.is_set():
+            measuring.set()
+            release.wait(15)
+
+    def hold_the_second_admission(opened: int) -> None:
+        if opened == 3:  # the first run's admission, then its invocation, then this one
+            admitting.set()
+            release.wait(15)
+
+    host.services.fake.script.before_cell = hold_the_batch
+    host.start()
+    first = submission()
+    assert host.call(op="submit", submission=first, run=RUN)["ok"]
+    assert measuring.wait(10)
+    host.services.at_connect = hold_the_second_admission
+    with ThreadPoolExecutor(max_workers=1) as clients:
+        second = clients.submit(host.call, op="submit", submission=submission(), run=RUN)
+        try:
+            assert admitting.wait(10)
+            assert served.call(host.socket, {"op": "inspect", "submission": first}, timeout=2)["running"]
+            reply = served.call(host.socket, {"op": "cancel", "submission": first}, timeout=2)
+            assert reply["ok"] and reply["cancel_requested"]
+        finally:
+            release.set()
+        assert second.result(timeout=30)["ok"]
+    assert host.settled(first)["cancel_requested"]
+
+
 def test_a_cancel_accepted_while_the_run_is_in_its_preflight_holds_and_nothing_is_created_or_booked(
     host: Host,
 ) -> None:
@@ -303,6 +426,10 @@ AWS_KEY = "AKIA" + "ABCDEFGHIJKLMNOP"  # built here, so that the file holds no k
         ),
         ({"op": "submit", "submission": "0" * 32, "run": {**RUN, "github_token": "x"}}, served.Refusal.CREDENTIAL),
         ({"op": "submit", "submission": "0" * 32, "run": {**RUN, "question": AWS_KEY}}, served.Refusal.CREDENTIAL),
+        (
+            {"op": "submit", "submission": "0" * 32, "run": {**RUN, "question": "Authorization: Bearer redacted"}},
+            served.Refusal.CREDENTIAL,
+        ),
         ({"op": "inspect", "submission": "0" * 32, "aws_secret_access_key": "x"}, served.Refusal.CREDENTIAL),
     ],
     ids=[
@@ -316,6 +443,7 @@ AWS_KEY = "AKIA" + "ABCDEFGHIJKLMNOP"  # built here, so that the file holds no k
         "over-the-ceiling",
         "credential-field",
         "credential-value",
+        "authorization-header",
         "credential-in-inspect",
     ],
 )
@@ -340,3 +468,77 @@ def test_a_booking_the_deployed_pool_cannot_hold_is_not_admitted(host: Host, run
     assert answer["refused"] == served.Refusal.NOT_ADMITTED.value
     assert controller.Check.POOL_LIMITS.value in answer["detail"]
     assert "run_id" not in answer and host.admitted() == [] and host.counts() == (0, 0, 0)
+
+
+def not_admitted(host: Host, run: dict[str, Any]) -> None:
+    answer = host.call(op="submit", submission=submission(), run=run)
+    assert answer["refused"] == served.Refusal.NOT_ADMITTED.value and "run_id" not in answer
+    assert host.admitted() == [] and host.services.fake.events.count("book") == 0
+
+
+def test_an_experiment_issue_that_is_not_there_or_records_another_workload_is_not_admitted(host: Host) -> None:
+    host.start()
+    not_admitted(host, {**RUN, "issue": 73})
+    assert host.counts() == (0, 0, 0)
+
+    sid = submission()
+    host.call(op="submit", submission=sid, run=RUN)
+    host.settled(sid)
+    (number,) = host.services.fake.github.issues
+    answer = host.call(op="submit", submission=submission(), run={**RUN, "issue": number, "input_seed": 41})
+    assert answer["refused"] == served.Refusal.NOT_ADMITTED.value and "run_id" not in answer
+    assert len(host.admitted()) == 1 and host.counts() == (1, 1, 1)
+
+
+@pytest.mark.parametrize("operator_hosts", [None, 1], ids=["no-session", "another-host-count"])
+def test_a_designated_session_the_pool_does_not_hold_for_the_hosts_is_not_admitted(
+    host: Host, operator_hosts: int | None
+) -> None:
+    if operator_hosts is not None:
+        fake = host.services.fake
+        session = lab.held_by_operator(fake)
+        fake.pool.table.put_item(Item=dataclasses.replace(session, instances=operator_hosts).to_item())
+    host.start()
+    not_admitted(host, {**RUN, "session": "existing", "window_ms": None})
+    assert host.counts() == (0, 0, 0)
+
+
+def test_the_runtime_s_own_checks_run_only_once_the_submission_is_mapped_and_journaled(host: Host) -> None:
+    # The live runtime's checks prepare the trial image and start its containers.
+    seen: list[tuple[int, int]] = []
+    host.services.at_preflight = lambda _opened: seen.append((len(host.admitted()), host.counts()[0]))
+    host.start()
+    sid = submission()
+    assert host.call(op="submit", submission=sid, run=RUN)["ok"]
+    host.settled(sid)
+    assert seen == [(1, 1)]
+
+
+def test_a_driver_never_takes_the_socket_another_driver_answers_on_and_replaces_a_stale_one(
+    host: Host, tmp_path: Path
+) -> None:
+    host.start()
+    sid = submission()
+    run_id = host.call(op="submit", submission=sid, run=RUN)["run_id"]
+    other = served.Driver(tmp_path / "other-runs", host.socket, connect=host.services)
+    with pytest.raises(served.InUse):
+        other.start()
+    other.close()
+    assert host.call(op="inspect", submission=sid)["run_id"] == run_id
+    host.settled(sid)
+
+    # A socket left at the path with nothing answering on it is the next driver's.
+    host.started[-1].close()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as left:
+        left.bind(str(host.socket))
+    host.start()
+    assert host.call(op="inspect", submission=sid)["run_id"] == run_id
+
+
+def test_a_socket_directory_others_may_enter_is_refused_and_left_as_it_is(host: Host) -> None:
+    host.socket.parent.mkdir(mode=0o700)
+    host.socket.parent.chmod(0o755)
+    with pytest.raises(PermissionError):
+        host.start()
+    assert stat.S_IMODE(host.socket.parent.stat().st_mode) == 0o755
+    assert host.services.scopes == []

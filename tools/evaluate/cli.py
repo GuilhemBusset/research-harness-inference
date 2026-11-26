@@ -458,8 +458,15 @@ def _client(args: argparse.Namespace, example_rate: float, connect: Connect | No
     if args.command == "driver":
         chosen = controller.connect_live if connect is None else connect
         served = driver.Driver(args.runs, socket_path, connect=chosen, fallback_rate=(example_rate, Source.EXAMPLE))
-        print("driver: listening, stop it with Ctrl-C", flush=True)
-        served.serve_forever()
+        print("driver: starting, stop it with Ctrl-C", flush=True)
+        try:
+            served.serve_forever()
+        except driver.InUse:
+            print("refused: another driver holds the socket or the runs", file=sys.stderr)
+            return 2
+        except PermissionError:
+            print("refused: the socket's directory is not this user's alone", file=sys.stderr)
+            return 2
         print("driver: stopped", flush=True)
         return 0
     if args.command == "submit":
