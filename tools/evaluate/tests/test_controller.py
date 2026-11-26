@@ -671,6 +671,65 @@ def test_a_restart_after_the_last_checkpoint_releases_and_comments_without_sendi
     assert ": completed" in body and "`released`" in body
 
 
+def died_before_cleanup(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A whole run whose driver dies as it stops the booking: every cell checkpointed, the booking held."""
+
+    def died(*_args: object) -> None:
+        raise Died
+
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver)
+    return only_run(driver)
+
+
+def test_checkpointed_cells_without_their_manifest_are_no_completed_result(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = died_before_cleanup(driver, monkeypatch)
+    (driver.runs / run_id / phases.MANIFEST).unlink()
+
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+
+    (body,) = comments(driver)
+    assert ": failed" in body and "Reason: `invalid-evidence`" in body and "`released`" in body
+    assert not (driver.runs / run_id / controller.BUNDLE).exists()
+
+
+def test_a_restart_whose_checkpoint_is_damaged_still_stops_the_booking_it_holds(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = died_before_cleanup(driver, monkeypatch)
+    (booked,) = booking_writes(driver)
+    sent = list(driver.sent)
+    files = (driver.runs / run_id).glob("observations/cell-*.jsonl")
+    (observed, *_) = sorted(one for one in files if not one.name.startswith("cell-0-"))  # a measured cell's
+    observed.write_text(observed.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
+
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+
+    stop = stored(driver.pool)
+    assert stop is not None and stop.set_by == booked.set_by and stop.ends_at <= driver.pool.now
+    assert driver.sent == sent
+    (body,) = comments(driver)
+    assert ": failed" in body and "`released`" in body
+
+
+def test_a_booking_written_late_in_the_window_still_ends_by_it(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> None:
+    start, begun = driver.pool.clock(), booking.Capacity._begun
+
+    def slow(self: booking.Capacity, minutes: int | None) -> booking.Reason | None:
+        driver.pool.sleep(35)  # the pool's limits read slowly, after the minutes were counted
+        return begun(self, minutes)
+
+    monkeypatch.setattr(booking.Capacity, "_begun", slow)
+    run(driver, minutes=60)
+
+    (booked,) = booking_writes(driver)[:1]
+    assert booked.ends_at <= start + 3600
+
+
 def test_a_session_the_driver_cannot_make_is_a_preflight_refusal_not_a_miss(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

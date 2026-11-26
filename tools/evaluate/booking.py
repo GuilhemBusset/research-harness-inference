@@ -394,6 +394,11 @@ class Capacity:
     def _booked(self, minutes: int, most: int) -> Reason | None:
         """Books the pool, of which a session may book `most` hosts; why not, when it did not."""
         chosen, journal, now = self.selection, self.journal, self._now()
+        if self.until is not None:
+            # Whole minutes from the time of the write: the record never outlives the invocation.
+            minutes = min(minutes, max(0, (self.until - now) // MINUTE_SECONDS))
+            if minutes * MINUTE_SECONDS < self._reserved:
+                return Reason.WINDOW_TOO_SHORT
         bounds: dict[str, Any] = dict(max_instances=most, session_max_hours=self._hours)
         marker = new_marker()
         try:

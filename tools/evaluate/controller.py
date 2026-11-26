@@ -929,13 +929,17 @@ class _Invocation:
 
     def release(self) -> None:
         """The conditional stop of this invocation's exact booking, recorded on its own. A cancel
-        request stops admissions and waits, never the stop's own retries."""
+        request stops admissions and waits, never the stop's own retries. An invocation refused
+        before it bound a booking (a checkpoint that does not resume, say) still stops every
+        booking its run holds from before."""
         self._cancel_delivered = True
         if self.capacity is not None:
             try:
                 self.cleanup = self.capacity.release()
             except Exception:  # noqa: BLE001 - whatever the stop raised, the booking's end bounds it
                 self.cleanup = booking.Cleanup.UNCONFIRMED
+        else:
+            self.settle_bookings()
         self.status(cleanup=self.cleanup.value)
         self.say(f"cleanup: {self.cleanup.value}")
 
@@ -1029,6 +1033,10 @@ class _Invocation:
             except Exception as error:  # noqa: BLE001 - a report that cannot be written ends the run failed, and is named
                 self.say(f"report: failed, {type(error).__name__}")
                 made, ending, self.reason = None, Ending.FAILED, Reason.DRIVER_ERROR
+            if made is None and ending is Ending.COMPLETED:
+                # A completed run is one its report backs: measured cells with no report are no result.
+                self.say("report: refused, no evidence for the measured cells")
+                ending, self.reason = Ending.FAILED, Reason.INVALID_EVIDENCE
             card = None if made is None else made[0]
             if made is not None:
                 report_paths = [str(made[3] / report.REPORT), str(made[3] / report.SUMMARY)]
@@ -1523,9 +1531,13 @@ def write_bundle(journal: Journal, directory: Path) -> bool:
     millisecond after the booking before it ends, so that the bundle keeps the order and the
     measured durations of every cell, and none of the time between bookings: a week away is no
     week of evidence. False with no evidence; `report.ReportError` (`unreadable-bundle`) when the
-    evidence of a checkpointed attempt cannot be read, so that no report omits a measured cell."""
+    evidence of a checkpointed attempt, or the manifest it was measured under, cannot be read, so
+    that no report omits a measured cell and no measured cell goes without a report."""
+    checkpointed = any(one.status is AttemptStatus.COMPLETE and one.record is not None for one in journal.attempts)
     manifest_file = journal.directory / phases.MANIFEST
     if not manifest_file.exists():
+        if checkpointed:
+            raise report.ReportError(report.Refusal.UNREADABLE_BUNDLE)
         return False
     manifest = loads(manifest_file.read_text(encoding="utf-8"), Manifest)
     bookings: list[tuple[float, list[tuple[journals.Attempt, dict[str, Any], tuple[Document, ...]]]]] = []
