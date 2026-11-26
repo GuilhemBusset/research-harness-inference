@@ -1,0 +1,49 @@
+{
+  "case": {
+    "capacity": 36,
+    "parcels": [
+      {
+        "id": "P01",
+        "weight": 11,
+        "fee": 12
+      },
+      {
+        "id": "P02",
+        "weight": 8,
+        "fee": 7
+      },
+      {
+        "id": "P03",
+        "weight": 7,
+        "fee": 6
+      },
+      {
+        "id": "P04",
+        "weight": 9,
+        "fee": 8
+      },
+      {
+        "id": "P05",
+        "weight": 2,
+        "fee": 11
+      },
+      {
+        "id": "P06",
+        "weight": 7,
+        "fee": 26
+      },
+      {
+        "id": "P07",
+        "weight": 8,
+        "fee": 23
+      },
+      {
+        "id": "P08",
+        "weight": 9,
+        "fee": 7
+      }
+    ],
+    "max_items": 3
+  },
+  "optimum": 61
+}
