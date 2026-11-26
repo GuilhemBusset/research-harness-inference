@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from evaluate import journal as journals
 from evaluate import publisher
 from evaluate.contracts import Harness, Profile, Shape
 from evaluate.journal import Action, IntentStatus, Journal, JournalError
@@ -309,6 +310,43 @@ def test_a_retry_keeps_its_marker_until_the_drivers_record_is_found(
     with Journal.open(tmp_path, journal.run_id) as again:
         (delivery,) = deliveries(again)
         assert (delivery.marker, delivery.result) == (marker, {"kind": "run", "comment": own["id"]})
+
+
+def test_a_saved_creation_survives_a_stop_during_its_recovery(tmp_path: Path, fake: FakeGitHub) -> None:
+    with Journal.create(tmp_path) as journal:
+        fake.down = True  # no login: the creation is saved, unsent
+        with pytest.raises(PublishError):
+            Publisher(GitHub(fake, REPO)).open_experiment(journal, EXPERIMENT)
+    fake.down = False
+    write = journals._write_whole
+
+    def stop_after_the_write(path: Path, text: str) -> None:
+        write(path, text)
+        raise InterruptedError
+
+    with patch.object(journals, "_write_whole", stop_after_the_write), pytest.raises(InterruptedError):
+        resume_publication(tmp_path, journal.run_id, Publisher(GitHub(fake, REPO)))
+    recovered = resume_publication(tmp_path, journal.run_id, Publisher(GitHub(fake, REPO)))
+    assert recovered.issue is not None and list(fake.issues) == [recovered.issue]
+
+
+def test_a_recovered_issue_is_confirmed_only_for_its_experiment(
+    tmp_path: Path, fake: FakeGitHub, driver: Publisher
+) -> None:
+    journal = Journal.create(tmp_path)
+    fake.faults.append(("POST", "lost-then-down"))
+    with pytest.raises(PublishError):
+        driver.open_experiment(journal, EXPERIMENT)
+    ((number, issue),) = fake.issues.items()
+    (creation,) = journal.intents
+    # Edited, before the recovery, into another experiment's record that keeps the marker.
+    issue["body"] = render_issue(replace(EXPERIMENT, seeds=(88,)))[1] + marker_line(creation.marker) + "\n"
+    fake.down = False
+    with pytest.raises(PublishError) as raised:
+        driver.open_experiment(journal, EXPERIMENT)
+    assert raised.value.reason is Refusal.ISSUE_MISMATCH
+    refused_to_book(journal)
+    assert list(fake.issues) == [number]
 
 
 def test_a_cut_response_is_an_answer_lost() -> None:

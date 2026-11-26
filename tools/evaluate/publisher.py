@@ -684,8 +684,7 @@ class Publisher:
         driver = self._driver()
         if payload.get("driver") is None:
             # Saved before the driver was known, so never sent: sent now, as this driver.
-            journal.rule_out(intent.ordinal)
-            intent = journal.intend(Action.CREATE_ISSUE, {**payload, "driver": driver})
+            intent = journal.supersede(intent.ordinal, {**payload, "driver": driver})
             sent_before = False
         elif payload["driver"] != driver:
             raise PublishError(Refusal.DESTINATION_MISMATCH)
@@ -708,6 +707,10 @@ class Publisher:
         record = self._settle(find, send, sent_before=sent_before)
         if record is None or type(record.get("number")) is not int:
             raise PublishError(Refusal.ISSUE_UNCONFIRMED)
+        if _identity_line(str(payload.get("identity"))) not in str(record.get("body")).splitlines():
+            # The driver's record of this creation no longer describes this experiment: it stays
+            # in doubt, and nothing is booked against it.
+            raise PublishError(Refusal.ISSUE_MISMATCH)
         journal.confirm(intent.ordinal, {"number": record["number"]})
         return record["number"]
 

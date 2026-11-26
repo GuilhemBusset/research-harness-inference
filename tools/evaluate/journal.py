@@ -643,6 +643,23 @@ class Journal:
         """Saves that the intent's action did not happen: the actual record does not show it."""
         return self._settle(ordinal, IntentStatus.RULED_OUT, None)
 
+    def supersede(self, ordinal: int, payload: Mapping[str, object]) -> Intent:
+        """Rules out a pending intent that was never sent and saves its replacement, with a new
+        marker, in one write: a stop between the two never leaves the action without an intent."""
+        if type(ordinal) is not int or not 0 <= ordinal < len(self.intents):
+            raise JournalError(Refusal.INTENT_NOT_PENDING)
+        old = self.intents[ordinal]
+        if old.status is not IntentStatus.PENDING:
+            raise JournalError(Refusal.INTENT_NOT_PENDING)
+        if old.action is Action.CREATE_ISSUE and self.issue_number is not None:
+            raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
+        ruled = dataclasses.replace(old, status=IntentStatus.RULED_OUT, result_json=None)
+        ordinal_after = len(self.intents)
+        marker = f"{MARKER_PREFIX}{self.run_id}/{ordinal_after}"
+        intent = Intent(ordinal_after, old.action, marker, IntentStatus.PENDING, _private(payload), None)
+        self._transition(intents=(*self.intents[:ordinal], ruled, *self.intents[ordinal + 1 :], intent))
+        return intent
+
     def adopt_issue(self, number: int, record: Mapping[str, object] | None = None) -> None:
         """Journals the number of an issue the operator named, and `record`, what the driver
         checked about it: nothing is created for the run."""
