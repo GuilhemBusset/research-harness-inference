@@ -16,8 +16,10 @@ is the production-planning task: its three instances, the files a trial's worksp
 kept outside every workspace, the reference fix and the grader that reads the plan and the table
 a run wrote. `evaluate.course.revision` is the debug-and-revise task: three broken solvers, the
 two prompts of its conversation, and, kept outside, the reference repairs, the original and changed
-cases and the grader that reads what the final program wrote on each. Both graders need the
-standard library only.
+cases and the grader that reads what the final program wrote on each. `evaluate.course.analysis`
+is the parallel-analysis task: its three paired-data instances and, kept outside every workspace,
+the reference solution and the grader of the two series, their figure, the named comparison and
+the spans of the workers the run delegated to. The three graders need the standard library only.
 
 `evaluate.plan` expands a suite (`suites/`) into the ordered workload of a profile and the bookings
 that hold it, offline. `evaluate.cli` is the command line, which `scripts/evaluate.sh` runs.
