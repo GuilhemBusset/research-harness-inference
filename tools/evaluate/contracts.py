@@ -749,6 +749,12 @@ def _identity(part: str, value: Record) -> str:
     return _sha256(_canonical({"identity": part, "schema_version": SCHEMA_VERSION, "of": value.to_json()}))
 
 
+def workload_identity(workload: Workload) -> str:
+    """The identity of a planned workload, from the workload alone: what `plan` prints before a
+    run exists, and what the manifest of every run of that plan has as its `workload_id`."""
+    return _identity("workload", workload)
+
+
 @dataclass(frozen=True, kw_only=True)
 class Manifest(Document):
     """What a run was: the plan, the settings requested for it, what ran it and what it observed
@@ -763,7 +769,7 @@ class Manifest(Document):
     @property
     def workload_id(self) -> str:
         """The same for every treatment and run of one plan."""
-        return _identity("workload", self.workload)
+        return workload_identity(self.workload)
 
     @property
     def treatment_id(self) -> str:
