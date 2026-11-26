@@ -1,0 +1,148 @@
+{
+  "request": {
+    "method": "POST",
+    "path": "/v1/messages?beta=true",
+    "headers": {
+      "host": "gateway.example.com",
+      "content-type": "application/json",
+      "user-agent": "rhi-capture-recorder",
+      "anthropic-version": "2023-06-01"
+    },
+    "body": "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":32000,\"system\":[{\"type\":\"text\",\"text\":\"You are a coding assistant. Answer briefly.\"}],\"tools\":[{\"name\":\"Read\",\"description\":\"Read a file of the working directory.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"file_path\":{\"type\":\"string\"}},\"required\":[\"file_path\"]}},{\"name\":\"ToolSearch\",\"description\":\"Find the deferred tools that match a query, so that they can be called.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"max_results\":{\"type\":\"number\"}},\"required\":[\"query\"]}},{\"name\":\"mcp__notes__list_notes\",\"description\":\"List the titles of the notes.\",\"input_schema\":{\"type\":\"object\",\"properties\":{}},\"defer_loading\":true},{\"name\":\"mcp__notes__read_note\",\"description\":\"Read one note by its title.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}},\"required\":[\"title\"]},\"defer_loading\":true}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"Read the note titled plan with the notes server.\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"I will look for the notes tools.\"},{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"ToolSearch\",\"input\":{\"query\":\"notes\",\"max_results\":5}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_01\",\"content\":[{\"type\":\"tool_reference\",\"tool_name\":\"mcp__notes__list_notes\"},{\"type\":\"tool_reference\",\"tool_name\":\"mcp__notes__read_note\"}]}]}]}"
+  },
+  "profile": {
+    "request_profile": [
+      "tool_reference_as_text"
+    ]
+  },
+  "forward": {
+    "model": "coursework",
+    "max_tokens": 32000,
+    "system": [
+      {
+        "type": "text",
+        "text": "You are a coding assistant. Answer briefly."
+      }
+    ],
+    "tools": [
+      {
+        "name": "Read",
+        "description": "Read a file of the working directory.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "file_path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_path"
+          ]
+        }
+      },
+      {
+        "name": "ToolSearch",
+        "description": "Find the deferred tools that match a query, so that they can be called.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string"
+            },
+            "max_results": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "mcp__notes__list_notes",
+        "description": "List the titles of the notes.",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        },
+        "defer_loading": true
+      },
+      {
+        "name": "mcp__notes__read_note",
+        "description": "Read one note by its title.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "title"
+          ]
+        },
+        "defer_loading": true
+      }
+    ],
+    "messages": [
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Read the note titled plan with the notes server."
+          }
+        ]
+      },
+      {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "text",
+            "text": "I will look for the notes tools."
+          },
+          {
+            "type": "tool_use",
+            "id": "toolu_01",
+            "name": "ToolSearch",
+            "input": {
+              "query": "notes",
+              "max_results": 5
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "toolu_01",
+            "content": [
+              {
+                "type": "text",
+                "text": "[tool reference: mcp__notes__list_notes]"
+              },
+              {
+                "type": "text",
+                "text": "[tool reference: mcp__notes__read_note]"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "answer": {
+    "status": 200,
+    "headers": {
+      "content-length": "292",
+      "content-type": "application/json"
+    },
+    "body": "{\"id\":\"msg_7a2e4c9d1f3b4e6a8c0d2b15\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"coursework\",\"content\":[{\"type\":\"tool_use\",\"id\":\"toolu_02\",\"name\":\"mcp__notes__read_note\",\"input\":{\"title\":\"plan\"}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":412,\"output_tokens\":34}}"
+  },
+  "usage": {
+    "input_tokens": 412,
+    "output_tokens": 34
+  }
+}

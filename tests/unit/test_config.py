@@ -650,7 +650,12 @@ def test_the_example_coursework_pool() -> None:
     assert (coursework.tool_call_parser, coursework.reasoning_parser) == ("qwen3_coder", "qwen3")
     assert coursework.trust_remote_code is False
     # The request profile of section 6.2, step 4, and the effort mapping of section 17.
-    assert coursework.request_profile == ("reasoning_effort", "system_in_place", "document_as_text")
+    assert coursework.request_profile == (
+        "reasoning_effort",
+        "system_in_place",
+        "document_as_text",
+        "tool_reference_as_text",
+    )
     assert coursework.reasoning_effort == {
         "low": "low",
         "medium": "medium",

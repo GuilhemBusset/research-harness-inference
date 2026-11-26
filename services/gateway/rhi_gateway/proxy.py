@@ -59,6 +59,14 @@ ends:
   on a stream that has started, the stream ends with the error event of its wire format for that
   cause, and nothing follows it. None of the engine's own answer, its body, its headers or its
   error events, is sent in either case;
+- **the engine refuses a prompt too long**: an answer of status 400 whose error message contains
+  "maximum context length" is the engine refusing a prompt longer than the pool's context (vLLM's
+  words; on the Messages route it gives no `param`, so its words are the only mark). The client is
+  answered 400 with the cause `context_length_exceeded`, whose sentence begins with the words of
+  Anthropic's own error for it, so that Claude Code compacts the session and sends the turn again
+  instead of retrying, unchanged, a 502 it takes for a passing failure. Only the body of a 400 is
+  read, within the time limit, and only to choose the cause; none of it is sent. Any other answer
+  that is not a success is `engine_error` at once, its body unread;
 - **the time limit**: a request may run `longest_request_seconds` at most, 1,800 by default
   (section 17), counted from the moment it is forwarded. Every wait on the engine, and every
   write of a stream to the client, races that deadline, and a deadline reached wins over an
@@ -162,6 +170,10 @@ _TOKEN_COUNT_FIELD = "input_tokens"
 
 # The names of the events that report an engine's failure, in the three formats.
 FAILURE_EVENTS = frozenset({"error", "response.failed"})
+
+# The engine's refusal of a prompt longer than its context: a 400 whose error message has these words.
+REFUSAL_STATUS = 400
+CONTEXT_LENGTH_WORDS = "maximum context length"
 
 # The status answered to a client that left before its answer: never read, it is what a log shows.
 CLIENT_LEFT_STATUS = 499
@@ -713,6 +725,22 @@ def _is_stream(content_type: str) -> bool:
     return content_type.split(";", 1)[0].strip().lower() == STREAM_TYPE
 
 
+def _cause_of_refusal(body: bytes) -> Cause:
+    """The cause of an engine's 400: a prompt too long, by its error message's words, else `engine_error`.
+
+    Both of vLLM's shapes, Anthropic's and OpenAI's, hold the message at `error.message`.
+    """
+    try:
+        answer = json.loads(body)
+    except (ValueError, RecursionError):
+        return Cause.ENGINE_ERROR
+    error = answer.get("error") if isinstance(answer, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if isinstance(message, str) and CONTEXT_LENGTH_WORDS in message:
+        return Cause.CONTEXT_LENGTH_EXCEEDED
+    return Cause.ENGINE_ERROR
+
+
 def _error_answer(cause: Cause, wire_format: WireFormat) -> Response:
     telemetry.note_cause(cause)
     answer = render_json(cause, wire_format)
@@ -806,6 +834,13 @@ class Proxy:
         try:
             try:
                 response = await ends.race(self._send(route, forwarded, affinity))
+                if response.status_code == REFUSAL_STATUS:
+                    # Read only to choose the cause: none of the engine's answer reaches the client.
+                    refusal = bytearray()
+                    chunks = response.aiter_bytes()
+                    while (chunk := await ends.race(_next_chunk(chunks))) is not None:
+                        refusal += chunk
+                    return _error_answer(_cause_of_refusal(bytes(refusal)), wire_format)
                 if not response.is_success:
                     # The engine failed: none of its answer reaches the client.
                     return _error_answer(Cause.ENGINE_ERROR, wire_format)

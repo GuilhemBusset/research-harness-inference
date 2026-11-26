@@ -355,6 +355,18 @@ def test_what_the_profile_rewrites_is_kept() -> None:
     assert got["messages"] == sent["messages"]
 
 
+@pytest.mark.parametrize("body_filter", [FILTER, COUNT_FILTER], ids=["messages", "count_tokens"])
+def test_only_a_tool_reference_in_a_tool_result_keeps_a_name(body_filter: BodyFilter) -> None:
+    text = {"type": "text", "text": "One match"}
+    references = [{"type": "tool_reference", "tool_name": "Read"}, {"type": "tool_reference", "name": "Write"}]
+
+    sent = request(tool_result({**text, "name": "display"}, {**IMAGE, "name": "plot"}, *references))
+
+    got = forwarded(sent, body_filter)
+
+    assert got["messages"][0]["content"][0]["content"] == [text, IMAGE, *references]
+
+
 def test_token_counting_takes_the_same_fields_without_those_of_generation() -> None:
     sent = {**claude_code_request(), "stop_sequences": ["END"], "temperature": 0.2, "top_p": 0.9, "top_k": 40}
 
