@@ -36,6 +36,7 @@ from implement_loop.state import RunStore
 from implement_loop.supervisor import Outcome
 from implement_loop.workspace import Workspace
 from test_live import ANSWERS, FAKE, RecordingMeter, StubWorkspace
+from test_temp_repo import traced
 
 
 def _bubblewrap_works() -> bool:
@@ -674,13 +675,14 @@ class EngineGitTests(SandboxCase):
 
     def test_what_the_engine_adds_to_its_environment(self):
         self.assertEqual(self.pinned, {
-            "GIT_NO_LAZY_FETCH": "1", "GIT_CONFIG_COUNT": "3",
+            "GIT_NO_LAZY_FETCH": "1", "GIT_CONFIG_COUNT": "4",
             "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": str(self.tmp / "no-hooks"),
             "GIT_CONFIG_KEY_1": "core.fsmonitor", "GIT_CONFIG_VALUE_1": "false",
-            "GIT_CONFIG_KEY_2": "protocol.ext.allow", "GIT_CONFIG_VALUE_2": "never"})
+            "GIT_CONFIG_KEY_2": "protocol.ext.allow", "GIT_CONFIG_VALUE_2": "never",
+            "GIT_CONFIG_KEY_3": "maintenance.auto", "GIT_CONFIG_VALUE_3": "false"})
         self.assertEqual(list((self.tmp / "no-hooks").iterdir()), [], "an empty directory of its own")
         kept = sandbox.engine_git_env({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.name"}, self.tmp / "no-hooks")
-        self.assertEqual((kept["GIT_CONFIG_COUNT"], kept["GIT_CONFIG_KEY_1"]), ("4", "core.hooksPath"))
+        self.assertEqual((kept["GIT_CONFIG_COUNT"], kept["GIT_CONFIG_KEY_1"]), ("5", "core.hooksPath"))
         self.assertNotIn("GIT_CONFIG_KEY_0", kept, "what the launching shell configured stays")
 
     def test_without_it_git_runs_the_worktrees_own_hooks(self):
@@ -730,6 +732,30 @@ class EngineGitTests(SandboxCase):
                 self.ws.index_entries(self.wt)   # what the engine reads when the call ends
                 self.ws.uncommitted(self.wt)
             self.assertFalse(self.ran.exists(), "the engine's git did not start it")
+
+    def test_the_engines_git_starts_no_background_maintenance(self):
+        # The repository asks for it, as a clone does by default (the test repositories turn it
+        # off, `helpers.NO_MAINTENANCE`). The engine's fetch, commit and merge start none: from git
+        # 2.56 it prunes a worktree that a `git worktree add` right after a fetch is still creating.
+        git("config", "maintenance.auto", "true", cwd=self.repo.work)
+        seed = self.repo.tmp / "seed"
+        (seed / "other.txt").write_text("y\n")
+        git("add", "other.txt", cwd=seed)
+        git("commit", "-q", "-m", "main moves", cwd=seed)
+        git("push", "-q", "origin", "HEAD:main", cwd=seed)
+        (self.wt / "change.txt").write_text("x\n")
+        with mock.patch.dict(os.environ, self.pinned), traced(self.repo) as started:
+            self.assertTrue(self.ws.commit_all(self.wt, "Build #7", "implementation", 7))
+            self.assertEqual(self.ws.update(self.wt).status, "merged")   # a fetch, then a merge
+            self.ws.issue_worktree(8, "feat/eight")                       # a fetch, then a worktree
+        self.assertEqual(started, [])
+
+        # Last, since what it starts may still be at work: without the engine's setting a commit
+        # starts maintenance, and the trace shows it.
+        (self.wt / "more.txt").write_text("z\n")
+        with traced(self.repo) as started:
+            self.assertTrue(self.ws.commit_all(self.wt, "Build #7", "implementation", 7))
+        self.assertTrue(started)
 
 
 # ---------------------------------------------------------------- the real thing

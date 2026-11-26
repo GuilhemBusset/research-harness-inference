@@ -143,14 +143,19 @@ def cache_dirs(env: Mapping[str, str] | None) -> list[Path]:
 
 
 # What the engine's own git commands run with, whatever a repository's or a worktree's configuration
-# says: no file-system monitor (a command git starts when it reads an index), no `ext::` transport.
-ENGINE_GIT_CONFIG = (("core.fsmonitor", "false"), ("protocol.ext.allow", "never"))
+# says: no file-system monitor (a command git starts when it reads an index), no `ext::` transport,
+# no background maintenance. A fetch, a commit and a merge each end by starting `git maintenance run
+# --auto`, which detaches and is still at work while the engine's next command runs; from git 2.56
+# it prunes worktrees, and that prune deletes the entry of a worktree `git worktree add` is still
+# creating, so the `add` dies. The engine adds a worktree right after a fetch.
+ENGINE_GIT_CONFIG = (("core.fsmonitor", "false"), ("protocol.ext.allow", "never"), ("maintenance.auto", "false"))
 
 
 def engine_git_env(env: Mapping[str, str], no_hooks_dir: Path) -> dict[str, str]:
     """What an engine run adds to its own environment before it starts any git process (its own
     commands and `ship.sh`): git then takes its hooks from `no_hooks_dir`, an empty directory the
-    engine owns, starts no file-system monitor and fetches nothing lazily.
+    engine owns, starts no file-system monitor and no background maintenance, and fetches nothing
+    lazily.
 
     The engine runs outside the sandbox, in worktrees and git directories an agent wrote to. With
     `core.hooksPath` set to `.githooks` in a clone, git would run the hooks of the worktree a
