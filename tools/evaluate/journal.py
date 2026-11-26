@@ -46,8 +46,14 @@ run. After it, `confirm` saves what came back: the issue's number, the exact boo
 comment. An intent that is still pending after a restart is an action that may or may not have
 happened: the driver looks for its marker in the actual record, then confirms it or rules it out
 (`rule_out`). One intent of each action is pending at most, so a retry targets the same record.
+A delivery that has to wait for the pending one is saved with `queue`, its marker made then: it
+is not sent, and `dequeue` makes it the pending one once no other delivery is, in the order they
+were queued. A comment that is ready while the one before it is still in doubt is saved whole, so
+that a restart delivers both, in order. Only a delivery is queued: a run has one issue, and once
+its number is journaled no creation can replace it.
 A booking or a delivery is refused until the issue number is journaled. `adopt_issue` journals the
-number of an issue the operator named. What an intent saved does not change afterwards: its
+number of an issue the operator named, with what the driver checked about it (private, like a
+payload). What an intent saved does not change afterwards: its
 payload and its result are given as copies, and a change to one changes nothing in the journal.
 
 `pending` is the one thing a restart does first, a member of `Step` and the saved intent it is
@@ -140,6 +146,7 @@ class Refusal(StrEnum):
     ISSUE_ALREADY_JOURNALED = "issue-already-journaled"
     ACTION_PENDING = "action-pending"
     INTENT_NOT_PENDING = "intent-not-pending"
+    INTENT_NOT_QUEUED = "intent-not-queued"
     ATTEMPT_RUNNING = "attempt-running"
     ATTEMPT_NOT_RUNNING = "attempt-not-running"
     CELL_ALREADY_MEASURED = "cell-already-measured"
@@ -168,6 +175,8 @@ class Action(StrEnum):
 class IntentStatus(StrEnum):
     # Saved, and not known to have happened or not.
     PENDING = "pending"
+    # Saved, and not sent: it waits for the pending one of its action to settle.
+    QUEUED = "queued"
     CONFIRMED = "confirmed"
     # Looked for in the actual record and not there: it did not happen.
     RULED_OUT = "ruled-out"
@@ -269,6 +278,8 @@ class _State:
     issue_number: int | None = None
     intents: tuple[Intent, ...] = ()
     attempts: tuple[Attempt, ...] = ()
+    # What the driver saved about an issue it adopted, as the text of a JSON object.
+    issue_record: str | None = None
 
 
 # --- The files -------------------------------------------------------------------------------
@@ -377,6 +388,7 @@ def _encode(state: _State) -> str:
         "schema_version": SCHEMA_VERSION,
         "run_id": state.run_id,
         "issue_number": state.issue_number,
+        "issue_record": None if state.issue_record is None else json.loads(state.issue_record),
         "intents": [
             {
                 "ordinal": intent.ordinal,
@@ -408,7 +420,14 @@ def _decode(text: str) -> _State:
             record = None if item["record"] is None else contracts.loads(json.dumps(item["record"]), CellRecord)
             read: dict[str, Any] = {**item, "status": AttemptStatus(item["status"]), "record": record}
             attempts.append(Attempt(**read))
-        return _State(saved["run_id"], saved["issue_number"], tuple(intents), tuple(attempts))
+        record = saved.get("issue_record")
+        return _State(
+            run_id=saved["run_id"],
+            issue_number=saved["issue_number"],
+            intents=tuple(intents),
+            attempts=tuple(attempts),
+            issue_record=None if record is None else _private(record),
+        )
     except (KeyError, TypeError, ValueError, JournalError) as error:  # a `ContractError` is a `ValueError`
         raise JournalError(Refusal.JOURNAL_UNREADABLE) from error
 
@@ -509,6 +528,12 @@ class Journal:
         return self._state.issue_number
 
     @property
+    def issue_record(self) -> dict[str, Any] | None:
+        """What `adopt_issue` saved about the issue it journaled, as a new copy."""
+        record = self._state.issue_record
+        return None if record is None else json.loads(record)
+
+    @property
     def intents(self) -> tuple[Intent, ...]:
         return self._state.intents
 
@@ -550,19 +575,47 @@ class Journal:
 
     # --- Intents ---
 
-    def intend(self, action: Action, payload: Mapping[str, object]) -> Intent:
-        """Saves that `action` is about to be taken with `payload`, and gives its marker."""
-        if any(intent.action is action and intent.status is IntentStatus.PENDING for intent in self.intents):
-            raise JournalError(Refusal.ACTION_PENDING)
+    def _new_intent(self, action: Action, payload: Mapping[str, object], status: IntentStatus) -> Intent:
         if action is Action.CREATE_ISSUE and self.issue_number is not None:
             raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
         if action is not Action.CREATE_ISSUE and self.issue_number is None:
             raise JournalError(Refusal.ISSUE_NOT_JOURNALED)
         ordinal = len(self.intents)
         marker = f"{MARKER_PREFIX}{self.run_id}/{ordinal}"
-        intent = Intent(ordinal, action, marker, IntentStatus.PENDING, _private(payload), None)
+        intent = Intent(ordinal, action, marker, status, _private(payload), None)
         self._transition(intents=(*self.intents, intent))
         return intent
+
+    def _refuse_pending(self, action: Action) -> None:
+        if any(intent.action is action and intent.status is IntentStatus.PENDING for intent in self.intents):
+            raise JournalError(Refusal.ACTION_PENDING)
+
+    def intend(self, action: Action, payload: Mapping[str, object]) -> Intent:
+        """Saves that `action` is about to be taken with `payload`, and gives its marker."""
+        self._refuse_pending(action)
+        return self._new_intent(action, payload, IntentStatus.PENDING)
+
+    def queue(self, action: Action, payload: Mapping[str, object]) -> Intent:
+        """Saves `payload` and its marker for a delivery that is not sent yet: it waits behind
+        the pending delivery, whether or not there is one, until `dequeue`. Nothing else is
+        queued: an issue or a booking is one intent at a time."""
+        if action is not Action.DELIVER:
+            raise JournalError(Refusal.INVALID_VALUE)
+        return self._new_intent(action, payload, IntentStatus.QUEUED)
+
+    def dequeue(self, ordinal: int) -> Intent:
+        """Makes a queued intent the pending one of its action, with the marker it was queued
+        with. The first queued of its action goes first."""
+        if type(ordinal) is not int or not 0 <= ordinal < len(self.intents):
+            raise JournalError(Refusal.INTENT_NOT_QUEUED)
+        queued = self.intents[ordinal]
+        first = next(one for one in self.intents if one.action is queued.action and one.status is queued.status)
+        if queued.status is not IntentStatus.QUEUED or first.ordinal != ordinal:
+            raise JournalError(Refusal.INTENT_NOT_QUEUED)
+        self._refuse_pending(queued.action)
+        pending = dataclasses.replace(queued, status=IntentStatus.PENDING)
+        self._transition(intents=(*self.intents[:ordinal], pending, *self.intents[ordinal + 1 :]))
+        return pending
 
     def _settle(self, ordinal: int, status: IntentStatus, result: str | None, **changes: Any) -> Intent:
         if type(ordinal) is not int or not 0 <= ordinal < len(self.intents):
@@ -580,6 +633,8 @@ class Journal:
         saved = _private(result)
         known = type(ordinal) is int and 0 <= ordinal < len(self.intents)
         if known and self.intents[ordinal].action is Action.CREATE_ISSUE:
+            if self.issue_number is not None:
+                raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
             number = _whole_number(json.loads(saved).get("number"), 1, contracts.MAX_COUNT)
             return self._settle(ordinal, IntentStatus.CONFIRMED, saved, issue_number=number)
         return self._settle(ordinal, IntentStatus.CONFIRMED, saved)
@@ -588,13 +643,32 @@ class Journal:
         """Saves that the intent's action did not happen: the actual record does not show it."""
         return self._settle(ordinal, IntentStatus.RULED_OUT, None)
 
-    def adopt_issue(self, number: int) -> None:
-        """Journals the number of an issue the operator named: nothing is created for the run."""
+    def supersede(self, ordinal: int, payload: Mapping[str, object]) -> Intent:
+        """Rules out a pending intent that was never sent and saves its replacement, with a new
+        marker, in one write: a stop between the two never leaves the action without an intent."""
+        if type(ordinal) is not int or not 0 <= ordinal < len(self.intents):
+            raise JournalError(Refusal.INTENT_NOT_PENDING)
+        old = self.intents[ordinal]
+        if old.status is not IntentStatus.PENDING:
+            raise JournalError(Refusal.INTENT_NOT_PENDING)
+        if old.action is Action.CREATE_ISSUE and self.issue_number is not None:
+            raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
+        ruled = dataclasses.replace(old, status=IntentStatus.RULED_OUT, result_json=None)
+        ordinal_after = len(self.intents)
+        marker = f"{MARKER_PREFIX}{self.run_id}/{ordinal_after}"
+        intent = Intent(ordinal_after, old.action, marker, IntentStatus.PENDING, _private(payload), None)
+        self._transition(intents=(*self.intents[:ordinal], ruled, *self.intents[ordinal + 1 :], intent))
+        return intent
+
+    def adopt_issue(self, number: int, record: Mapping[str, object] | None = None) -> None:
+        """Journals the number of an issue the operator named, and `record`, what the driver
+        checked about it: nothing is created for the run."""
         if self.issue_number is not None:
             raise JournalError(Refusal.ISSUE_ALREADY_JOURNALED)
         if self.pending().step is Step.RECONCILE_ISSUE:
             raise JournalError(Refusal.ACTION_PENDING)
-        self._transition(issue_number=_whole_number(number, 1, contracts.MAX_COUNT))
+        saved = None if record is None else _private(record)
+        self._transition(issue_number=_whole_number(number, 1, contracts.MAX_COUNT), issue_record=saved)
 
     # --- Cells ---
 

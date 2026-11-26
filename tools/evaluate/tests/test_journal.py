@@ -510,6 +510,47 @@ def test_the_issue_number_is_journaled_before_a_booking_or_a_delivery(tmp_path: 
     assert again.intents[booking.ordinal].result == RESULTS[Action.BOOK]  # the exact booking returned
 
 
+def test_a_queued_delivery_waits_behind_the_pending_one_with_its_marker(tmp_path: Path) -> None:
+    journal = Journal.create(tmp_path)
+    journal.adopt_issue(ISSUE)
+    first = journal.intend(Action.DELIVER, PAYLOADS[Action.DELIVER])
+    second = journal.queue(Action.DELIVER, {"body": "Comparison finished."})
+    third = journal.queue(Action.DELIVER, {"body": "A later note."})
+    assert journal.pending() == Pending(Step.RECONCILE_DELIVERY, first)  # the queued ones are not in doubt
+    with refused(Refusal.ACTION_PENDING):
+        journal.dequeue(second.ordinal)
+
+    again = restart(journal, tmp_path)
+    assert again.intents[second.ordinal] == second
+    again.confirm(first.ordinal, RESULTS[Action.DELIVER])
+    with refused(Refusal.INTENT_NOT_QUEUED):  # in the order they were queued
+        again.dequeue(third.ordinal)
+    sent = again.dequeue(second.ordinal)
+    assert (sent.status, sent.marker, sent.payload) == (IntentStatus.PENDING, second.marker, second.payload)
+    assert again.pending() == Pending(Step.RECONCILE_DELIVERY, sent)
+
+
+def test_only_a_delivery_is_queued_so_the_runs_issue_stays_one(tmp_path: Path) -> None:
+    journal = Journal.create(tmp_path)
+    creation = journal.intend(Action.CREATE_ISSUE, PAYLOADS[Action.CREATE_ISSUE])
+    with refused(Refusal.INVALID_VALUE):
+        journal.queue(Action.CREATE_ISSUE, PAYLOADS[Action.CREATE_ISSUE])
+    journal.confirm(creation.ordinal, RESULTS[Action.CREATE_ISSUE])
+    with refused(Refusal.INVALID_VALUE):
+        journal.queue(Action.BOOK, PAYLOADS[Action.BOOK])
+    assert journal.issue_number == RESULTS[Action.CREATE_ISSUE]["number"]
+
+
+def test_an_adopted_issue_keeps_what_the_driver_checked_about_it(tmp_path: Path) -> None:
+    journal = Journal.create(tmp_path)
+    journal.adopt_issue(ISSUE, {"identity": "sha256:" + "a" * 64})
+    record = journal.issue_record
+    assert record is not None
+    record["identity"] = "changed"  # a copy: the journal keeps what it saved
+    again = restart(journal, tmp_path)
+    assert (again.issue_number, again.issue_record) == (ISSUE, {"identity": "sha256:" + "a" * 64})
+
+
 def test_what_an_intent_saved_does_not_change_with_what_it_gave(tmp_path: Path) -> None:
     journal = Journal.create(tmp_path)
     journal.adopt_issue(ISSUE)
