@@ -1138,15 +1138,17 @@ class _Run:
                 # What the bundle needs beside the journal, saved before the checkpoint that
                 # makes the cell one a resume keeps.
                 self.keep(sink.attempt, tally, reading)
+            if record.valid_for_qualification and not warm:
+                # Only what can be kept says what served the run: an invalid window's observations
+                # stay in its attempt, for diagnosis, and a resume runs it again. It is saved before
+                # the checkpoint that makes the cell one a resume keeps: a journal that keeps a
+                # measurement never lacks what served it (`_resumable`).
+                _write_served(self.journal.directory, serving(reading))
             self.journal.checkpoint_cell(sink.attempt, record)
             if warm:
                 self.warm_up = window
                 self.served = serving(reading)
             if record.valid_for_qualification:
-                # Only what can be kept says what served the run: an invalid window's observations
-                # stay in its attempt, for diagnosis, and a resume runs it again.
-                if not warm:
-                    _write_served(self.journal.directory, serving(reading))
                 self.observed = _agreed([*([] if self.observed is None else [self.observed]), reading.observed])
                 _write_manifest(self.journal.directory, dataclasses.replace(self.manifest, observed=self.observed))
         else:

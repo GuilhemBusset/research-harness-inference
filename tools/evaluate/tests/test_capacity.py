@@ -486,6 +486,23 @@ def test_a_request_sent_in_the_drain_is_accounted_for_and_gives_no_sample():
             assert cell.verdict is Verdict.INSUFFICIENT_EVIDENCE
 
 
+@pytest.mark.parametrize(
+    ("eligible", "samples", "verdict"),
+    [(ADMITTED, 99, Verdict.INSUFFICIENT_EVIDENCE), (ADMITTED - 1, 100, Verdict.PASS)],
+)
+def test_a_request_first_eligible_at_the_close_of_admissions_gives_no_sample(eligible, samples, verdict):
+    planned = floor_cell()
+    at = planned.identity.cell
+    # 99 later turns well before the close, and a hundredth sent at the close: first eligible there
+    # (never admitted) or one millisecond before it (admitted). Each answers in 1 s, streams in 1 s.
+    first, last = ADMITTED + 1000, ADMITTED + 2000
+    times = {"first_output_ms": first, "first_answer_ms": first, "last_output_ms": last, "ended_ms": last + 10}
+    edge = replace(request(at, 99), eligible_ms=eligible, sent_ms=ADMITTED, **times)
+    cell = read_one(evidence(planned, [*requests(at, 99), edge]))
+    assert (cell.failures.attempts, cell.sent_in_drain_requests) == (100, 0)
+    assert (cell.later_turns.count, cell.speeds.count, cell.verdict) == (samples, samples, verdict)
+
+
 # --- Repetitions -------------------------------------------------------------------------------------
 
 
