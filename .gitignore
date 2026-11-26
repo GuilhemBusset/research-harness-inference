@@ -52,6 +52,10 @@ config.local.*
 # Node: the CDK CLI is installed from package-lock.json
 node_modules/
 
+# The evaluation's trial image: the inventory of the image built on this machine, with its ID
+# (tools/evaluate/image/).
+tools/evaluate/image/inventory.local.json
+
 # Agent tooling: per-machine state
 .claude/worktrees/
 .claude/settings.local.json
