@@ -356,12 +356,15 @@ def in_other_units_and_notations(answer: dict[str, Any]) -> None:
         (0, "W / (m K)"),
         (0, "W/m/K"),
         (0, "W/mK"),
+        (0, "mW/(m·mK)"),  # a milliwatt per metre per millikelvin: the prefixes cancel
+        (None, "kg/(m³) × m"),  # a density times a thickness is a mass per area
     ],
 )
-def test_a_unit_in_another_notation_is_the_same_unit(tmp_path: Path, row: int, unit: str) -> None:
-    report = research.grade(
-        EXEMPLAR, written(tmp_path, changed(EXEMPLAR, lambda answer: answer["evidence"][row].update(unit=unit)))
-    )
+def test_a_unit_in_another_notation_is_the_same_unit(tmp_path: Path, row: int | None, unit: str) -> None:
+    def respelled(answer: dict[str, Any]) -> None:
+        (answer["conclusion"] if row is None else answer["evidence"][row])["unit"] = unit
+
+    report = research.grade(EXEMPLAR, written(tmp_path, changed(EXEMPLAR, respelled)))
 
     assert report.accepted, report.faults
 

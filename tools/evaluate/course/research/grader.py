@@ -37,10 +37,11 @@ fault said: `grade` raises only on what the trusted side gave it.
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -69,10 +70,12 @@ PROPERTIES = tuple(Property)
 # space, `·`, `⋅`, `*`, `×` or `.`, or with nothing between two symbols (`kgm-3`); a power with or
 # without a caret, in digits or superscripts, its minus a hyphen, `−` or `⁻`. What follows a `/`
 # up to the next `/` or the end of its parenthesis divides: W/m·K is read as W/(m·K), as the
-# sources print it; a divisor that is a parenthesis ends with it, so kg/(m²)·m is kg·m/m². A
+# sources print it; a divisor that is a parenthesis ends with it, so kg/(m³)·m is kg·m/m³. A
 # prefix binds to the symbol it is written against, as SI writes it: mg is a milligram, not a
-# metre times a gram. Kelvin takes no prefix, so W/mK is W/(m·K), as datasheets print it. A unit
-# of a quantity of `QUANTITIES` is known; any other is no unit here.
+# metre times a gram, and mW/(m·mK) is a milliwatt per metre per millikelvin. Only where that
+# reading measures no quantity is a prefixed symbol read as two symbols: W/mK, which measures
+# none as a watt per millikelvin, is W/(m·K), as datasheets print it. A unit of a quantity of
+# `QUANTITIES` is known; any other is no unit here.
 
 # The prefixes a symbol of `_PREFIXED` may carry, and their factors.
 _PREFIXES: Mapping[str, float] = {
@@ -80,6 +83,7 @@ _PREFIXES: Mapping[str, float] = {
 }  # fmt: skip
 # The unprefixed symbols that take a prefix: their factor to the base units, and their powers.
 _PREFIXED: Mapping[str, tuple[float, Mapping[str, int]]] = {
+    "K": (1.0, {"K": 1}),
     "W": (1.0, {"W": 1}),
     "g": (1e-3, {"kg": 1}),
     "m": (1.0, {"m": 1}),
@@ -89,7 +93,6 @@ _PREFIXED: Mapping[str, tuple[float, Mapping[str, int]]] = {
 
 # Each symbol: its factor to the base units, and its powers of them.
 SYMBOLS: Mapping[str, tuple[float, Mapping[str, int]]] = {
-    "K": (1.0, {"K": 1}),
     **_PREFIXED,
     **{
         prefix + symbol: (scale * factor, powers)
@@ -105,49 +108,72 @@ QUANTITIES: Mapping[str, Mapping[str, int]] = {
 }
 
 _SIGNS = str.maketrans({"⁻": "-", "−": "-", "–": "-", "¹": "1", "²": "2", "³": "3", "⋅": "·", "×": "·"})
-_TOKEN = re.compile(
-    r"(?P<space>\s+)|(?P<sign>[·*./()])"
-    r"|(?P<symbol>" + "|".join(sorted(map(re.escape, SYMBOLS), key=len, reverse=True)) + r")"
-    r"(?:\^?(?P<power>-?[0-9]+))?"
-)
+_GAP = re.compile(r"(?P<space>\s+)|(?P<sign>[·*./()])")
+_POWER = re.compile(r"\^?(-?[0-9]+)")
+# The symbols, the longest first: a prefix binds to the symbol it is written against.
+_BY_LENGTH = sorted(SYMBOLS, key=len, reverse=True)
+# The longest unit text read, and the most readings of one tried: a bound on the work.
+_LONGEST_UNIT = 64
+_MOST_READINGS = 64
+
+type _Token = str | tuple[float, dict[str, int]]
 
 
 class _NoUnit(Exception):
     """A text that is no unit the grader reads."""
 
 
-def _tokens(unit: str) -> list[str | tuple[float, dict[str, int]]]:
-    """The unit's factors and signs, a product written out as `·`."""
-    text, at = unit.translate(_SIGNS).strip(), 0
-    tokens: list[str | tuple[float, dict[str, int]]] = []
-    while at < len(text):
-        matched = _TOKEN.match(text, at)
-        if matched is None:
-            raise _NoUnit(unit)
-        at = matched.end()
-        token: str | tuple[float, dict[str, int]]
-        if matched["symbol"]:
-            factor, powers = SYMBOLS[matched["symbol"]]
-            power = int(matched["power"] or 1)
-            token = (factor**power, {base: exponent * power for base, exponent in powers.items()})
-        elif matched["sign"]:
-            token = "·" if matched["sign"] in "*." else matched["sign"]
-        else:
-            continue  # a space: a product between two factors (below), nothing next to a sign
+def _readings(unit: str) -> Iterator[list[_Token]]:
+    """The ways to read a unit as factors and signs, a product written out as `·`, the SI one first.
+
+    The symbols of a run of letters are matched the longest first, so that the first reading binds
+    each prefix to its symbol; a later one splits a prefixed symbol into a symbol and the next.
+    """
+    text = unit.translate(_SIGNS).strip()
+    if len(text) > _LONGEST_UNIT:
+        return
+
+    def joined(tokens: tuple[_Token, ...], token: _Token) -> tuple[_Token, ...]:
         # Two factors side by side, with a space or nothing between them, are a product.
         if (
             tokens
             and (not isinstance(tokens[-1], str) or tokens[-1] == ")")
             and (not isinstance(token, str) or token == "(")
         ):
-            tokens.append("·")
-        tokens.append(token)
-    return tokens
+            return (*tokens, "·", token)
+        return (*tokens, token)
+
+    # Where no reading of the rest of the text ends: whether one does depends on the place alone.
+    dead: set[int] = set()
+
+    def onward(at: int, tokens: tuple[_Token, ...]) -> Iterator[list[_Token]]:
+        while at < len(text) and (gap := _GAP.match(text, at)):
+            at = gap.end()
+            if gap["sign"]:  # a space is a product between two factors, nothing next to a sign
+                tokens = joined(tokens, "·" if gap["sign"] in "*." else gap["sign"])
+        if at == len(text):
+            yield list(tokens)
+            return
+        if at in dead:
+            return
+        ended = False
+        for symbol in _BY_LENGTH:
+            if text.startswith(symbol, at):
+                factor, powers = SYMBOLS[symbol]
+                raised = _POWER.match(text, at + len(symbol))
+                power = int(raised[1]) if raised else 1
+                token = (factor**power, {base: exponent * power for base, exponent in powers.items()})
+                for reading in onward(raised.end() if raised else at + len(symbol), joined(tokens, token)):
+                    ended = True
+                    yield reading
+        if not ended:
+            dead.add(at)
+
+    yield from itertools.islice(onward(0, ()), _MOST_READINGS)
 
 
-def _parse(unit: str) -> tuple[float, dict[str, int]]:
-    """The factor of a unit to its base units, and its powers of them."""
-    tokens = _tokens(unit)
+def _parse(tokens: list[_Token]) -> tuple[float, dict[str, int]]:
+    """The factor of a reading of a unit to its base units, and its powers of them."""
     at = 0
 
     def product() -> tuple[float, dict[str, int]]:
@@ -162,8 +188,13 @@ def _parse(unit: str) -> tuple[float, dict[str, int]]:
     def quotient() -> tuple[float, dict[str, int]]:
         nonlocal at
         factor, powers = product()
-        while at < len(tokens) and tokens[at] == "/":
+        while at < len(tokens) and tokens[at] in ("/", "·"):
+            sign = tokens[at]
             at += 1
+            if sign == "·":  # after a parenthesized divisor, what follows it multiplies
+                more = product()
+                factor, powers = factor * more[0], _times(powers, more[1], 1)
+                continue
             # A parenthesis is the whole divisor: what follows it multiplies.
             divisor = factor_of() if at < len(tokens) and tokens[at] == "(" else product()
             factor, powers = factor / divisor[0], _times(powers, divisor[1], -1)
@@ -172,22 +203,22 @@ def _parse(unit: str) -> tuple[float, dict[str, int]]:
     def factor_of() -> tuple[float, dict[str, int]]:
         nonlocal at
         if at >= len(tokens):
-            raise _NoUnit(unit)
+            raise _NoUnit
         token = tokens[at]
         at += 1
         if token == "(":
             inner = quotient()
             if at >= len(tokens) or tokens[at] != ")":
-                raise _NoUnit(unit)
+                raise _NoUnit
             at += 1
             return inner
         if isinstance(token, str):
-            raise _NoUnit(unit)
+            raise _NoUnit
         return token
 
     whole = quotient()
     if at != len(tokens):
-        raise _NoUnit(unit)
+        raise _NoUnit
     return whole
 
 
@@ -199,14 +230,18 @@ def _times(powers: Mapping[str, int], more: Mapping[str, int], sign: int) -> dic
 
 
 def _unit(unit: str) -> tuple[str, float] | None:
-    """The quantity a unit measures and its factor to the quantity's base unit, or None."""
-    try:
-        factor, powers = _parse(unit)
-    except (_NoUnit, OverflowError, ZeroDivisionError, ValueError):
-        return None
-    for quantity, base in QUANTITIES.items():
-        if powers == base:
-            return quantity, factor
+    """The quantity a unit measures and its factor to the quantity's base unit, or None.
+
+    The first reading of the unit (`_readings`) that measures a quantity is the one taken.
+    """
+    for reading in _readings(unit):
+        try:
+            factor, powers = _parse(reading)
+        except (_NoUnit, OverflowError, ZeroDivisionError, ValueError):
+            continue
+        for quantity, base in QUANTITIES.items():
+            if powers == base:
+                return quantity, factor
     return None
 
 
