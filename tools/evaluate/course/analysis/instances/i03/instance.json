@@ -1,0 +1,8 @@
+{
+  "x_label": "Week",
+  "y_label": "Rainfall in total (mm)",
+  "series_a": "Station A",
+  "series_b": "Station B",
+  "comparison": "final_difference",
+  "delegate": true
+}

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="400" font-family="sans-serif">
+<rect width="640" height="400" fill="white"/>
+<line x1="80" y1="340" x2="500" y2="340" stroke="black"/>
+<line x1="80" y1="30" x2="80" y2="340" stroke="black"/>
+<text x="80.00" y="356.00" font-size="11" text-anchor="middle">0</text>
+<text x="122.00" y="356.00" font-size="11" text-anchor="middle">1</text>
+<text x="164.00" y="356.00" font-size="11" text-anchor="middle">2</text>
+<text x="206.00" y="356.00" font-size="11" text-anchor="middle">3</text>
+<text x="248.00" y="356.00" font-size="11" text-anchor="middle">4</text>
+<text x="290.00" y="356.00" font-size="11" text-anchor="middle">5</text>
+<text x="332.00" y="356.00" font-size="11" text-anchor="middle">6</text>
+<text x="374.00" y="356.00" font-size="11" text-anchor="middle">7</text>
+<text x="416.00" y="356.00" font-size="11" text-anchor="middle">8</text>
+<text x="458.00" y="356.00" font-size="11" text-anchor="middle">9</text>
+<text x="500.00" y="356.00" font-size="11" text-anchor="middle">10</text>
+<polyline id="series_a" points="80.00,340.00 122.00,336.90 164.00,327.60 206.00,312.10 248.00,290.40 290.00,262.50 332.00,228.40 374.00,188.10 416.00,141.60 458.00,88.90 500.00,30.00" fill="none" stroke="#1f77b4" stroke-width="2"/>
+<line x1="515" y1="40" x2="535" y2="40" stroke="#1f77b4" stroke-width="2"/>
+<text x="540" y="44" font-size="12">Line A</text>
+<polyline id="series_b" points="80.00,340.00 122.00,309.00 164.00,278.00 206.00,247.00 248.00,216.00 290.00,185.00 332.00,154.00 374.00,123.00 416.00,92.00 458.00,61.00 500.00,30.00" fill="none" stroke="#d62728" stroke-width="2"/>
+<line x1="515" y1="60" x2="535" y2="60" stroke="#d62728" stroke-width="2"/>
+<text x="540" y="64" font-size="12">Line B</text>
+<text x="290.00" y="385" font-size="13" text-anchor="middle">Hour</text>
+<text x="25" y="185.00" font-size="13" text-anchor="middle" transform="rotate(-90 25 185.00)">Units made in total</text>
+</svg>
