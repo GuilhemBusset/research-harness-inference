@@ -1,0 +1,142 @@
+{
+ "sources": {
+  "S1": {
+   "title": "Laboratory report S1: thermal conductivity of four bio-based insulation panels",
+   "file": "S1.pdf"
+  },
+  "S2": {
+   "title": "Note S2: density and moisture of the panels tested in report S1",
+   "file": "S2.md"
+  },
+  "S3": {
+   "title": "Review S3: conductivities of bio-based insulation reported in earlier studies",
+   "file": "S3.md"
+  },
+  "S4": {
+   "title": "Sheet S4: properties the suppliers of the panels declare",
+   "file": "S4.md"
+  }
+ },
+ "passages": [
+  {
+   "source": "S1",
+   "page": 1,
+   "table": null,
+   "text": "Written for a course exercise. The panels, the laboratory and every value are invented."
+  },
+  {
+   "source": "S1",
+   "page": 1,
+   "table": null,
+   "text": "Four insulation panels were tested: a wood fibre panel, an expanded cork panel, a hemp fibre panel and a compressed straw panel, all 60 mm thick. Their thermal conductivity was measured with a guarded hot plate on two specimens of each panel, and the mean of the two is reported."
+  },
+  {
+   "source": "S1",
+   "page": 1,
+   "table": null,
+   "text": "The specimens were first measured dry, after drying at 70 °C to constant mass, at a mean temperature of 10 °C. They were measured again at the same mean temperature after conditioning at 23 °C and 80 % relative humidity, and finally dry at a mean temperature of 30 °C. The densities of the same specimens are given in note S2."
+  },
+  {
+   "source": "S1",
+   "page": 2,
+   "table": null,
+   "text": "Results at a mean temperature of 10 °C. Tables 1 and 2 give the conductivity of each panel dry and after conditioning at 80 % relative humidity."
+  },
+  {
+   "source": "S1",
+   "page": 2,
+   "table": "1",
+   "text": "Table 1. Thermal conductivity, dry, mean temperature 10 °C. Panel | λ, W/(m·K). wood fibre | 0.038. cork | 0.040. hemp fibre | 0.042. straw | 0.052."
+  },
+  {
+   "source": "S1",
+   "page": 2,
+   "table": "2",
+   "text": "Table 2. Thermal conductivity, conditioned at 23 °C and 80 % relative humidity, mean 10 °C. Panel | λ, W/(m·K). wood fibre | 0.044. cork | 0.043. hemp fibre | 0.049. straw | 0.061."
+  },
+  {
+   "source": "S1",
+   "page": 3,
+   "table": null,
+   "text": "Results at a mean temperature of 30 °C. Table 3 gives the conductivity of each panel dry, measured after the conditioned series."
+  },
+  {
+   "source": "S1",
+   "page": 3,
+   "table": "3",
+   "text": "Table 3. Thermal conductivity, dry, mean temperature 30 °C. Panel | λ, W/(m·K). wood fibre | 0.041. cork | 0.046. hemp fibre | 0.047. straw | 0.057."
+  },
+  {
+   "source": "S1",
+   "page": 3,
+   "table": null,
+   "text": "Moisture raised the conductivity of every panel, the fibre panels most. The cork panel changed least, which agrees with its low moisture uptake (note S2, Table 2)."
+  },
+  {
+   "source": "S2",
+   "page": null,
+   "table": null,
+   "text": "Written for a course exercise. The panels, the laboratory and every value are invented."
+  },
+  {
+   "source": "S2",
+   "page": null,
+   "table": null,
+   "text": "The specimens of report S1 were weighed after drying at 70 °C to constant mass and again after conditioning at 23 °C and 80 % relative humidity. Table 1 gives the oven-dry density, Table 2 the moisture content after conditioning."
+  },
+  {
+   "source": "S2",
+   "page": null,
+   "table": "1",
+   "text": "Table 1. Oven-dry density of the specimens of report S1. Panel | ρ, kg/m³. wood fibre | 160. cork | 110. hemp fibre | 45. straw | 100."
+  },
+  {
+   "source": "S2",
+   "page": null,
+   "table": "2",
+   "text": "Table 2. Moisture content after conditioning at 23 °C and 80 % relative humidity. Panel | moisture content, % of dry mass. wood fibre | 9.5. cork | 6.0. hemp fibre | 12.0. straw | 14.5."
+  },
+  {
+   "source": "S3",
+   "page": null,
+   "table": null,
+   "text": "Written for a course exercise. The panels, the laboratory and every value are invented."
+  },
+  {
+   "source": "S3",
+   "page": null,
+   "table": null,
+   "text": "Earlier studies of similar panels report conductivities a little apart from one another, as densities and test conditions differ. Table 1 gives the median of the values they report, dry, at mean temperatures between 10 °C and 23 °C. They are not measurements of the panels of report S1."
+  },
+  {
+   "source": "S3",
+   "page": null,
+   "table": "1",
+   "text": "Table 1. Median thermal conductivity reported in earlier studies, dry. Panel | λ, W/(m·K). wood fibre | 0.039. cork | 0.045. hemp fibre | 0.044. straw | 0.055."
+  },
+  {
+   "source": "S4",
+   "page": null,
+   "table": null,
+   "text": "Written for a course exercise. The panels, the laboratory and every value are invented."
+  },
+  {
+   "source": "S4",
+   "page": null,
+   "table": null,
+   "text": "The suppliers declare a nominal density and a design conductivity for each panel. A declared value is a production target, not a measurement of the specimens of report S1."
+  },
+  {
+   "source": "S4",
+   "page": null,
+   "table": "1",
+   "text": "Table 1. Declared nominal density. Panel | ρ, kg/m³. wood fibre | 150. cork | 120. hemp fibre | 40. straw | 105."
+  },
+  {
+   "source": "S4",
+   "page": null,
+   "table": "2",
+   "text": "Table 2. Declared design thermal conductivity. Panel | λ, W/(m·K). wood fibre | 0.040. cork | 0.041. hemp fibre | 0.041. straw | 0.050."
+  }
+ ]
+}

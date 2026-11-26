@@ -1,0 +1,38 @@
+{
+  "evidence": [
+    {
+      "fact": "conductivity.cork.humid",
+      "value": 0.043,
+      "unit": "W/(m·K)",
+      "source": "S1",
+      "page": 2,
+      "table": "2"
+    },
+    {
+      "fact": "density.cork",
+      "value": 110,
+      "unit": "kg/m³",
+      "source": "S2",
+      "table": "1"
+    }
+  ],
+  "conclusion": {
+    "fact": "mass_per_area.cork.humid",
+    "statement": "A thermal resistance of 2.5 m²·K/W needs 107.5 mm of the cork panel (2.5 × 0.043), which at 110 kg/m³ weighs 11.825 kg per square metre of wall.",
+    "value": 11.825,
+    "unit": "kg/m²",
+    "citations": [
+      {
+        "fact": "conductivity.cork.humid",
+        "source": "S1",
+        "page": 2,
+        "table": "2"
+      },
+      {
+        "fact": "density.cork",
+        "source": "S2",
+        "table": "1"
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "research.t01.i03",
+  "question": "A timber-frame wall is to be insulated with the wood fibre panel tested in the packet's laboratory report, so that the insulation alone has a thermal resistance of 3 m²·K/W. The panel's conductivity is the one measured dry, at a mean temperature of 10 °C. What mass of oven-dry panel does one square metre of wall need?",
+  "thermal_resistance": {
+    "value": 3.0,
+    "unit": "m²·K/W"
+  },
+  "facts": {
+    "conductivity.wood_fibre.dry": "the thermal conductivity of the wood fibre panel measured dry, at a mean temperature of 10 °C",
+    "density.wood_fibre": "the oven-dry density of the wood fibre panel's specimens"
+  },
+  "result": {
+    "fact": "mass_per_area.wood_fibre.dry",
+    "description": "the mass of oven-dry wood fibre panel per square metre of wall: thermal resistance × conductivity × density"
+  }
+}
