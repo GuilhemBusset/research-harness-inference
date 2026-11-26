@@ -27,6 +27,12 @@ that stops a trial at a limit. It reads each attempt with `evaluate.streams`.
 under `fixtures/replay/`, before any of them is sent: the requests and pauses of each, in the form
 the load generator's recorded-session reader reads. It needs `spikes` on the path too.
 
+`evaluate.telemetry` reads from the Prometheus workspace what served a measured window: the hosts
+and what each ran, their engines' counters through the drain, and the gateway's traffic. It says
+which treatments that evidence leaves unverified and why a window cannot qualify. It reads with
+spike S5's readers, by the names the services export, so it needs `spikes`, the services and
+`dashboards` on the path.
+
 `evaluate.replay` drives one cell of a plan on the student gateway: each slot's conversations as
 their seat's canary student, independently of the other seats, for the cell's admissions and a
 bounded drain, with a record of every request and of what the driver planned and observed. It

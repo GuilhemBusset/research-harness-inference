@@ -463,6 +463,9 @@ class HostMetric(StrEnum):
     OUTPUT_TOKENS_TOTAL = "output_tokens_total"
     INPUT_TOKENS_TOTAL = "input_tokens_total"
     CACHED_INPUT_TOKENS_TOTAL = "cached_input_tokens_total"
+    # The input the engine computed itself. No difference of the two above gives it: an engine
+    # can also take input from elsewhere than its own cache, and not every engine reports it.
+    COMPUTED_INPUT_TOKENS_TOTAL = "computed_input_tokens_total"
     RUNNING_REQUESTS = "running_requests"
     WAITING_REQUESTS = "waiting_requests"
     PREEMPTIONS_TOTAL = "preemptions_total"
@@ -481,6 +484,7 @@ METRIC_UNITS = {
     HostMetric.OUTPUT_TOKENS_TOTAL: Unit.TOKENS,
     HostMetric.INPUT_TOKENS_TOTAL: Unit.TOKENS,
     HostMetric.CACHED_INPUT_TOKENS_TOTAL: Unit.TOKENS,
+    HostMetric.COMPUTED_INPUT_TOKENS_TOTAL: Unit.TOKENS,
     HostMetric.RUNNING_REQUESTS: Unit.REQUESTS,
     HostMetric.WAITING_REQUESTS: Unit.REQUESTS,
     HostMetric.PREEMPTIONS_TOTAL: Unit.EVENTS,
