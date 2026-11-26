@@ -14,6 +14,8 @@ import pytest
 
 from evaluate.contracts import RequestOutcome, RequestRecord, Route, Traffic, Usage
 from evaluate.streams import Attempt, Attempts
+from rhi_common.causes import Cause
+from rhi_gateway.errors import WireFormat, render_stream_event
 
 MESSAGES, RESPONSES, CHAT = Route.MESSAGES, Route.RESPONSES, Route.CHAT_COMPLETIONS
 ROUTES = (MESSAGES, RESPONSES, CHAT)
@@ -124,16 +126,18 @@ def replay(
     status: int | None = 200,
     sent: int = 0,
     retry: int = 0,
+    broken: bool = False,
     into: Attempts | None = None,
 ) -> Attempt:
     """Reads an answer as a driver would: its status, unless none arrived, then each chunk at its
-    time. The attempt ends 10 ms after its last chunk."""
+    time. The attempt ends 10 ms after its last chunk: the body is over, or, when `broken`, the
+    transport failed."""
     reader = (into or Attempts()).send(route, sent, retry=retry)
     if status is not None:
         reader.answered(status)
     for at, chunk in chunks:
         reader.feed(chunk, at)
-    return reader.end((chunks[-1][0] if chunks else sent) + 10)
+    return reader.end((chunks[-1][0] if chunks else sent) + 10, transport_error=broken)
 
 
 def output_times(attempt: Attempt) -> tuple[int | None, int | None, int | None]:
@@ -175,6 +179,25 @@ def test_an_error_event_inside_a_200_is_a_failure_whatever_follows_and_no_text_i
 
 
 @routes
+def test_an_error_event_after_the_last_event_is_a_failure(route: Route) -> None:
+    # What the gateway writes when the stream it passed on, last event included, reported no usage.
+    gateway_error = render_stream_event(Cause.ENGINE_ERROR, WireFormat(route.value))
+    body = [(100, opening(route)), (200, text(route)), (300, ending(route))]
+    attempts = Attempts()
+
+    for late in (error(route), gateway_error, text(route) + gateway_error):
+        attempt = replay(route, *body, (400, late), into=attempts)
+
+        assert (attempt.outcome, attempt.status, attempt.failed) == (RequestOutcome.ERROR_EVENT, 200, True)
+        # Nothing but the error is read after the last event.
+        assert output_times(attempt) == (200, 200, 200)
+    # Without an error, what follows the last event changes nothing.
+    assert replay(route, *body, (400, text(route)), into=attempts).outcome is RequestOutcome.COMPLETED
+    tally = attempts.tally()
+    assert (tally.completed, tally.failed, tally.failures[RequestOutcome.ERROR_EVENT]) == (1, 3, 3)
+
+
+@routes
 def test_a_refusal_and_a_request_that_got_no_answer_are_told_by_the_status(route: Route) -> None:
     stream = opening(route) + text(route) + ending(route)
 
@@ -184,6 +207,26 @@ def test_a_refusal_and_a_request_that_got_no_answer_are_told_by_the_status(route
     assert (refused.outcome, refused.status) == (RequestOutcome.HTTP_REFUSAL, 429)
     assert (refused.first_output_ms, refused.usage) == (None, None)
     assert (lost.outcome, lost.status) == (RequestOutcome.TRANSPORT_ERROR, None)
+    assert replay(route, status=None, broken=True).outcome is RequestOutcome.TRANSPORT_ERROR
+
+
+@routes
+def test_a_transport_that_fails_after_the_headers_is_a_transport_error_with_what_was_measured(route: Route) -> None:
+    body = [(100, opening(route)), (200, text(route)), (300, text(route))]
+    attempts = Attempts()
+
+    broken = replay(route, *body, broken=True, into=attempts)
+    closed = replay(route, *body, into=attempts)
+
+    assert (broken.outcome, broken.status, broken.failed) == (RequestOutcome.TRANSPORT_ERROR, 200, True)
+    assert (*output_times(broken), broken.ended_ms) == (200, 200, 300, 310)
+    assert closed.outcome is RequestOutcome.TRUNCATED_STREAM
+    failures = attempts.tally().failures
+    assert (failures[RequestOutcome.TRANSPORT_ERROR], failures[RequestOutcome.TRUNCATED_STREAM]) == (1, 1)
+    # A failure of the transport takes nothing from a stream that had ended, or from a refusal.
+    assert replay(route, *body, (400, ending(route)), broken=True).outcome is RequestOutcome.COMPLETED
+    assert replay(route, *body, (400, error(route)), broken=True).outcome is RequestOutcome.ERROR_EVENT
+    assert replay(route, status=503, broken=True).outcome is RequestOutcome.HTTP_REFUSAL
 
 
 @pytest.mark.parametrize(("route", "other"), [(route, other) for route in ROUTES for other in ROUTES if route != other])
@@ -267,7 +310,13 @@ def test_a_request_sent_again_is_a_retry_and_the_attempt_before_it_is_kept(route
     attempts = Attempts()
 
     first = replay(route, status=None, into=attempts)
-    again = replay(route, (100, opening(route) + text(route) + ending(route)), sent=50, retry=1, into=attempts)
+    # The retry counts from its send, before anything of its answer.
+    reader = attempts.send(route, 50, retry=1)
+    sent = attempts.tally()
+    assert (sent.attempts, sent.unfinished, sent.retries) == (2, 1, 1)
+    reader.answered(200)
+    reader.feed(opening(route) + text(route) + ending(route), 100)
+    again = reader.end(110)
 
     assert attempts.ended == (first, again)
     assert (first.retry, first.outcome) == (0, RequestOutcome.TRANSPORT_ERROR)

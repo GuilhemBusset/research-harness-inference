@@ -12,29 +12,34 @@ carries of the output, and the usage a stream reports, are read as the load gene
 them. The events that end a stream are the gateway's own names.
 
 **An attempt** is one request sent once. `Attempts.send` opens its `StreamReader`; the driver calls
-`answered` when the status arrives, `feed` with each chunk of the body, and `end` once, when the
-body is over or the transport has failed. `end` gives the `Attempt`, and the attempt is then kept.
-A request sent again is another attempt, opened with its `retry`: nothing replaces an attempt.
+`answered` when the status arrives, `feed` with each chunk of the body, and `end` once: when the
+body is over, or, with `transport_error=True`, when the transport failed (a connection that broke,
+a timeout). `end` gives the `Attempt`, and the attempt is then kept. A request sent again is
+another attempt, opened with its `retry` and counted as a retry from its send: nothing replaces an
+attempt.
 
 **How an attempt ended** is one `contracts.RequestOutcome`, decided in this order:
 
-- `transport_error`: no status arrived. The request got no answer: a connection that failed, a
-  timeout before the headers.
-- `http_refusal`: the status is not 2xx. Nothing of the body is read.
-- `error_event`: inside a 2xx, an event that reports a failure came before the stream's end. That
-  is an event named `error` or `response.failed` (`rhi_gateway.proxy.FAILURE_EVENTS`), or data
-  that holds an `error`, as a chunk of Chat Completions does.
+- `http_refusal`: the status is not 2xx. Nothing of the body is read, and the answer was the
+  refusal however its body ended.
+- `error_event`: inside a 2xx, an event that reports a failure was received, anywhere in the body.
+  That is an event named `error` or `response.failed` (`rhi_gateway.proxy.FAILURE_EVENTS`), or
+  data that holds an `error`, as a chunk of Chat Completions does. An error followed by `[DONE]`
+  is an error, and so is `[DONE]` followed by an error: the gateway writes its own error after a
+  last event it has already passed on, when the stream it passed on reported no usage.
 - `completed`: the route's own last event was read whole: `message_stop` on Messages,
   `response.completed` or `response.incomplete` on Responses (an answer cut at a limit is over),
-  `data: [DONE]` on Chat Completions. The last event of another route ends nothing.
-- `truncated_stream`: a 2xx whose body stopped before either. How it stopped is not told apart: a
-  connection that breaks in the middle of a stream and a body that just ends are the same cut
-  stream to the student.
+  `data: [DONE]` on Chat Completions. The last event of another route ends nothing. A transport
+  that fails after the last event takes nothing from an answer that came whole.
+- `transport_error`: the driver said the transport failed, or no status arrived, and the stream
+  had neither of the events above. A failure after the headers keeps its status and what was
+  measured before it.
+- `truncated_stream`: a 2xx whose body just ended before its last event.
 
-The first of an error event and a last event decides, and nothing after it is read: an error
-followed by `[DONE]` is an error. The status stays on the attempt beside the outcome, `None` when
-none arrived, so an error inside a 200 shows both. The reader is for streamed requests: a 200 that
-is not a stream has no last event and reads as truncated.
+After an error event nothing is read. After a last event only an error event is: no output, no
+time and no usage is taken from what follows it. The status stays on the attempt beside the
+outcome, `None` when none arrived, so an error inside a 200 shows both. The reader is for streamed
+requests: a 200 that is not a stream has no last event and reads as truncated.
 
 **Times** are the driver's, in milliseconds on the run's clock, under the names of
 `contracts.RequestRecord`. A chunk has one time, and every event it completes has that time: events
@@ -186,7 +191,8 @@ class StreamReader:
         self._first: int | None = None
         self._answer: int | None = None
         self._last: int | None = None
-        self._outcome: RequestOutcome | None = None  # Set by the event that decides it; nothing after is read.
+        # Set by the event that decides it. A last event can still be overruled by an error event; no other can.
+        self._outcome: RequestOutcome | None = None
         self._attempt: Attempt | None = None
 
     def answered(self, status: int) -> None:
@@ -198,12 +204,17 @@ class StreamReader:
         if self._status is None or not 200 <= self._status < 300:
             return
         for event in self._events.feed(chunk):
-            if self._outcome is not None:
+            if self._outcome is RequestOutcome.ERROR_EVENT:
                 return
             if event.comment or event.name == PING_EVENT:
                 continue
             data = _object(event.data)
             held = data or {}
+            if self._outcome is not None:
+                # The stream has ended: only an error still says something of it.
+                if _reports_failure(event, held):
+                    self._outcome = RequestOutcome.ERROR_EVENT
+                continue
             merge_usage(self._usage, usage_in(held))
             carried = output_of(_WIRES[self._route], event)
             if carried is not None:
@@ -216,16 +227,19 @@ class StreamReader:
             elif _ends(self._route, event, data):
                 self._outcome = RequestOutcome.COMPLETED
 
-    def end(self, now_ms: int) -> Attempt:
-        """The body is over, or the transport failed: the attempt, the same one however often asked."""
+    def end(self, now_ms: int, *, transport_error: bool = False) -> Attempt:
+        """The body is over, or, with `transport_error`, the transport failed at `now_ms`: the
+        attempt, the same one however often asked."""
         if self._attempt is not None:
             return self._attempt
-        if self._status is None:
-            outcome = RequestOutcome.TRANSPORT_ERROR
-        elif not 200 <= self._status < 300:
+        if self._status is not None and not 200 <= self._status < 300:
             outcome = RequestOutcome.HTTP_REFUSAL
+        elif self._outcome is not None:
+            outcome = self._outcome
+        elif transport_error or self._status is None:
+            outcome = RequestOutcome.TRANSPORT_ERROR
         else:
-            outcome = self._outcome or RequestOutcome.TRUNCATED_STREAM
+            outcome = RequestOutcome.TRUNCATED_STREAM
         self._attempt = Attempt(
             route=self._route,
             retry=self._retry,
@@ -257,7 +271,7 @@ class Tally:
     failures: Mapping[RequestOutcome, int]
     """The failed attempts by cause: every cause is there, zero included."""
     retries: int
-    """The attempts that sent a request again."""
+    """The sends that sent a request again, counted when sent."""
     usage_missing: int
     eligible: int
     """The streams that have a speed."""
@@ -272,11 +286,13 @@ class Attempts:
 
     def __init__(self) -> None:
         self._sent = 0
+        self._retries = 0
         self._ended: list[Attempt] = []
 
     def send(self, route: Route, sent_ms: int, *, retry: int = 0) -> StreamReader:
         """Opens the reader of a request sent at `sent_ms`, for the `retry`-th time after its first."""
         self._sent += 1
+        self._retries += retry > 0
         return StreamReader(route, sent_ms, retry=retry, keep=self._ended.append)
 
     @property
@@ -290,7 +306,7 @@ class Attempts:
             unfinished=self._sent - len(ended),
             completed=sum(not attempt.failed for attempt in ended),
             failures={cause: sum(attempt.outcome is cause for attempt in ended) for cause in FAILURES},
-            retries=sum(attempt.retry > 0 for attempt in ended),
+            retries=self._retries,
             usage_missing=sum(attempt.usage_missing for attempt in ended),
             eligible=sum(attempt.eligible for attempt in ended),
         )
