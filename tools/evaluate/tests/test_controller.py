@@ -1324,6 +1324,7 @@ def test_a_host_serves_the_release_of_its_latest_scrape(monkeypatch: pytest.Monk
     monkeypatch.setattr(lookups.spike_keys, "read", lambda _secrets: SimpleNamespace(students=keys))
     monkeypatch.setattr(lookups.image, "prepare", lambda: SimpleNamespace(image_id=wanted))
     monkeypatch.setattr(lookups.workers, "Workers", lambda *_args, **_kwargs: contextlib.nullcontext(SimpleNamespace(start=None)))
+    monkeypatch.setattr(controller, "source_commit", lambda *_args, **_kwargs: "c" * 40)
     said: list[tuple[str, float]] = []
 
     def samples(_query: str, *, at: float) -> list[Any]:
