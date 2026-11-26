@@ -303,6 +303,26 @@ def test_the_launch_settings_need_the_fingerprint_through_the_window() -> None:
     assert read.hosts[0].launch_fingerprints == ()
 
 
+def test_an_agent_that_names_no_engine_beyond_the_allowance_leaves_the_window_without_evidence() -> None:
+    def unnamed(scrapes: int) -> telemetry.Reading:
+        # The first host's agent says no fingerprint at `scrapes` scrapes from 1108 on, and no
+        # fingerprint is requested.
+        workspace = clean()
+        gap = SCRAPES[27 : 27 + scrapes]
+        workspace.find(LAUNCH, instance=HOST_A)[0].times = tuple(at for at in SCRAPES if at not in gap)
+        workspace.add(LAUNCH, lambda _: 1, gap, instance=HOST_A, settings_fingerprint="unavailable")
+        return reading(workspace, requested=replace(REQUESTED, launch_fingerprint=None))
+
+    # Two scrapes: 45 seconds, from the fingerprint at 1093 to the one at 1138, name no engine.
+    read = unnamed(2)
+    assert read.treatments[Treatment.LAUNCH_SETTINGS] is Reason.NOT_DECLARED
+    assert [host.launch_unnamed for host in read.hosts] == [True, False]
+    assert read.reasons == (Reason.INCOMPLETE_COVERAGE,)
+    assert read.flags == (InvalidFlag.MISSING_EVIDENCE,)
+    # One scrape is within the allowance, as a scrape that never arrived would be.
+    assert unnamed(1).reasons == ()
+
+
 def test_the_effective_settings_an_engine_exposes_are_observed_where_every_host_agrees() -> None:
     place = cache_capacity(VLLM)
     assert place is not None
@@ -790,6 +810,26 @@ def test_an_identity_whose_series_begins_in_the_window_counts_from_its_first_req
     assert read.reasons == (Reason.EXTERNAL_TRAFFIC,)
 
 
+def test_an_identity_there_before_the_window_with_no_number_to_count_from_does_not_reconcile() -> None:
+    assert reading(clean()).traffic.reconciled
+
+    # The first identity of the cohort first appears in the window: its 24 requests count from zero.
+    workspace = clean()
+    first = workspace.find(GATEWAY, alias=COHORT[0])[0]
+    first.value, first.times = requests(24), tuple(at for at in SCRAPES if at > START)
+    read = reading(workspace)
+    assert (read.traffic.cohort_requests, read.traffic.reconciled, read.reasons) == (40, True, ())
+
+    # It was scraped before the window, and reads no number until a minute into it, then 24.
+    workspace = clean()
+    workspace.find(GATEWAY, alias=COHORT[0])[0].value = lambda at: float("nan") if at < START + 60 else 24
+    read = reading(workspace)
+    assert (read.traffic.coverage, read.traffic.reconciled) == (Coverage.INCOMPLETE, False)
+    assert read.reasons == (Reason.GATEWAY_COVERAGE_INCOMPLETE, Reason.UNRECONCILED_COUNTERS)
+    answers = telemetry.read(workspace, POOL, VLLM, WINDOW, WARM_UP)
+    assert telemetry.identity_requests(answers, WINDOW, COHORT) == {COHORT[0]: None, COHORT[1]: 16}
+
+
 def test_the_cohorts_count_reconciles_with_attempts_and_side_queries_together() -> None:
     assert reading(clean()).traffic.driver_requests == 40
 
@@ -822,6 +862,42 @@ def test_a_reading_records_the_preflight_the_warm_up_of_every_host_and_its_cache
         capacity_tokens=400_000, usage_at_start=0.25, usage_peak=0.5, coverage=Coverage.COMPLETE
     )
     assert read.hosts[0].counters[HostMetric.CACHED_INPUT_TOKENS_TOTAL].increase == 15_000
+
+
+def test_a_preflight_reads_each_hosts_latest_launch_sample_as_its_provenance() -> None:
+    # The first host's agent says the fingerprint up to the scrape at 973, and none from 988 on.
+    workspace = clean()
+    workspace.find(LAUNCH, instance=HOST_A)[0].times = tuple(at for at in SCRAPES if at <= 973)
+    workspace.add(
+        LAUNCH,
+        lambda _: 1,
+        tuple(at for at in SCRAPES if at > 973),
+        instance=HOST_A,
+        settings_fingerprint="unavailable",
+    )
+    assert telemetry.preflight(workspace, POOL, VLLM, at=1_000).missing == (Source.LAUNCH,)
+    assert telemetry.preflight(workspace, POOL, VLLM, at=980).missing == ()
+
+
+def test_an_engine_named_only_inside_the_window_is_not_warmed_by_the_warm_up() -> None:
+    # The first host's agent says no fingerprint through the warm-up, and names its engine at the
+    # window's first scrape, 3 seconds in.
+    workspace = clean()
+    workspace.find(LAUNCH, instance=HOST_A)[0].times = tuple(at for at in SCRAPES if at > START)
+    workspace.add(
+        LAUNCH,
+        lambda _: 1,
+        tuple(at for at in SCRAPES if at < START),
+        instance=HOST_A,
+        settings_fingerprint="unavailable",
+    )
+    read = reading(workspace)
+    first, second = read.hosts
+
+    # Its warm-up's tokens are kept, and nothing ties them to the engine the window measured.
+    assert (first.warm_up_output_tokens, first.engine_replaced, first.warmed) == (600, False, False)
+    assert (second.warm_up_output_tokens, second.warmed) == (600, True)
+    assert Reason.WARM_UP_INCOMPLETE in read.reasons
 
 
 def test_a_host_that_only_answered_its_own_liveness_was_not_warmed_up() -> None:
