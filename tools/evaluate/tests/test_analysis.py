@@ -326,6 +326,30 @@ def test_a_series_the_figure_does_not_show_is_rejected(tmp_path: Path, edit: Cal
     assert failed(graded_with_edit(tmp_path, EXEMPLAR, edit)) == {Property.DATA}
 
 
+@pytest.mark.parametrize("size", [("640", "400"), ("100%", "100%"), ("50%", "100%")])
+@pytest.mark.parametrize("covered", [False, True])
+def test_a_rectangle_sized_in_percent_is_the_size_it_is_drawn(tmp_path: Path, covered: bool, size: tuple) -> None:
+    """A full-canvas rectangle hides the plot when painted over it, and is the background of light
+    lettering when painted under it, however its size is written; half of it is half."""
+    whole = size[0] != "50%"
+
+    def paint(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        if covered:
+            rect = ElementTree.SubElement(root, SVG + "rect", {"fill": "white"})
+        else:
+            rect = next(root.iter(SVG + "rect"))
+            rect.set("fill", "black")
+            root.set("fill", "white")
+            for line in root.iter(SVG + "line"):
+                if line.get("stroke") == "black":
+                    line.set("stroke", "white")
+        rect.set("width", size[0])
+        rect.set("height", size[1])
+
+    # Half the canvas covers some of the plot, or leaves some of the white lettering on white.
+    assert failed(graded_with_edit(tmp_path, EXEMPLAR, paint)) == ({Property.DATA} if covered or not whole else set())
+
+
 @pytest.mark.parametrize(
     "paint",
     [

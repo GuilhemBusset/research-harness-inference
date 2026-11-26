@@ -25,7 +25,8 @@ in a transformed group, a label in a `tspan`) is accepted when it shows the same
 
 **What is drawn.** The grader reads an SVG's geometry (`transform`, `x`, `y`, the shapes'
 coordinates, and each `svg` element's viewport: `width`, `height`, `viewBox`,
-`preserveAspectRatio`) and its paint, from presentation attributes and `style` attributes,
+`preserveAspectRatio`; a percentage is one of the viewport around, as SVG reads it, and one of a
+viewport of no set size cannot be read) and its paint, from presentation attributes and `style` attributes,
 inherited as SVG inherits them; it reads no style sheet. A colour is one colour however SVG lets it
 be written (a keyword, `#rgb`, `#rrggbb`, `rgb()`, `hsl()`). A line, a text or a mark that is not
 displayed (`display`, `visibility`, an `opacity` of 0, no paint, a stroke of width 0, a text of
@@ -524,6 +525,34 @@ def _length(text: str | None) -> float | None:
     return numbers[0] if numbers else None
 
 
+def _coordinate(text: str | None, reference: float | None) -> float | None:
+    """A coordinate or a length of the geometry, in user units: its first value, a percentage
+    being one of `reference`, the size of the viewport it refers to; None if it has none. A
+    percentage of a viewport of no set size cannot be read."""
+    if text is None:
+        return None
+    first = next(iter(re.split(r"[\s,]+", text.strip())), "")
+    if not first.endswith("%"):
+        return _length(first)
+    number = _length(first.removesuffix("%"))
+    if number is None:
+        return None
+    if reference is None or not math.isfinite(reference):
+        raise _Unreadable(f"{FIGURE} sizes its geometry in percent of a viewport of no set size")
+    return number / 100 * reference
+
+
+# The size, in user units, of the viewport a percentage refers to: (width, height), each None
+# where it is not set.
+Extent = tuple[float | None, float | None]
+
+
+def _diagonal(extent: Extent) -> float | None:
+    """What a percentage of a length along no one axis (a radius) refers to."""
+    width, height = extent
+    return None if width is None or height is None else math.sqrt((width * width + height * height) / 2)
+
+
 def _fraction(text: str | None) -> float:
     """An opacity, from 0 to 1: a number or a percentage; one that cannot be read is SVG's default, 1."""
     if text is None:
@@ -593,6 +622,8 @@ class _Drawn:
     opacity: float
     shown: bool
     clips: tuple[tuple[Affine, Rect], ...] = ()
+    extent: Extent = (None, None)
+    """The size of the viewport its percentages refer to."""
 
     def stroke(self) -> str | None:
         """The colour its outline is drawn in, None if it is drawn in none."""
@@ -642,20 +673,37 @@ def _declared(element: ElementTree.Element) -> dict[str, str]:
     return declared
 
 
-def _size(text: str | None) -> float | None:
-    """A width or a height in user units; None when it is not set or is relative (`100%`)."""
-    if text is None or not re.fullmatch(_NUMBER.pattern + r"(?:px)?", text.strip()):
+def _size(text: str | None, reference: float | None) -> float | None:
+    """A width or a height in user units, a percentage being one of `reference`; None when it is
+    not set, or is relative to a size not known (the window around the figure)."""
+    if text is None:
         return None
-    return _finite(text.strip().removesuffix("px"), FIGURE)
+    stripped = text.strip()
+    number = stripped.removesuffix("%")
+    if (
+        number != stripped
+        and reference is not None
+        and math.isfinite(reference)
+        and re.fullmatch(_NUMBER.pattern, number)
+    ):
+        return _finite(number, FIGURE) / 100 * reference
+    if not re.fullmatch(_NUMBER.pattern + r"(?:px)?", stripped):
+        return None
+    return _finite(stripped.removesuffix("px"), FIGURE)
 
 
-def _viewport(element: ElementTree.Element, nested: bool) -> tuple[Affine, Rect] | None:
-    """What an `svg` element shows: the map from its user space to the space around it, and the
+def _viewport(element: ElementTree.Element, nested: bool, outer: Extent) -> tuple[Affine, Rect, Extent] | None:
+    """What an `svg` element shows: the map from its user space to the space around it, the
     rectangle of its user space its viewport shows (`viewBox` and `preserveAspectRatio` as SVG
-    reads them, a size it does not set as large as its content); None when it shows nothing."""
-    x = (_length(element.get("x")) or 0.0) if nested else 0.0
-    y = (_length(element.get("y")) or 0.0) if nested else 0.0
-    width, height = _size(element.get("width")), _size(element.get("height"))
+    reads them, a size it does not set as large as its content) and the size its percentages refer
+    to (its `viewBox`, else its own); None when it shows nothing. The percentages of a nested one
+    refer to the viewport around it; those of the outermost one, to a window the grader does not
+    know."""
+    if not nested:
+        outer = (None, None)
+    x = (_coordinate(element.get("x"), outer[0]) or 0.0) if nested else 0.0
+    y = (_coordinate(element.get("y"), outer[1]) or 0.0) if nested else 0.0
+    width, height = _size(element.get("width"), outer[0]), _size(element.get("height"), outer[1])
     if (width is not None and not width > 0) or (height is not None and not height > 0):
         return None
     try:
@@ -665,7 +713,7 @@ def _viewport(element: ElementTree.Element, nested: bool) -> tuple[Affine, Rect]
     if len(box) != 4:  # no viewBox, or one SVG ignores
         right = x + width if width is not None else math.inf
         bottom = y + height if height is not None else math.inf
-        return (1, 0, 0, 1, x, y), (0.0, 0.0, right - x, bottom - y)
+        return (1, 0, 0, 1, x, y), (0.0, 0.0, right - x, bottom - y), (width, height)
     box_x, box_y, box_width, box_height = box
     if not (box_width > 0 and box_height > 0):
         return None
@@ -684,10 +732,10 @@ def _viewport(element: ElementTree.Element, nested: bool) -> tuple[Affine, Rect]
         at_y = (height - box_height * scale_y) * {"ymin": 0.0, "ymax": 1.0}.get(align[4:], 0.5)
     affine: Affine = (scale_x, 0, 0, scale_y, x + at_x - scale_x * box_x, y + at_y - scale_y * box_y)
     shown = (box_x - at_x / scale_x, box_y - at_y / scale_y)
-    return affine, (*shown, shown[0] + width / scale_x, shown[1] + height / scale_y)
+    return affine, (*shown, shown[0] + width / scale_x, shown[1] + height / scale_y), (box_width, box_height)
 
 
-def _clip(value: str | None, ids: Mapping[str, ElementTree.Element]) -> Rect | None:
+def _clip(value: str | None, ids: Mapping[str, ElementTree.Element], extent: Extent) -> Rect | None:
     """The rectangle a `clip-path` lets an element show in, of its user space: everywhere for
     none, None for a clip the grader does not read (anything but one plain `rect`)."""
     if value is None or value.strip() in ("", "none"):
@@ -704,7 +752,10 @@ def _clip(value: str | None, ids: Mapping[str, ElementTree.Element]) -> Rect | N
     shapes = list(target)
     if len(shapes) != 1 or _local(shapes[0].tag) != "rect" or shapes[0].get("transform"):
         return None
-    left, top, width, height = (_length(shapes[0].get(name, "0")) for name in ("x", "y", "width", "height"))
+    left, top, width, height = (
+        _coordinate(shapes[0].get(name, "0"), extent[axis])
+        for name, axis in (("x", 0), ("y", 1), ("width", 0), ("height", 1))
+    )
     if left is None or top is None or width is None or height is None:
         return None
     return (left, top, left + width, top + height)
@@ -731,19 +782,21 @@ def _placed(
     )
     affine = _then(around.affine, _transform(element.get("transform")))
     clips = around.clips
-    clip = _clip(declared.get("clip-path"), ids)
+    extent = around.extent
+    clip = _clip(declared.get("clip-path"), ids, extent)
     if clip is None:
         shown = False
     elif clip != EVERYWHERE:
         clips = (*clips, (affine, clip))
     if tag == "svg":
-        viewport = _viewport(element, nested)
+        viewport = _viewport(element, nested, extent)
         if viewport is None:
             shown = False
         else:
             affine = _then(affine, viewport[0])
             clips = (*clips, (affine, viewport[1]))
-    own = _Drawn(affine, paint, around.opacity * _fraction(declared.get("opacity")), shown, clips)
+            extent = viewport[2]
+    own = _Drawn(affine, paint, around.opacity * _fraction(declared.get("opacity")), shown, clips, extent)
     yield element, own
     for child in element:
         yield from _placed(child, own, ids, nested=True)
@@ -800,8 +853,9 @@ def _line_points(element: ElementTree.Element, identifier: str) -> list[Point]:
     raise _Unreadable(f"{FIGURE} draws {identifier} with neither a polyline nor a path")
 
 
-def _mark_points(element: ElementTree.Element) -> list[Point]:
-    """The points that outline a mark, in its own coordinates; none when they cannot be read."""
+def _mark_points(element: ElementTree.Element, extent: Extent) -> list[Point]:
+    """The points that outline a mark, in its own coordinates, its percentages of `extent`; none
+    when they cannot be read."""
     tag = _local(element.tag)
     try:
         if tag in ("polyline", "polygon"):
@@ -811,13 +865,15 @@ def _mark_points(element: ElementTree.Element) -> list[Point]:
             return _path_points(element.get("d", ""), "a mark")
     except _Unreadable:
         return []
+    width, height = extent
+    diagonal = _diagonal(extent)
     names = {
-        "line": ("x1", "y1", "x2", "y2"),
-        "rect": ("x", "y", "width", "height"),
-        "circle": ("cx", "cy", "r", "r"),
-        "ellipse": ("cx", "cy", "rx", "ry"),
+        "line": (("x1", width), ("y1", height), ("x2", width), ("y2", height)),
+        "rect": (("x", width), ("y", height), ("width", width), ("height", height)),
+        "circle": (("cx", width), ("cy", height), ("r", diagonal), ("r", diagonal)),
+        "ellipse": (("cx", width), ("cy", height), ("rx", width), ("ry", height)),
     }[tag]
-    values = [_length(element.get(name, "0")) for name in names]
+    values = [_coordinate(element.get(name, "0"), reference) for name, reference in names]
     if any(value is None for value in values):
         return []
     one, two, three, four = (value or 0.0 for value in values)
@@ -828,15 +884,17 @@ def _mark_points(element: ElementTree.Element) -> list[Point]:
     return [(one - three, two - four), (one + three, two + four)]
 
 
-def _first_character(element: ElementTree.Element, x: float | None, y: float | None) -> tuple[float, float]:
+def _first_character(
+    element: ElementTree.Element, x: float | None, y: float | None, extent: Extent
+) -> tuple[float, float]:
     """Where a text's first character is placed: the `x` and `y` of the innermost element that
     holds it and sets them, as SVG places a `tspan`."""
-    x = own if (own := _length(element.get("x"))) is not None else x
-    y = own if (own := _length(element.get("y"))) is not None else y
+    x = own if (own := _coordinate(element.get("x"), extent[0])) is not None else x
+    y = own if (own := _coordinate(element.get("y"), extent[1])) is not None else y
     if not (element.text or "").strip():
         for child in element:
             if "".join(child.itertext()).strip():
-                return _first_character(child, x, y)
+                return _first_character(child, x, y, extent)
     return (x or 0.0, y or 0.0)
 
 
@@ -905,7 +963,7 @@ def _drawing(root: ElementTree.Element) -> _Figure:
         colour = drawn.opaque_fill()
         if _local(element.tag) != "rect" or colour is None or b or c or len(drawn.clips) > 1:
             continue
-        corners = [_apply(drawn.affine, x, y) for x, y in _mark_points(element)]
+        corners = [_apply(drawn.affine, x, y) for x, y in _mark_points(element, drawn.extent)]
         if corners:
             xs, ys = [x for x, _y in corners], [y for _x, y in corners]
             covers.append((index, (min(xs), min(ys), max(xs), max(ys)), colour))
@@ -945,13 +1003,13 @@ def _drawing(root: ElementTree.Element) -> _Figure:
             lines[identifier] = _Line(points, drawn.stroke(), shows)
         elif tag == "text" and drawn.visible():
             content = " ".join("".join(element.itertext()).split()).casefold()
-            at = _apply(drawn.affine, *_first_character(element, None, None))
+            at = _apply(drawn.affine, *_first_character(element, None, None, drawn.extent))
             colours = lettering(element)
             if colours and seen(index, drawn, colours, at):
                 texts.append(_Text(content, at, colours))
         elif tag in _MARKS and drawn.visible():
             colours = _paints(drawn, line=tag == "line")
-            points = [_apply(drawn.affine, x, y) for x, y in _mark_points(element)]
+            points = [_apply(drawn.affine, x, y) for x, y in _mark_points(element, drawn.extent)]
             if colours and points:
                 xs, ys = [x for x, _y in points], [y for _x, y in points]
                 middle = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
