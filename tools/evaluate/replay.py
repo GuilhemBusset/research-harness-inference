@@ -138,7 +138,7 @@ from evaluate.streams import Attempt, Attempts, Tally
 from rhi_common.keys import is_valid_key, key_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Iterable, Sequence
+    from collections.abc import Callable, Coroutine, Iterable, Sequence
 
     from evaluate.plan import Plan, PlannedCell
 
@@ -475,9 +475,10 @@ class _Drive:
         evidence: Evidence,
         started: asyncio.Event | None = None,
         first_conversation: int = 0,
+        on_request: Callable[[RequestRecord], None] | None = None,
     ) -> None:
         self.plan, self.cell, self.gateway, self.keys, self.stops, self.sizes = plan, cell, gateway, keys, stops, sizes
-        self.evidence = evidence
+        self.evidence, self.on_request = evidence, on_request
         self.started, self.first_conversation = started, first_conversation
         self.clock = gateway.clock
         self.rule = _RULES[cell.identity.phase]
@@ -668,20 +669,21 @@ class _Drive:
             attempt = reader.end(clock.now_ms())
             one.in_flight = False
             self.open[one.student] -= 1
-            self.requests.append(
-                RequestRecord(
-                    request=ordinal,
-                    cell=self.cell.identity.cell,
-                    student=one.student,
-                    conversation=number,
-                    turn=turn,
-                    traffic=self.rule.traffic,
-                    trial=None,
-                    eligible_ms=eligible,
-                    finish_reason=None,
-                    **attempt.measured(),
-                )
+            record = RequestRecord(
+                request=ordinal,
+                cell=self.cell.identity.cell,
+                student=one.student,
+                conversation=number,
+                turn=turn,
+                traffic=self.rule.traffic,
+                trial=None,
+                eligible_ms=eligible,
+                finish_reason=None,
+                **attempt.measured(),
             )
+            self.requests.append(record)
+            if self.on_request is not None:
+                self.on_request(record)
         return attempt
 
     def _shown(self, requests: Sequence[RequestRecord], prefix: str | None) -> tuple[tuple[int, ...], Fresh]:
@@ -779,6 +781,7 @@ async def run_cell(
     evidence: Evidence | None = None,
     started: asyncio.Event | None = None,
     first_conversation: int = 0,
+    on_request: Callable[[RequestRecord], None] | None = None,
 ) -> CellRun:
     """Drives cell `cell` of the plan on the gateway and returns what it left.
 
@@ -791,7 +794,9 @@ async def run_cell(
     must whatever was shown before. `started`, when given, is set at the instant the cell starts,
     its record's `started_ms`: before any of its requests is sent. `first_conversation` is the
     number of its first conversation: a cell driven again, beside another trial of it, goes on from
-    the conversations it sent before, each with a transcript of its own.
+    the conversations it sent before, each with a transcript of its own. `on_request`, when given,
+    is handed each request's record the moment it is written, so that what a cell sent is kept
+    even when the cell does not end.
 
     `ReplayError`, with nothing sent, for fewer distinct keys than the cell has identities, for a
     warm-up or a live cell that nothing would end, and for a suite that replays on another route.
@@ -816,5 +821,6 @@ async def run_cell(
         Evidence() if evidence is None else evidence,
         started,
         first_conversation,
+        on_request,
     )
     return await drive.run()

@@ -343,9 +343,19 @@ class _Runner:
         evidence: replay.Evidence,
         execution: int,
         request: int,
+        on_request: Callable[[RequestRecord], None] | None = None,
+        on_attempt: Callable[[Executed], int] | None = None,
     ) -> None:
         self.plan, self.gateway, self.keys, self.harnesses, self.graders = plan, gateway, keys, harnesses, graders
         self.cancel, self.evidence, self.execution, self.request = cancel, evidence, execution, request
+        self.on_request, self.on_attempt = on_request, on_attempt
+
+    def _kept(self, executed: Executed) -> Executed:
+        """Hands the attempt to `on_attempt`, which numbers the requests it records from the
+        next ordinal and says how many it took: the next background starts after them."""
+        if self.on_attempt is not None:
+            self.request += self.on_attempt(executed)
+        return executed
 
     async def cell(self, cell: int) -> CellRan:
         planned = self.plan.cells[cell]
@@ -384,6 +394,7 @@ class _Runner:
                 evidence=self.evidence,
                 started=started,
                 first_conversation=conversation,
+                on_request=self.on_request,
             )
         )
         # The attempt stops at once when the run is cancelled or its background ends before it.
@@ -456,13 +467,15 @@ class _Runner:
         self.execution += 1
         if ran is not None:
             self.request += len(ran.requests)
-        return Executed(
-            record=record,
-            loads=self.plan.loads_of(trial),
-            peak_fan_out=peak_fan_out(evidence),
-            side_calls=evidence.side_calls,
-            delegation=work.delegation,
-            background=ran,
+        return self._kept(
+            Executed(
+                record=record,
+                loads=self.plan.loads_of(trial),
+                peak_fan_out=peak_fan_out(evidence),
+                side_calls=evidence.side_calls,
+                delegation=work.delegation,
+                background=ran,
+            )
         )
 
     def _unstarted(self, trial: TrialIdentity) -> Executed:
@@ -484,7 +497,7 @@ class _Runner:
             usage=None,
         )
         self.execution += 1
-        return Executed(record, self.plan.loads_of(trial), 0, 0, None, None)
+        return self._kept(Executed(record, self.plan.loads_of(trial), 0, 0, None, None))
 
 
 async def run(
@@ -499,11 +512,16 @@ async def run(
     evidence: replay.Evidence | None = None,
     first_execution: int = 0,
     first_request: int = 0,
+    on_request: Callable[[RequestRecord], None] | None = None,
+    on_attempt: Callable[[Executed], int] | None = None,
 ) -> Run:
     """Runs the live cells of the plan, all of them in order unless `cells` names some, and returns
     every attempt (the module's text). `keys` are the cohort's canary keys: the first is the live
     seat's. `evidence` is what earlier cells showed of each student's prefix cache. Executions are
-    numbered from `first_execution`, background requests from `first_request`.
+    numbered from `first_execution`, background requests from `first_request`. `on_request` is
+    handed each background request's record as it is written, and `on_attempt` each attempt once
+    it has been graded; it gives the number of request ordinals it took for the attempt's own
+    requests, which the next background is numbered after.
 
     ValueError, before anything is sent, for a cell that is not live or a family with no grader;
     `replay.ReplayError` for keys too few for the plan."""
@@ -525,6 +543,8 @@ async def run(
         replay.Evidence() if evidence is None else evidence,
         first_execution,
         first_request,
+        on_request,
+        on_attempt,
     )
     ran: list[CellRan] = []
     for cell in chosen:

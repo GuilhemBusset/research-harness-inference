@@ -56,7 +56,7 @@ import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from evaluate import contracts
 from evaluate.contracts import (
@@ -81,6 +81,9 @@ from evaluate.contracts import (
     TrialIdentity,
     Workload,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 SUITES = Path(__file__).resolve().parent / "suites"
 # The course fixture the replay draws its tool turns from (`traces.COURSE`), by its bytes.
@@ -530,6 +533,27 @@ class _Expansion:
         )
 
 
+def _digests(spec: SuiteSpec, profile: Profile, cells: Sequence[PlannedCell]) -> tuple[str, str, str]:
+    """The suite, arrival and protocol digests of a workload: of the suite, of the arrivals of
+    its cells, and of the suite's protocol with the profile and what was planned for each cell."""
+    protocol = spec.protocol | {
+        "profile": spec.profiles[profile].table,
+        "background": {task: spec.background[task] for task in sorted(spec.background)},
+        "core": sorted(spec.core),
+        "cells": [cell.planned() for cell in cells],
+    }
+    arrivals = _digest([list(cell.arrivals_ms) for cell in cells])
+    return contracts.content_hash(spec.suite), arrivals, _digest(protocol)
+
+
+def digests_hold(plan: Plan) -> bool:
+    """Whether the plan's workload still names what its spec and its cells would send: the suite,
+    arrival and protocol digests computed again from them are the ones the workload froze."""
+    workload = plan.workload
+    frozen = (workload.suite_digest, workload.arrival_digest, workload.protocol_digest)
+    return _digests(plan.spec, workload.profile, plan.cells) == frozen
+
+
 def expand(
     spec: SuiteSpec,
     profile: Profile,
@@ -627,20 +651,15 @@ def expand(
         if len(seeds_used) != chosen.repetitions:
             # Two repetitions on one seed would be, in part, one measurement made twice.
             raise PlanError(Refusal.INVALID_REQUEST)
-    protocol = spec.protocol | {
-        "profile": chosen.table,
-        "background": {task: spec.background[task] for task in sorted(spec.background)},
-        "core": sorted(spec.core),
-        "cells": [cell.planned() for cell in cells],
-    }
     scheduled = {trial.harness for trial in plan.trials}
+    suite_digest, arrival_digest, protocol_digest = _digests(spec, profile, cells)
     try:
         workload = Workload(
             profile=profile,
             students=students,
-            suite_digest=contracts.content_hash(spec.suite),
-            arrival_digest=_digest([list(cell.arrivals_ms) for cell in cells]),
-            protocol_digest=_digest(protocol),
+            suite_digest=suite_digest,
+            arrival_digest=arrival_digest,
+            protocol_digest=protocol_digest,
             input_seed=input_seed,
             schedule_seed=schedule_seed,
             cache_policy=spec.cache_policy,

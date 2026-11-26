@@ -21,9 +21,10 @@ import httpx
 import pytest
 
 import common
-from evaluate import booking, capacity, phases, plan, replay, telemetry, trials
+from evaluate import booking, capacity, phases, plan, replay, scripted, telemetry, trials
 from evaluate.contracts import (
     LIVE_PHASES,
+    MAX_COUNT,
     CellStatus,
     Grade,
     HostMetric,
@@ -160,22 +161,33 @@ def _event(data: object, name: str | None = None) -> bytes:
 
 
 def _answer(route: Route, cached: int) -> list[bytes]:
+    """A streamed answer that calls the route warm-up's tool, with a cached input of `cached`."""
+    tool = phases.WARM_UP_TOOL
     if route is Route.MESSAGES:
         usage = {"input_tokens": 30, "cache_read_input_tokens": cached}
+        block = {"type": "tool_use", "id": "call_1", "name": tool, "input": {}}
         return [
             _event({"type": "message_start", "message": {"usage": usage}}, "message_start"),
+            _event({"type": "content_block_start", "index": 0, "content_block": block}, "content_block_start"),
             _event(
-                {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}}, "content_block_delta"
+                {"type": "content_block_delta", "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+                "content_block_delta",
             ),
-            _event({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 4}}),
+            _event({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 4}}),
             _event({"type": "message_stop"}, "message_stop"),
         ]
-    usage = {"input_tokens": 30, "output_tokens": 4}
     if route is Route.RESPONSES:
+        call = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": tool, "arguments": "{}"}
+        usage = {"input_tokens": 30, "input_tokens_details": {"cached_tokens": cached}, "output_tokens": 4}
         done = {"type": "response.completed", "response": {"usage": usage}}
-        return [_event({"type": "response.output_text.delta", "delta": "ok"}), _event(done, "response.completed")]
+        return [
+            _event({"type": "response.output_item.added", "item": call}, "response.output_item.added"),
+            _event({"type": "response.function_call_arguments.delta", "delta": "{}"}),
+            _event(done, "response.completed"),
+        ]
+    delta = {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": tool, "arguments": "{}"}}]}
     return [
-        _event({"choices": [{"index": 0, "delta": {"content": "ok"}}]}),
+        _event({"choices": [{"index": 0, "delta": delta}]}),
         _event({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
         _event({"choices": [], "usage": {"prompt_tokens": 30, "completion_tokens": 4}}),
         _event("[DONE]"),
@@ -192,13 +204,14 @@ _ROUTES = {
 class Gateway(httpx.AsyncBaseTransport):
     """A made-up gateway: it knows a student by the key, answers after `ANSWER_MS`, reports a
     cached input of zero for a student's first request under a prefix and 12 after, and keeps when
-    each request arrived and from whom."""
+    each request arrived and from whom. `answer`, when set, writes the answers instead."""
 
     def __init__(self, clock: Clock, keys: Sequence[str]) -> None:
         self.clock, self.keys = clock, list(keys)
         self.arrived: list[tuple[int, int]] = []
         self.open = 0
         self.on_arrival: Callable[[int, int], None] = lambda _at, _student: None
+        self.answer: Callable[[Route, int], list[bytes]] | None = None
         self._cached: set[tuple[int, str]] = set()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -209,7 +222,7 @@ class Gateway(httpx.AsyncBaseTransport):
         prefix = json.dumps([body.get("system"), body.get("instructions"), body.get("tools")])
         cached = 12 if (student, prefix) in self._cached else 0
         self._cached.add((student, prefix))
-        events = _answer(_ROUTES[request.url.path], cached)
+        events = (self.answer or _answer)(_ROUTES[request.url.path], cached)
 
         async def stream() -> AsyncIterator[bytes]:
             self.open += 1
@@ -230,13 +243,18 @@ _SPAN = re.compile(r"\[(\d+)(ms|s)\]$")
 @dataclass
 class Workspace:
     """A Prometheus workspace that answers a range selector with what it scraped every 15 seconds
-    up to now: two hosts that always work, and the gateway's count of each canary's requests.
-    `change_at` replaces the second host by a third from that time on."""
+    up to now: two hosts, and the gateway's count of each canary's requests. Each student's gateway
+    affinity is a host (even students the first, odd ones the second), whose engine counts 20
+    output tokens for each request of theirs; its input counters rise with the time. `change_at`
+    replaces the second host by a third from that time on, `lifetime` is what each engine counted
+    before, and `misattributed` makes the gateway count every request as the first canary's."""
 
     clock: Clock
     gateway: Gateway
     aliases: Sequence[str]
     change_at: float | None = None
+    lifetime: float = 0.0
+    misattributed: bool = False
     series: dict[str, list[tuple[dict[str, str], Callable[[float], float], Callable[[float], bool]]]] = field(
         default_factory=dict
     )
@@ -244,10 +262,10 @@ class Workspace:
     def __post_init__(self) -> None:
         held = telemetry.selectors(POOL, VLLM)
         always = lambda _t: True
-        for host, present in (
-            ("node-a", always),
-            ("node-b", lambda t: self.change_at is None or t < self.change_at),
-            ("node-c", lambda t: self.change_at is not None and t >= self.change_at),
+        for affinity, host, present in (
+            (0, "node-a", always),
+            (1, "node-b", lambda t: self.change_at is None or t < self.change_at),
+            (1, "node-c", lambda t: self.change_at is not None and t >= self.change_at),
         ):
             for key, value, labels in (
                 (
@@ -263,17 +281,10 @@ class Workspace:
                 (HostMetric.PREEMPTIONS_TOTAL, 0, {"engine": "0"}),
             ):
                 self.add(held[key], {"instance": host, **labels}, lambda _t, v=value: v, present)
-            for key, rate in (
-                (HostMetric.OUTPUT_TOKENS_TOTAL, 10),
-                (HostMetric.INPUT_TOKENS_TOTAL, 100),
-                (HostMetric.CACHED_INPUT_TOKENS_TOTAL, 50),
-            ):
-                self.add(
-                    held[key],
-                    {"instance": host, "engine": "0"},
-                    lambda t, r=rate: 50 + r * (t - ORIGIN_S + 900),
-                    present,
-                )
+            engine = {"instance": host, "engine": "0"}
+            self.add(held[HostMetric.OUTPUT_TOKENS_TOTAL], engine, self.output(affinity), present)
+            for key, rate in ((HostMetric.INPUT_TOKENS_TOTAL, 100), (HostMetric.CACHED_INPUT_TOKENS_TOTAL, 50)):
+                self.add(held[key], engine, lambda t, r=rate: self.lifetime + 50 + r * (t - ORIGIN_S + 900), present)
         for student, alias in enumerate(self.aliases):
             self.add(
                 held[telemetry.Source.GATEWAY_REQUESTS],
@@ -287,9 +298,17 @@ class Workspace:
     ) -> None:
         self.series.setdefault(selector, []).append(({"pool": POOL, **labels}, value, present))
 
+    def _before(self, at: float, students: Callable[[int], bool]) -> int:
+        return sum(1 for arrived, one in self.gateway.arrived if students(one) and ORIGIN_S + arrived / 1000 < at)
+
+    def output(self, affinity: int) -> Callable[[float], float]:
+        return lambda at: self.lifetime + 50 + 20 * self._before(at, lambda one: one % 2 == affinity)
+
     def count(self, student: int) -> Callable[[float], float]:
         def counted(at: float) -> float:
-            return sum(1 for arrived, one in self.gateway.arrived if one == student and ORIGIN_S + arrived / 1000 < at)
+            if self.misattributed:
+                return self._before(at, lambda _one: True) if student == 0 else 0
+            return self._before(at, lambda one: one == student)
 
         return counted
 
@@ -321,6 +340,9 @@ class Harness:
     artifacts: Path
     silent: frozenset[int] = frozenset()
     on_turn: Callable[[int, int], None] = lambda _trial, _turn: None
+    # How long before its dispatch each later turn reached the forwarder, and a tally that lost its completions.
+    lag_ms: int = 0
+    miscounted: bool = False
 
     @contextlib.asynccontextmanager
     async def attempt(self, trial: Any, key: str, cancel: asyncio.Event) -> AsyncGenerator[trials.Work]:
@@ -346,7 +368,7 @@ class Harness:
                 measured.append(
                     Measurement(
                         attempt=one,
-                        received_ms=sent,
+                        received_ms=sent - (self.lag_ms if turn else 0),
                         side_call=False,
                         closed_by_client=False,
                         cancelled=False,
@@ -370,7 +392,7 @@ class Harness:
             refusals=0,
             generated_tokens=4 * len(measured),
             open_reservations=0,
-            tally=attempts.tally(),
+            tally=replace(attempts.tally(), completed=0) if self.miscounted else attempts.tally(),
             requests=tuple(measured),
         )
         yield trials.Work(evidence=evidence, artifacts=self.artifacts)
@@ -421,6 +443,13 @@ class Bench:
     breach_at_ms: int | None = None
     deadline_ms: int | None = None
     clock: Clock = field(default_factory=Clock)
+    pool: str = POOL
+    instances: int = 2
+    requested: Settings | None = None
+    graders: dict[Any, Any] | None = None
+    # The journal of an earlier run to go on with; a new one by default.
+    resumes: Journal | None = None
+    continuity: Callable[[], Coroutine[Any, Any, booking.Reason | None]] | None = None
 
     def __post_init__(self) -> None:
         count = self.planned.canary_identities if self.keys is None else self.keys
@@ -431,7 +460,7 @@ class Bench:
         self.workspace = Workspace(self.clock, self.gateway, alias_list)
         self.harness = Harness(self.clock, self.gateway, self.tmp_path)
         self.cancel = asyncio.Event()
-        self.journal = Journal.create(self.tmp_path / "runs")
+        self.journal: Journal = Journal.create(self.tmp_path / "runs") if self.resumes is None else self.resumes
         self.manifest_before_first_request: bool | None = None
         previous = self.gateway.on_arrival
 
@@ -446,8 +475,8 @@ class Bench:
         clock = self.clock if self.late is None else Late(self.clock, self.late[0], self.late[1])
         gateway = replay.Gateway("https://gateway.example.com", POOL, clock, self.gateway)
         session = Session(
-            pool=POOL,
-            instances=2,
+            pool=self.pool,
+            instances=self.instances,
             starts_at=int(ORIGIN_S),
             ends_at=int(ORIGIN_S) + 6 * 3600,
             set_by="evaluate/run",
@@ -459,17 +488,19 @@ class Bench:
             breached = self.breach_at_ms is not None and self.clock.now_ms() >= self.breach_at_ms
             return booking.Reason.BOOKING_CHANGED if breached else None
 
-        source = phases.Telemetry(self.workspace, POOL, VLLM, telemetry.Requested(REQUESTED, FINGERPRINT))
+        source = phases.Telemetry(
+            self.workspace, POOL, VLLM, telemetry.Requested(self.requested or REQUESTED, FINGERPRINT)
+        )
         return self.clock.drive(
             phases.run(
                 self.planned,
-                phases.Admitted(outcome, continuity),
+                phases.Admitted(outcome, continuity if self.continuity is None else self.continuity),
                 gateway,
                 phases.Canaries(tuple(self.key_list), tuple(self.alias_list)),
                 source,
                 phases.Artifacts(RUN, trial_image(self.versions)),
                 self.harness,
-                dict.fromkeys(capacity_families(), grade_all),
+                dict.fromkeys(capacity_families(), grade_all) if self.graders is None else self.graders,
                 self.journal,
                 origin_s=ORIGIN_S,
                 cancel=self.cancel,
@@ -488,6 +519,12 @@ class Bench:
 
 def capacity_families() -> set[Any]:
     return {trials.task_of(PLAN, trial).family for trial in PLAN.workload.trials}
+
+
+def running(bench: Bench) -> int | None:
+    """The cell whose attempt is the journal's last, `None` before the first."""
+    attempts = bench.journal.attempts
+    return attempts[-1].cell if attempts else None
 
 
 def phase_of(result: phases.CellResult) -> Phase:
@@ -524,6 +561,9 @@ def test_a_reduced_plan_runs_every_phase_and_keeps_warm_up_and_openings_out_of_s
     warm_up = result.cells[0]
     routes = [one.route for one in warm_up.requests if one.conversation < 3]
     assert routes == [Route.MESSAGES, Route.RESPONSES, Route.CHAT_COMPLETIONS]
+    # The per-host warm-up sent as every canary: each one's affinity is a host, and both were warmed.
+    assert {one.student for one in warm_up.requests} == set(range(len(bench.key_list)))
+    assert all(host.warmed for one in result.cells[1:] if one.reading for host in one.reading.hosts)
     # Every cell was read over its whole window, reconciled and checkpointed with its observations.
     for one in result.cells:
         assert one.qualifies, (one.cell.identity, one.record)
@@ -580,6 +620,13 @@ def _other_grader(planned: plan.Plan) -> plan.Plan:
     return replace(planned, spec=spec)
 
 
+def _sent_otherwise(planned: plan.Plan) -> plan.Plan:
+    """The plan with the replay's sizes changed after it was expanded: its workload names others."""
+    protocol = planned.spec.protocol
+    replay_table = protocol["replay"] | {"turn_output_tokens": 7}
+    return replace(planned, spec=replace(planned.spec, protocol=protocol | {"replay": replay_table}))
+
+
 @pytest.mark.parametrize(
     ("planned", "versions"),
     [
@@ -592,8 +639,9 @@ def _other_grader(planned: plan.Plan) -> plan.Plan:
             VERSIONS,
         ),
         (_other_grader(PLAN), VERSIONS),
+        (_sent_otherwise(PLAN), VERSIONS),
     ],
-    ids=["harness-version", "replay-fixture", "grader"],
+    ids=["harness-version", "replay-fixture", "grader", "protocol"],
 )
 def test_artifacts_that_are_not_the_plans_are_refused_before_measuring(
     tmp_path: Path, planned: plan.Plan, versions: dict[str, str]
@@ -601,6 +649,23 @@ def test_artifacts_that_are_not_the_plans_are_refused_before_measuring(
     bench = Bench(tmp_path, planned=planned, versions=versions)
     assert bench.refused() is phases.Refusal.ARTIFACT_MISMATCH
     assert not (bench.journal.directory / phases.MANIFEST).exists()
+
+
+def test_a_family_with_no_grader_is_refused_before_anything_is_sent(tmp_path: Path) -> None:
+    assert Bench(tmp_path, graders={}).refused() is phases.Refusal.ARTIFACT_MISMATCH
+
+
+def test_a_journal_of_another_workload_keeps_its_manifest_and_is_not_resumed(tmp_path: Path) -> None:
+    first = Bench(tmp_path / "first")
+    first.run()
+    saved = (first.journal.directory / phases.MANIFEST).read_text()
+    other = plan.expand(PLAN.spec, Profile.SCREEN, 2, input_seed=PLAN.workload.input_seed + 1)
+    again = Bench(tmp_path / "again", planned=other, resumes=first.journal)
+    with pytest.raises(phases.PhaseError) as refused:
+        again.run()
+    assert refused.value.reason is phases.Refusal.INCOMPATIBLE_RESUME
+    assert again.gateway.arrived == []
+    assert (first.journal.directory / phases.MANIFEST).read_text() == saved
 
 
 def test_the_manifest_resolves_what_is_installed() -> None:
@@ -625,7 +690,7 @@ def test_a_host_change_leaves_its_cell_and_the_ones_after_unqualified(tmp_path: 
 
     def change(at: int, student: int) -> None:
         # The second student first sends in the hands-on class-size cell: a host is replaced 5 s later.
-        if student == 1 and bench.workspace.change_at is None:
+        if student == 1 and running(bench) == floor.identity.cell and bench.workspace.change_at is None:
             bench.workspace.change_at = ORIGIN_S + at / 1000 + 5
         seen(at, student)
 
@@ -637,6 +702,14 @@ def test_a_host_change_leaves_its_cell_and_the_ones_after_unqualified(tmp_path: 
     assert all(by_cell[cell].qualifies for cell in range(floor.identity.cell))
     for one in result.cells[floor.identity.cell :]:
         cannot_qualify(bench, result, one)
+
+
+@pytest.mark.parametrize(("pool", "instances"), [("other-pool", 2), (POOL, 1)], ids=["pool", "hosts"])
+def test_traffic_and_telemetry_of_another_pool_than_booked_are_refused(
+    tmp_path: Path, pool: str, instances: int
+) -> None:
+    # The gateway and the workspace serve the pool `POOL` on two hosts.
+    assert Bench(tmp_path, pool=pool, instances=instances).refused() is phases.Refusal.BOOKING_MISMATCH
 
 
 def test_identities_too_few_or_shared_are_refused_before_anything_is_sent(tmp_path: Path) -> None:
@@ -654,6 +727,110 @@ def test_a_live_seat_that_sent_nothing_leaves_its_cell_unqualified(tmp_path: Pat
     silent = next(one for one in result.cells if one.cell == low)
     assert silent.record is not None and InvalidFlag.MISSING_EVIDENCE in silent.record.invalid_flags
     cannot_qualify(bench, result, silent)
+
+
+def test_a_release_that_changes_inside_a_window_leaves_that_cell_unqualified(tmp_path: Path) -> None:
+    bench = Bench(tmp_path, requested=replace(REQUESTED, engine_image_digest=IMAGE))
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+    rows = bench.workspace.series[telemetry.selectors(POOL, VLLM)[telemetry.Source.RELEASE]]
+    changed: list[float] = []
+
+    def other(at: float) -> bool:
+        return bool(changed) and changed[0] <= at < changed[0] + 20
+
+    labels, value, present = rows[0]
+    rows[0] = labels, value, lambda at: present(at) and not other(at)
+    rows.append((labels | {"image_digest": "sha256:" + "bb" * 32}, value, other))
+
+    def change(at: int, _student: int) -> None:
+        if running(bench) == sweep.identity.cell and not changed:
+            changed.append(ORIGIN_S + at / 1000 + 30)
+
+    bench.gateway.on_arrival = change
+    result = bench.run()
+    cell = next(one for one in result.cells if one.cell == sweep)
+    assert cell.record is not None and InvalidFlag.HOST_TURNOVER in cell.record.invalid_flags
+    cannot_qualify(bench, result, cell)
+
+
+def test_a_gateway_that_does_not_count_each_canary_leaves_its_cells_unqualified(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    bench.workspace.misattributed = True
+    result = bench.run()
+    shared = [one for one in result.cells if one.cell.identities > 1]
+    assert shared
+    for one in shared:
+        assert one.record is not None and InvalidFlag.UNRECONCILED_COUNTERS in one.record.invalid_flags
+        cannot_qualify(bench, result, one)
+
+
+def test_a_live_attempt_whose_first_answer_reads_a_cache_leaves_its_cell_unqualified(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
+    bench.gateway.answer = lambda route, cached: _answer(route, 12 if running(bench) == low.identity.cell else cached)
+    result = bench.run()
+    cell = next(one for one in result.cells if one.cell == low)
+    assert cell.record is not None and InvalidFlag.MISSING_EVIDENCE in cell.record.invalid_flags
+    cannot_qualify(bench, result, cell)
+
+
+@pytest.mark.parametrize(
+    ("harness", "flag"),
+    [({"lag_ms": 500}, InvalidFlag.DRIVER_SATURATION), ({"miscounted": True}, InvalidFlag.UNRECONCILED_COUNTERS)],
+    ids=["dispatch-lag", "tally"],
+)
+def test_live_requests_that_lag_or_do_not_reconcile_leave_their_cells_unqualified(
+    tmp_path: Path, harness: dict[str, Any], flag: InvalidFlag
+) -> None:
+    bench = Bench(tmp_path)
+    bench.harness = replace(bench.harness, **harness)
+    result = bench.run()
+    live = [one for one in result.cells if phase_of(one) in LIVE_PHASES]
+    assert live
+    for one in live:
+        assert one.record is not None and flag in one.record.invalid_flags
+        cannot_qualify(bench, result, one)
+
+
+def test_a_route_that_answers_without_the_tool_call_ends_the_warm_up(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    text = scripted._responses(["plain text"], POOL)[1]
+    bench.gateway.answer = lambda route, cached: text if route is Route.RESPONSES else _answer(route, cached)
+    result = bench.run()
+    assert result.ended is phases.Ended.ROUTE_WARM_UP_FAILED
+    (warm_up,) = result.cells
+    assert not warm_up.checkpointed and len(warm_up.requests) == 3
+
+
+def test_offline_host_counters_are_what_the_window_counted(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    # Engines that counted beyond the contracts' bound before the run, and one whose preemptions
+    # are two series: one restarts from five to zero while the other rises from zero to five.
+    bench.workspace.lifetime = MAX_COUNT
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+    rows = bench.workspace.series[telemetry.selectors(POOL, VLLM)[HostMetric.PREEMPTIONS_TOTAL]]
+    changed: list[float] = []
+    labels, _, present = rows[0]
+    rows[0] = labels, lambda at: 0 if changed and at >= changed[0] else 5, present
+    rows.append((labels | {"engine": "1"}, lambda at: 5 if changed and at >= changed[0] else 0, present))
+
+    def change(at: int, _student: int) -> None:
+        if running(bench) == sweep.identity.cell and not changed:
+            changed.append(ORIGIN_S + at / 1000 + 30)
+
+    bench.gateway.on_arrival = change
+    result = bench.run()
+    offline = {one.identity.cell: one for one in graded(result).cells}
+    measured = [one for one in result.cells if phase_of(one) is Phase.CAPACITY_SWEEP]
+    assert measured
+    for one in measured:
+        engine = offline[one.cell.identity.cell].engine
+        assert engine is not None and one.reading is not None
+        counted = one.reading.pool.counters
+        assert engine.output_tokens == counted[HostMetric.OUTPUT_TOKENS_TOTAL] and engine.output_tokens
+        assert engine.preemptions == counted[HostMetric.PREEMPTIONS_TOTAL]
+    restarted = offline[sweep.identity.cell].engine
+    assert restarted is not None and restarted.preemptions == 5
 
 
 def test_missed_driver_headroom_refuses_the_run_before_the_gateway_sees_anything(tmp_path: Path) -> None:
@@ -708,6 +885,106 @@ def test_a_cancellation_during_a_live_seat_stops_everything_within_the_drain_and
     cannot_qualify(bench, result, last)
 
 
+def test_a_cancellation_stops_the_route_warm_up_and_the_wait_for_scrapes(tmp_path: Path) -> None:
+    routes = Bench(tmp_path / "routes")
+    routes.gateway.on_arrival = lambda _at, _student: routes.cancel.set()
+    result = routes.run()
+    assert result.ended is phases.Ended.CANCELLED and len(routes.gateway.arrived) == 1
+    assert not result.cells[0].checkpointed
+
+    scrapes = Bench(tmp_path / "scrapes")
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+    pending: list[asyncio.Task[None]] = []
+
+    async def after_the_drain() -> None:
+        await scrapes.clock.sleep_ms(sweep.admissions_ms + sweep.drain_ms + 1_000)
+        scrapes.cancel.set()
+
+    def cancel(_at: int, _student: int) -> None:
+        if running(scrapes) == sweep.identity.cell and not pending:
+            pending.append(asyncio.ensure_future(after_the_drain()))
+
+    scrapes.gateway.on_arrival = cancel
+    result = scrapes.run()
+    assert result.ended is phases.Ended.CANCELLED
+    last = result.cells[-1]
+    assert last.cell == sweep and last.reading is None
+    cannot_qualify(scrapes, result, last)
+
+
+def test_a_continuity_probe_that_fails_stops_the_cell(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+
+    async def unreadable() -> booking.Reason | None:
+        if running(bench) == sweep.identity.cell and bench.journal.attempts[-1].status is AttemptStatus.RUNNING:
+            raise OSError("no answer")
+        return None
+
+    bench.continuity = unreadable
+    result = bench.run()
+    assert result.ended is phases.Ended.CONTINUITY_LOST and result.breach is booking.Reason.POOL_STATE_UNREADABLE
+    last = result.cells[-1]
+    assert last.cell == sweep
+    cannot_qualify(bench, result, last)
+
+
+class DriverStopped(Exception):
+    pass
+
+
+def test_requests_that_ended_stay_in_the_journal_when_the_driver_breaks(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+    sends: list[int] = []
+
+    def lose_the_driver(at: int, _student: int) -> None:
+        if running(bench) == sweep.identity.cell:
+            sends.append(at)
+            if len(sends) == 3:
+                raise DriverStopped
+
+    bench.gateway.on_arrival = lose_the_driver
+    with pytest.raises(DriverStopped):
+        bench.run()
+    attempt = bench.journal.attempts[-1]
+    assert attempt.cell == sweep.identity.cell and attempt.status is AttemptStatus.INTERRUPTED
+    run_id = bench.journal.run_id
+    bench.journal.close()
+    with Journal.open(tmp_path / "runs", run_id) as reopened:
+        saved = reopened.observations(attempt.ordinal)
+    assert {getattr(one, "sent_ms", None) for one in saved} >= set(sends[:2])
+
+
+def test_a_resume_in_another_booking_warms_up_again_and_replaces_the_interrupted_trial(tmp_path: Path) -> None:
+    first = Bench(tmp_path / "first")
+    low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
+
+    def cancel(trial: int, _turn: int) -> None:
+        if trial in low.trials:
+            first.cancel.set()
+
+    first.harness.on_turn = cancel
+    before = first.run()
+    interrupted = before.trials[-1]
+    assert interrupted.invalid is InvalidReason.INTERRUPTED
+
+    second = Bench(tmp_path / "second", resumes=first.journal)
+    second.clock.at = first.clock.at + 60_000
+    after = second.run()
+    assert after.ended is phases.Ended.COMPLETED
+    # The new booking warmed its hosts again; the cells measured before were not run again.
+    assert after.cells[0].cell.identity.phase is Phase.WARM_UP and after.cells[0].qualifies
+    measured = {one.cell.identity.cell for one in before.cells[1:] if one.qualifies}
+    assert measured and not measured & {one.cell.identity.cell for one in after.cells}
+    assert all(one.qualifies for one in after.cells)
+    # The replacement is an execution of its own, linked to the one it replaces.
+    again = next(one for one in after.trials if one.trial == interrupted.trial)
+    assert again.execution > interrupted.execution and again.replaces == interrupted.execution
+    requests = [one.request for cells in (before.cells, after.cells) for cell in cells for one in cell.requests]
+    assert len(requests) == len(set(requests))
+
+
 def test_a_booking_that_changes_interrupts_the_cell_and_starts_no_other(tmp_path: Path) -> None:
     bench = Bench(tmp_path)
     floor = next(
@@ -716,7 +993,7 @@ def test_a_booking_that_changes_interrupts_the_cell_and_starts_no_other(tmp_path
 
     def breach(at: int, student: int) -> None:
         # The second student first sends in the hands-on class-size cell: the booking changes then.
-        if student == 1 and bench.breach_at_ms is None:
+        if student == 1 and running(bench) == floor.identity.cell and bench.breach_at_ms is None:
             bench.breach_at_ms = at + 1
 
     bench.gateway.on_arrival = breach

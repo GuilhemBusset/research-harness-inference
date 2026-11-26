@@ -10,31 +10,42 @@ to measure with; it binds what exists to each phase:
   background of a live cell and the class openings;
 - the tasks are `trials.run`, with the harnesses and graders it is given: the live cells at low
   load and at class size, one seat live and the others replaying;
-- the telemetry reader is `telemetry.preflight`, `read` and `resolve`, over `Telemetry`'s reader;
+- the telemetry reader is `telemetry.preflight`, `read`, `resolve` and `identity_requests`, over
+  `Telemetry`'s reader;
 - the journal is `journal.Journal`: each cell is an attempt that its observations are appended to
-  and that ends checkpointed, or interrupted.
+  as they are made, and that ends checkpointed, or interrupted.
 
 Who books, who owns the session and who publishes is the operator controller's: not this module.
 
 **Before measuring.** Nothing is sent to the gateway until all of these hold, and each refusal is a
 member of `Refusal`:
 
-- the booking is ready (`booking-not-ready`);
+- the booking is ready (`booking-not-ready`), and the gateway's pool and the telemetry's are the
+  pool it booked (`booking-mismatch`);
 - the canary identities are enough and distinct: the plan's keys (`replay.preflight`), each with a
   gateway alias of its own (`insufficient-identities`);
 - the artifacts that will run are the ones the plan pins (`artifact-mismatch`): each harness's
-  version as the trial image reports it (`image.installed`), each task instance's fixture and
-  grader digests as its course module computes them now, and the digest of the course fixture the
-  replay builds its requests from (`traces.COURSE`), which the plan's protocol digest covers. The
-  run's `contracts.Manifest` is then written whole, before the first cell (`MANIFEST`);
-- the telemetry a reading needs answers on every host the booking selected (`telemetry-unavailable`);
+  version as the trial image reports it (`image.installed`), a grader for every family the selected
+  live cells run, each task instance's fixture and grader digests as its course module computes
+  them now, the digest of the course fixture the replay builds its requests from (`traces.COURSE`),
+  and the suite, arrival and protocol digests computed again from the spec and the cells that will
+  be sent (`plan.digests_hold`);
+- a journal that holds earlier cells holds them under this workload and this treatment, and so
+  does the manifest beside it (`incompatible-resume`): a run is resumed, never overwritten;
+- the telemetry a reading needs answers on every host the booking selected, and on no other host
+  (`telemetry-unavailable`, `booking-mismatch`);
 - the load driver has headroom: the plan's largest replay, driven on the run's clock against a
   local mock that answers at once, dispatches within the suite's tolerance at p95
   (`driver-headroom-missed`).
 
-**The warm-up** is the plan's first cell. Its route warm-up is one streamed tool exchange on each
-wire format of the suite (`warm_up.routes`), under the warm-up's own prefix; a route that does not
-complete ends the run. Its per-host warm-up is the warm-up cell's replay, which sends until the
+The run's `contracts.Manifest` is then written whole (`MANIFEST`), before the first cell.
+
+**The warm-up** is the plan's first cell, and every booking runs it again, even when an earlier
+booking's warm-up is in the journal: a warm-up warms the engines that did it. Its route warm-up is
+one streamed tool exchange on each wire format of the suite (`warm_up.routes`), under the warm-up's
+own prefix; a route whose answer does not complete with a call of the declared tool ends the run.
+Its per-host warm-up is the warm-up cell's replay, widened to one seat for each canary of the
+cohort, so that each host a student's gateway affinity sends to is reached. It sends until the
 telemetry shows every selected host working beyond its liveness completions, and is then told it
 has finished; one that does not get there within the suite's warm-up estimate ends the run. Its
 window is the warm-up every later reading is given (`telemetry.Driver.warm_up`).
@@ -43,29 +54,46 @@ window is the warm-up every later reading is given (`telemetry.Driver.warm_up`).
 clock until the workspace holds the scrapes of its window (`telemetry.readable_from`), reads that
 window and resolves it. Over the whole window it then checks:
 
-- the identities: every seat the plan gives the cell sent as its own student, the live seat by its
-  forwarder's requests and the replay seats by theirs;
+- the hosts and the release: the hosts the window shows are as many as the booking selected, and
+  the reading's `hosts` and `release` treatments are not contradicted: a release that changed, or a
+  host count other than the requested one, flags the cell `host_turnover`, and a part of either
+  the telemetry does not show flags it `missing_evidence`;
+- the identities: every seat the cell drives sent as its own student, and the gateway's count of
+  each canary's alias over the window is the number of requests the driver sent as that student;
 - the cache conditions: the replay's fresh prefix was not left unverified, and each live attempt's
-  first answer reported its cached input, so its starting cache is known from reported usage;
-- the accounting: each scheduler's tally against its request rows, the forwarder's against its
-  measurements, and the gateway's count of the cohort against every request the driver says
-  reached it: the replay's, the route warm-up's and the live seat's, side queries included.
+  first answers reported a cached input of exactly zero (`replay.met_fresh`);
+- the accounting: each scheduler's tally against its request rows, request by request and outcome
+  by outcome, the forwarder's against its measurements, the driver's dispatch lag of the live
+  requests within the suite's tolerance at p95, and the gateway's count of the cohort against
+  every request the driver says reached it: the replay's, the route warm-up's and the live seat's,
+  side queries included.
 
 Each reason of the reading, and each failed check, becomes a `contracts.InvalidFlag` of the cell's
-record. The requests, the trials and the host samples (`contracts.HostSample`, from the series the
-window was read from) are appended to the cell's journal attempt, which is then checkpointed with
-the record; `CellResult.evidence` is what `capacity.read` grades offline. Nothing is graded here.
+record. Requests and trials are appended to the cell's journal attempt as each one ends; the host
+samples (`contracts.HostSample`, from the series the window was read from) once the window is read.
+A counter's samples are the increase each of its series counted since the first sample of the
+window's range, summed over the host's series at each scrape: what the reading counted is what
+`capacity.read` counts from them, whatever the counter's lifetime total and whichever of its
+series restarted. The attempt is then checkpointed with the record; `CellResult.evidence` is what
+`capacity.read` grades offline. Nothing is graded here.
 
-**Stopping.** During every cell a watcher reads the cancel event, the deadline (the booking's end
-less the suite's cleanup, or the run's own deadline if earlier) and the booking's continuity
-(`Admitted.continuity`: the record still the booking, the same hosts, the same release). When one
-trips, the cell's stop is set: the replay sends nothing more and cuts what it has open, the live
-attempt is told to stop and is recorded invalid, `interrupted`, and what is still running after the
-cell's drain (and, for a live cell, the worker's `forwarding.CANCEL_S`) is cancelled. What the cell
-observed is still appended, and its attempt is interrupted, never checkpointed: its observations
-stay readable (`Journal.observations`), it cannot qualify, and a resume runs it again. No cell
-starts after that, nor one that the time left cannot hold (`plan.reserved_ms`). Why the run ended
-is `Result.ended`, apart from any measurement.
+**Stopping.** From the moment a cell's attempt opens until its checkpoint is decided, a watcher
+reads the cancel event, the deadline (the booking's end less the suite's cleanup, or the run's own
+deadline if earlier) and the booking's continuity (`Admitted.continuity`: the record still the
+booking, the same hosts, the same release); a probe that cannot answer is a continuity that cannot
+be established (`pool-state-unreadable`). When one trips, the cell's stop is set: no route and no
+replay request is sent after it and the replay cuts what it has open, the live attempt is told to
+stop and is recorded invalid, `interrupted`, and what is still running after the cell's drain (and,
+for a live cell, the worker's `forwarding.CANCEL_S`) is cancelled. A stop while the window's
+scrapes are awaited stops the cell as well, and so does a continuity that no longer holds once they
+are read. What the cell observed stays in its attempt, which is interrupted, never checkpointed:
+its observations stay readable (`Journal.observations`), it cannot qualify, and a resume runs it
+again; a driver that raises interrupts it too. No cell starts after that, nor one that the time
+left cannot hold (`plan.reserved_ms`). Why the run ended is `Result.ended`, apart from any
+measurement.
+
+**Resuming.** Request ordinals and trial executions go on from the highest the journal holds, and
+an execution of a trial the journal already holds one of names the latest in `replaces`.
 
 Everything recorded is ordinals, run-clock times, counts and labels, as `evaluate.contracts` holds
 them. It needs `spikes` and `services/gateway` on the path, as `evaluate.replay` does.
@@ -79,13 +107,15 @@ import dataclasses
 import json
 import math
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 import loadgen
+from common import percentile
 from evaluate import booking, capacity, image, plan, replay, telemetry, traces, trials
 from evaluate.contracts import (
     LIVE_PHASES,
@@ -109,10 +139,13 @@ from evaluate.contracts import (
     Traffic,
     TrialRecord,
     dumps,
+    loads,
 )
 from evaluate.course import analysis, optimization, research, revision
 from evaluate.forwarding import CANCEL_S
+from evaluate.journal import AttemptStatus, JournalError
 from evaluate.streams import Attempts, Tally
+from rhi_gateway.sse import SseReader
 from rhi_lifecycle.serving import PROBE_INTERVAL_SECONDS
 
 if TYPE_CHECKING:
@@ -151,14 +184,19 @@ COURSE_MODULES = {
 }
 # The SDK the SDK tool loop is pinned at.
 SDK_TOOL_LOOP_SDK = "openai_sdk"
+# The treatments a window must not contradict: what the booking selected and what serves it.
+BOOKED = (telemetry.Treatment.HOSTS, telemetry.Treatment.RELEASE)
+_UNSEEN = (telemetry.Reason.NOT_OBSERVED, telemetry.Reason.INCOMPLETE_COVERAGE)
 
 
 class Refusal(StrEnum):
     """Why nothing was measured."""
 
     BOOKING_NOT_READY = "booking-not-ready"
+    BOOKING_MISMATCH = "booking-mismatch"
     INSUFFICIENT_IDENTITIES = "insufficient-identities"
     ARTIFACT_MISMATCH = "artifact-mismatch"
+    INCOMPATIBLE_RESUME = "incompatible-resume"
     TELEMETRY_UNAVAILABLE = "telemetry-unavailable"
     DRIVER_HEADROOM_MISSED = "driver-headroom-missed"
 
@@ -303,8 +341,9 @@ def _nothing_observed() -> Settings:
 
 def resolve_manifest(plan_: Plan, artifacts: Artifacts, requested: Settings) -> Manifest:
     """The run's manifest from what will actually run, held to what the plan pins: the harnesses
-    its trials run on, the fixture and grader of each instance they work on, and the course fixture
-    the replay sends from. `PhaseError` (`artifact-mismatch`) for anything else."""
+    its trials run on, the fixture and grader of each instance they work on, the course fixture
+    the replay sends from, and the workload the spec and the cells would send now. `PhaseError`
+    (`artifact-mismatch`) for anything else."""
     versions = installed_versions(artifacts.trial_image)
     if any(versions.get(pin.harness) != pin.version for pin in plan_.workload.harnesses):
         raise PhaseError(Refusal.ARTIFACT_MISMATCH)
@@ -319,7 +358,55 @@ def resolve_manifest(plan_: Plan, artifacts: Artifacts, requested: Settings) -> 
                 raise PhaseError(Refusal.ARTIFACT_MISMATCH)
     if plan_.spec.protocol.get("replay_fixture_digest") != plan.file_digest(traces.COURSE):
         raise PhaseError(Refusal.ARTIFACT_MISMATCH)
+    if not plan.digests_hold(plan_):
+        raise PhaseError(Refusal.ARTIFACT_MISMATCH)
     return Manifest(workload=plan_.workload, requested=requested, run=artifacts.run, observed=_nothing_observed())
+
+
+def _graders_held(plan_: Plan, cells: Iterable[int], graders: Mapping[Family, trials.Grader]) -> None:
+    """Refuses a run whose selected live cells run a family it has no grader for."""
+    needed = {
+        trials.task_of(plan_, plan_.workload.trials[trial]).family
+        for cell in cells
+        if plan_.cells[cell].identity.phase in LIVE_PHASES
+        for trial in plan_.cells[cell].trials
+    }
+    if needed - set(graders):
+        raise PhaseError(Refusal.ARTIFACT_MISMATCH)
+
+
+def _resumable(plan_: Plan, journal: Journal, manifest: Manifest) -> None:
+    """Refuses a journal that holds cells, or a manifest, of another workload or treatment."""
+    saved = journal.directory / MANIFEST
+    if saved.is_file():
+        try:
+            before = loads(saved.read_text(encoding="utf-8"), Manifest)
+        except ValueError:
+            raise PhaseError(Refusal.INCOMPATIBLE_RESUME) from None
+        if (before.workload_id, before.treatment_id) != (manifest.workload_id, manifest.treatment_id):
+            raise PhaseError(Refusal.INCOMPATIBLE_RESUME)
+    try:
+        journal.resume([(one.identity.cell, 0) for one in plan_.cells], 0, manifest.workload_id, manifest.treatment_id)
+    except JournalError:
+        raise PhaseError(Refusal.INCOMPATIBLE_RESUME) from None
+
+
+def _history(journal: Journal) -> tuple[int, int, dict[int, int]]:
+    """What the journal's observations already hold: the next request ordinal, the next trial
+    execution, and each trial's latest execution. `PhaseError` for observations that cannot be read."""
+    next_request = execution = 0
+    executions: dict[int, int] = {}
+    try:
+        observed = [one for attempt in journal.attempts for one in journal.observations(attempt.ordinal)]
+    except JournalError:
+        raise PhaseError(Refusal.INCOMPATIBLE_RESUME) from None
+    for one in observed:
+        if isinstance(one, RequestRecord):
+            next_request = max(next_request, one.request + 1)
+        elif isinstance(one, TrialRecord):
+            execution = max(execution, one.execution + 1)
+            executions[one.trial] = max(executions.get(one.trial, one.execution), one.execution)
+    return next_request, execution, executions
 
 
 def _write_manifest(directory: Path, manifest: Manifest) -> None:
@@ -375,12 +462,17 @@ async def headroom(plan_: Plan, clock: replay.Clock, keys: Sequence[str], *, adm
         drain_ms=0,
         arrivals_ms=(0,) * largest.replay_slots,
     )
-    at = largest.identity.cell
-    rehearsed = dataclasses.replace(plan_, cells=(*plan_.cells[:at], rehearsal, *plan_.cells[at + 1 :]))
+    rehearsed = _with_cell(plan_, rehearsal)
     mock = replay.Gateway("https://driver-check.example.com", "driver-check", clock, httpx.MockTransport(_mock_answer))
-    ran = await replay.run_cell(rehearsed, at, mock, keys)
+    ran = await replay.run_cell(rehearsed, largest.identity.cell, mock, keys)
     lag, tolerance = ran.summary.lag_p95_ms, ran.summary.lag_tolerance_ms
     return lag is not None and lag <= tolerance
+
+
+def _with_cell(plan_: Plan, cell: PlannedCell) -> Plan:
+    """The plan with one of its cells driven otherwise: a rehearsal, or the widened warm-up."""
+    at = cell.identity.cell
+    return dataclasses.replace(plan_, cells=(*plan_.cells[:at], cell, *plan_.cells[at + 1 :]))
 
 
 # --- Waiting -------------------------------------------------------------------------------------
@@ -405,8 +497,28 @@ async def _until(clock: replay.Clock, at_ms: int) -> None:
 # --- Host samples --------------------------------------------------------------------------------
 
 
-def _usable(value: float) -> bool:
-    return math.isfinite(value) and 0 <= value <= MAX_COUNT
+def _finite(value: float) -> bool:
+    return math.isfinite(value) and value >= 0
+
+
+def _cumulative(samples: Sequence[tuple[int, float]]) -> list[tuple[int, float]]:
+    """A counter series as the increase it counted since its first sample: each rise added, each
+    drop a restart from zero whose new value is added in full, as telemetry counts it."""
+    added, found = 0.0, []
+    for index, (at_ms, value) in enumerate(samples):
+        if index:
+            before = samples[index - 1][1]
+            added += value - before if value >= before else value
+        found.append((at_ms, added))
+    return found
+
+
+def _summed(series: Sequence[Sequence[tuple[int, float]]]) -> list[tuple[int, float]]:
+    """Cumulative series summed at each time any of them was scraped, each at its latest value."""
+    found = []
+    for at_ms in sorted({at for one in series for at, _ in one}):
+        found.append((at_ms, sum(next((v for t, v in reversed(one) if t <= at_ms), 0.0) for one in series)))
+    return found
 
 
 def host_samples(
@@ -419,38 +531,45 @@ def host_samples(
     origin_s: float,
 ) -> tuple[HostSample, ...]:
     """The samples of each host of the reading, one a metric and a scrape, from a scrape before
-    the window's start to one after its drain, on the run's clock: the series of a host at one
-    scrape summed, or averaged for a ratio. A host is the reading's ordinal of its instance."""
+    the window's start to one after its drain, on the run's clock. A gauge is its series at one
+    scrape summed, or averaged for a ratio. A counter is the increase each of its series counted
+    since its first sample of that range, summed: a lifetime total beyond the contracts' bound, or a
+    series that restarted while another went on, counts what the window counted. A host is the
+    reading's ordinal of its instance."""
     hosts = {host.host for host in reading.hosts}
     low, high = window.started - telemetry.ALLOWANCE_SECONDS, window.drained + telemetry.ALLOWANCE_SECONDS
     found: list[HostSample] = []
     for metric in HostMetric:
-        combine = telemetry.GAUGES.get(metric, sum)
-        by: dict[tuple[int, int], list[float]] = {}
+        counter = metric in telemetry.COUNTERS
+        by: dict[int, list[list[tuple[int, float]]]] = {}
         for one in answers.get(metric, ()):
             instance = one.labels.get("instance", "")
             inside = any(window.started <= at <= window.drained for at, _ in one.samples)
-            if not instance or not inside:
+            if not instance or not inside or (host := ordinals.of(instance)) not in hosts:
                 continue
-            host = ordinals.of(instance)
-            for at, value in one.samples:
-                at_ms = round((at - origin_s) * 1000)
-                if host in hosts and low <= at <= high and _usable(value) and 0 <= at_ms <= MAX_TIME_MS:
-                    by.setdefault((host, at_ms), []).append(value)
-        for (host, at_ms), values in sorted(by.items()):
-            value = combine(values)
-            if metric is HostMetric.GPU_UTILIZATION and value > 1:
-                continue
-            found.append(
-                HostSample(
-                    cell=cell,
-                    host=host,
-                    at_ms=at_ms,
-                    metric=metric,
-                    unit=METRIC_UNITS[metric],
-                    value=value,
-                )
+            held = sorted(
+                (round((at - origin_s) * 1000), value)
+                for at, value in one.samples
+                if low <= at <= high and math.isfinite(at) and _finite(value) and (counter or value <= MAX_COUNT)
             )
+            held = [(at_ms, value) for at_ms, value in held if 0 <= at_ms <= MAX_TIME_MS]
+            by.setdefault(host, []).append(_cumulative(held) if counter else held)
+        for host, series in sorted(by.items()):
+            if counter:
+                values = _summed(series)
+            else:
+                combine = telemetry.GAUGES.get(metric, sum)
+                scrapes: dict[int, list[float]] = {}
+                for one in series:
+                    for at_ms, value in one:
+                        scrapes.setdefault(at_ms, []).append(value)
+                values = [(at_ms, combine(held)) for at_ms, held in sorted(scrapes.items())]
+            for at_ms, value in values:
+                if value > MAX_COUNT or (metric is HostMetric.GPU_UTILIZATION and value > 1):
+                    continue
+                found.append(
+                    HostSample(cell=cell, host=host, at_ms=at_ms, metric=metric, unit=METRIC_UNITS[metric], value=value)
+                )
     return tuple(found)
 
 
@@ -475,19 +594,22 @@ def _tally(tallies: Iterable[Tally]) -> Tally:
     )
 
 
-def _rows_tallied(tally: Tally, rows: int) -> bool:
-    """Whether every send a tally counted ended and has its row."""
-    return tally.unfinished == 0 and tally.attempts == rows
+def reconciled(tally: Tally, rows: Sequence[RequestRecord]) -> bool:
+    """Whether a scheduler's tally is its request rows: every send ended and has one row of its
+    own, and the completions and each cause of failure are as many as the rows say."""
+    outcomes = Counter(one.outcome for one in rows)
+    causes = {cause: tally.failures.get(cause, 0) for cause in RequestOutcome if cause is not RequestOutcome.COMPLETED}
+    return (
+        tally.unfinished == 0
+        and tally.attempts == len(rows) == len({one.request for one in rows})
+        and tally.completed == outcomes[RequestOutcome.COMPLETED]
+        and all(outcomes[cause] == count for cause, count in causes.items())
+    )
 
 
-def _answered_first_reported(evidence: Evidence) -> bool:
-    """Whether a live attempt's first answer reported its cached input: its starting cache is
-    then known from reported usage."""
-    answered = [one.attempt for one in evidence.requests if one.attempt.usage is not None or not one.attempt.failed]
-    if not answered:
-        return False
-    first = min(answered, key=lambda attempt: attempt.sent_ms)
-    return first.usage is not None and first.usage.cached_input_tokens is not None
+def _lag_p95(rows: Sequence[RequestRecord]) -> float | None:
+    lags = [float(one.sent_ms - one.eligible_ms) for one in rows]
+    return percentile(lags, 95) if lags else None
 
 
 def _liveness_tokens(seconds: float) -> int:
@@ -548,6 +670,49 @@ def route_exchange(route: Route, model: str, prefix: str) -> tuple[str, dict[str
     return _PATHS[route], headers, json.dumps(body).encode()
 
 
+def _dict(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def calls_the_tool(route: Route, data: Mapping[str, Any]) -> bool:
+    """Whether one event of a route's stream calls the route warm-up's tool: a `tool_use` block on
+    Messages, a `function_call` item on Responses, a tool call's function on Chat Completions."""
+    if route is Route.MESSAGES:
+        block = _dict(data.get("content_block"))
+        return (
+            data.get("type") == "content_block_start"
+            and block.get("type") == "tool_use"
+            and (block.get("name") == WARM_UP_TOOL)
+        )
+    if route is Route.RESPONSES:
+        item = _dict(data.get("item"))
+        return item.get("type") == "function_call" and item.get("name") == WARM_UP_TOOL
+    choices = data.get("choices")
+    for choice in choices if isinstance(choices, list) else ():
+        calls = _dict(_dict(choice).get("delta")).get("tool_calls")
+        for call in calls if isinstance(calls, list) else ():
+            if _dict(_dict(call).get("function")).get("name") == WARM_UP_TOOL:
+                return True
+    return False
+
+
+class _ToolCall:
+    """Reads a route's stream beside the driver's reader, for a call of the warm-up's tool."""
+
+    def __init__(self, route: Route) -> None:
+        self.route, self.events, self.called = route, SseReader(), False
+
+    def feed(self, chunk: bytes) -> None:
+        for event in self.events.feed(chunk):
+            if event.comment or self.called:
+                continue
+            try:
+                data = json.loads(event.data)
+            except ValueError:
+                continue
+            self.called = isinstance(data, dict) and calls_the_tool(self.route, data)
+
+
 # --- The run -------------------------------------------------------------------------------------
 
 
@@ -565,16 +730,38 @@ class _Recorded:
             yield work
 
 
+class _Sink:
+    """One cell's attempt in the journal: each observation is appended the moment it is made."""
+
+    def __init__(self, runner: _Run, attempt: int) -> None:
+        self.runner, self.attempt = runner, attempt
+        self.requests: list[RequestRecord] = []
+        self.trials: list[TrialRecord] = []
+        self.samples: list[HostSample] = []
+
+    def request(self, record: RequestRecord) -> None:
+        self.runner.journal.append(self.attempt, record)
+        self.requests.append(record)
+        self.runner.next_request = max(self.runner.next_request, record.request + 1)
+
+    def trial(self, record: TrialRecord) -> None:
+        self.runner.journal.append(self.attempt, record)
+        self.trials.append(record)
+
+    def sample(self, sample: HostSample) -> None:
+        self.runner.journal.append(self.attempt, sample)
+        self.samples.append(sample)
+
+
 @dataclass
 class _Driven:
     """What driving a cell left, before its telemetry is read."""
 
     record: CellRecord | None
-    requests: list[RequestRecord]
-    trials: list[TrialRecord]
-    tallies: list[Tally]
-    live: list[Evidence]
-    flags: set[InvalidFlag]
+    identities: int
+    tallies: list[Tally] = field(default_factory=list)
+    live: list[tuple[int, Evidence]] = field(default_factory=list)
+    flags: set[InvalidFlag] = field(default_factory=set)
     side_queries: int = 0
 
 
@@ -599,15 +786,16 @@ class _Run:
         self.source, self.harnesses, self.graders, self.journal = source, _Recorded(harnesses), graders, journal
         self.manifest, self.cancel, self.origin_s, self.deadline_ms = manifest, cancel, origin_s, deadline_ms
         self.clock = gateway.clock
+        self.tolerance = plan_.spec.protocol["driver"]["scheduling_lag_p95_ms_max"]
         self.ordinals = telemetry.Ordinals()
         self.evidence = replay.Evidence()
-        self.next_request = 0
-        self.execution = 0
         self.warm_up: telemetry.Window | None = None
         self.ended: Ended | None = None
         self.breach: booking.Reason | None = None
         session = admitted.outcome.session
         self.hosts = 0 if session is None else session.instances
+        # Ordinals go on from what the journal holds: a resume adds to the run, it does not restart it.
+        self.next_request, self.execution, self.executions = _history(journal)
 
     # Times.
 
@@ -624,28 +812,47 @@ class _Run:
             return Ended.CANCELLED
         if self.clock.now_ms() >= self.deadline_ms:
             return Ended.DEADLINE
-        breach = await self.admitted.continuity()
+        try:
+            breach = await self.admitted.continuity()
+        except Exception:  # noqa: BLE001 - a probe that cannot answer establishes no continuity
+            breach = booking.Reason.POOL_STATE_UNREADABLE
         if breach is not None:
-            self.breach = breach
+            self.breach = self.breach or breach
             return Ended.CONTINUITY_LOST
         return None
 
-    async def _watch(self, stop: asyncio.Event) -> None:
-        """Sets `stop` once the run is cancelled, past its deadline, or out of its booking."""
-        while not stop.is_set():
-            tripped = await self._tripped()
+    def _halted(self, stop: asyncio.Event) -> bool:
+        """Whether the cell is stopped, as read at this instant: the watcher may not have run since
+        the cancel event was set or the deadline passed."""
+        if not stop.is_set():
+            now = self.clock.now_ms()
+            tripped = Ended.CANCELLED if self.cancel.is_set() else Ended.DEADLINE if now >= self.deadline_ms else None
             if tripped is not None:
                 self.ended = self.ended or tripped
                 stop.set()
-                return
-            wake = min(self.clock.now_ms() + WATCH_MS, self.deadline_ms)
-            await _first(_until(self.clock, wake), self.cancel.wait(), stop.wait())
+        return stop.is_set()
+
+    async def _watch(self, stop: asyncio.Event) -> None:
+        """Sets `stop` once the run is cancelled, past its deadline, or out of its booking. It
+        never ends quietly: whatever ends it, the cell is stopped."""
+        try:
+            while not stop.is_set():
+                tripped = await self._tripped()
+                if tripped is not None:
+                    self.ended = self.ended or tripped
+                    return
+                wake = min(self.clock.now_ms() + WATCH_MS, self.deadline_ms)
+                await _first(_until(self.clock, wake), self.cancel.wait(), stop.wait())
+        except Exception:  # noqa: BLE001 - a watcher that broke can no longer show the booking held
+            self.breach = self.breach or booking.Reason.POOL_STATE_UNREADABLE
+            self.ended = self.ended or Ended.CONTINUITY_LOST
+        finally:
+            stop.set()
 
     async def _bounded[T](self, work: Awaitable[T], stop: asyncio.Event, drain_ms: int) -> T | None:
-        """Runs a cell's work under the watcher. Once it is stopped, the work has `drain_ms` to end
-        and is then cancelled: `None` for work that had to be."""
+        """Runs a cell's work until it ends or the cell is stopped. Once it is stopped, the work has
+        `drain_ms` to end and is then cancelled: `None` for work that had to be."""
         task = asyncio.ensure_future(work)
-        watch = asyncio.ensure_future(self._watch(stop))
         try:
             await _first(asyncio.shield(task), stop.wait())
             if not task.done():
@@ -657,8 +864,7 @@ class _Run:
             return task.result()
         finally:
             task.cancel()
-            watch.cancel()
-            await asyncio.gather(task, watch, return_exceptions=True)
+            await asyncio.gather(task, return_exceptions=True)
 
     # Reading the telemetry.
 
@@ -678,17 +884,6 @@ class _Run:
             tokenizer_revision=self.source.tokenizer_revision,
             gateway_profile_digest=self.source.gateway_profile_digest,
         )
-
-    async def _observe(
-        self, cell: int, window: telemetry.Window, driver: telemetry.Driver
-    ) -> tuple[telemetry.Reading, tuple[HostSample, ...]]:
-        """Waits for the window's scrapes to be delivered, then reads and resolves it."""
-        await _until(self.clock, math.ceil((telemetry.readable_from(window) - self.origin_s) * 1000))
-        source = self.source
-        answers = telemetry.read(source.reader, source.pool, source.engine, window, driver.warm_up)
-        reading = telemetry.resolve(answers, window, source.requested, driver, self.ordinals)
-        samples = host_samples(answers, reading, window, self.ordinals, cell=cell, origin_s=self.origin_s)
-        return reading, samples
 
     def _hosts_working(self, started_ms: int) -> bool:
         """Whether, from `started_ms` to the last delivered scrape, every selected host counted
@@ -717,7 +912,8 @@ class _Run:
             if self.ended is not None:
                 break
             planned = self.plan.cells[cell]
-            if any(one.cell == cell and one.reusable for one in self.journal.attempts):
+            warm = planned.identity.phase is Phase.WARM_UP
+            if not warm and any(one.cell == cell and one.reusable for one in self.journal.attempts):
                 continue
             tripped = await self._tripped()
             if tripped is None and self.clock.now_ms() + self.plan.reserved_ms(planned) > self.deadline_ms:
@@ -730,48 +926,74 @@ class _Run:
         return done
 
     async def cell(self, planned: PlannedCell) -> CellResult:
+        warm = planned.identity.phase is Phase.WARM_UP
+        attempt = self.journal.start_cell(
+            planned.identity.cell, self.plan.workload_hash, self.manifest.treatment_id, again=warm
+        ).ordinal
+        sink = _Sink(self, attempt)
+        stop = asyncio.Event()
+        watch = asyncio.ensure_future(self._watch(stop))
+        try:
+            return await self._measured(planned, sink, stop)
+        except BaseException:
+            # A driver that raised: what the cell observed stays, in an attempt that cannot count.
+            if self.journal.attempts[attempt].status is AttemptStatus.RUNNING:
+                with contextlib.suppress(JournalError):
+                    self.journal.interrupt(attempt)
+            raise
+        finally:
+            watch.cancel()
+            await asyncio.gather(watch, return_exceptions=True)
+
+    async def _measured(self, planned: PlannedCell, sink: _Sink, stop: asyncio.Event) -> CellResult:
         number = planned.identity.cell
-        attempt = self.journal.start_cell(number, self.plan.workload_hash, self.manifest.treatment_id).ordinal
         baseline = self._baseline()
         started_ms = self.clock.now_ms()
-        stop = asyncio.Event()
         if planned.identity.phase is Phase.WARM_UP:
-            driven = await self._warm_up_cell(planned, stop)
+            driven = await self._warm_up_cell(planned, sink, stop)
         elif planned.identity.phase in LIVE_PHASES:
-            driven = await self._live_cell(planned, stop)
+            driven = await self._live_cell(planned, sink, stop)
         else:
-            driven = await self._replay_cell(planned, stop)
-        for request in driven.requests:
-            self.journal.append(attempt, request)
-        for trial in driven.trials:
-            self.journal.append(attempt, trial)
+            driven = await self._replay_cell(planned, sink, stop)
         tally = _tally(driven.tallies) if driven.tallies else None
-        record, reading, samples = driven.record, None, ()
-        if record is not None and self.ended is None:
+        record, reading, window = driven.record, None, None
+        if record is not None and self.ended is None and not self._halted(stop):
             started_ms = min(started_ms, record.started_ms)
             window = self.window(started_ms, record.ended_ms)
-            warm_up = None if planned.identity.phase is Phase.WARM_UP else self.warm_up
-            attempts = len(driven.requests) - driven.side_queries
-            reading, samples = await self._observe(
-                number, window, self._driver(attempts, driven.side_queries, warm_up, baseline)
-            )
-            record = self._judged(planned, record, driven, reading, baseline, started_ms)
-            for sample in samples:
-                self.journal.append(attempt, sample)
+            # The scrapes of the window are awaited under the watcher: a stop meanwhile stops the cell.
+            readable_ms = math.ceil((telemetry.readable_from(window) - self.origin_s) * 1000)
+            await _first(_until(self.clock, readable_ms), stop.wait())
+            if not self._halted(stop):
+                source = self.source
+                warm_up = None if planned.identity.phase is Phase.WARM_UP else self.warm_up
+                attempts = len(sink.requests) - driven.side_queries
+                driver = self._driver(attempts, driven.side_queries, warm_up, baseline)
+                answers = telemetry.read(source.reader, source.pool, source.engine, window, warm_up)
+                reading = telemetry.resolve(answers, window, source.requested, driver, self.ordinals)
+                for sample in host_samples(
+                    answers, reading, window, self.ordinals, cell=number, origin_s=self.origin_s
+                ):
+                    sink.sample(sample)
+                record = self._judged(planned, record, driven, sink, answers, window, reading, baseline, started_ms)
+        if reading is not None and self.ended is None and not stop.is_set():
+            # The booking must still hold once the window has been read: it held through all of it.
+            tripped = await self._tripped()
+            if tripped is not None:
+                self.ended = self.ended or tripped
+        checkpointed = record is not None and reading is not None and self.ended is None and not stop.is_set()
+        if checkpointed and record is not None:
+            self.journal.checkpoint_cell(sink.attempt, record)
             if planned.identity.phase is Phase.WARM_UP:
                 self.warm_up = window
-        checkpointed = record is not None and reading is not None
-        if checkpointed and record is not None:
-            self.journal.checkpoint_cell(attempt, record)
         else:
-            self.journal.interrupt(attempt)
+            self.journal.interrupt(sink.attempt)
         return CellResult(
             cell=planned,
-            attempt=attempt,
+            attempt=sink.attempt,
             record=record,
-            requests=tuple(driven.requests),
-            trials=tuple(driven.trials),
-            samples=samples,
+            requests=tuple(sorted(sink.requests, key=lambda one: one.request)),
+            trials=tuple(sink.trials),
+            samples=tuple(sink.samples),
             tally=tally,
             reading=reading,
             checkpointed=checkpointed,
@@ -782,6 +1004,9 @@ class _Run:
         planned: PlannedCell,
         record: CellRecord,
         driven: _Driven,
+        sink: _Sink,
+        answers: Mapping[telemetry.Key, Sequence[Series]],
+        window: telemetry.Window,
         reading: telemetry.Reading,
         baseline: telemetry.Preflight,
         started_ms: int,
@@ -793,14 +1018,24 @@ class _Run:
             # The warm-up is what warms: it does not owe a warm-up of its own.
             reasons.discard(telemetry.Reason.WARM_UP_INCOMPLETE)
         flags |= {telemetry.FLAG_OF[reason] for reason in reasons}
-        if baseline.missing or baseline.hosts < self.hosts:
+        if baseline.missing or baseline.hosts != self.hosts:
             flags.add(InvalidFlag.MISSING_EVIDENCE)
-        seats = {one.student for one in driven.requests if one.traffic is not Traffic.LIVE}
-        seats |= {trials.LIVE_STUDENT} if any(one.traffic is Traffic.LIVE for one in driven.requests) else set()
-        if len(seats) < planned.identities:
+        # What served the window is what was booked: the hosts selected, one release on them.
+        if len(reading.hosts) != self.hosts:
+            flags.add(InvalidFlag.HOST_TURNOVER)
+        for treatment in BOOKED:
+            reason = reading.treatments.get(treatment)
+            if reason is not None and reason is not telemetry.Reason.NOT_DECLARED:
+                flags.add(InvalidFlag.MISSING_EVIDENCE if reason in _UNSEEN else InvalidFlag.HOST_TURNOVER)
+        # Every seat sent as its own student, and the gateway counted each of them as the driver did.
+        sent = Counter(one.student for one in sink.requests)
+        if len(sent) < driven.identities:
             flags.add(InvalidFlag.MISSING_EVIDENCE)
-        if not all(_answered_first_reported(one) for one in driven.live):
-            flags.add(InvalidFlag.MISSING_EVIDENCE)
+        counted = telemetry.identity_requests(answers, window, self.aliases)
+        for student, alias in enumerate(self.aliases):
+            seen = counted[alias]
+            if (0 if seen is None else round(seen)) != sent[student]:
+                flags.add(InvalidFlag.UNRECONCILED_COUNTERS)
         return dataclasses.replace(
             record,
             started_ms=started_ms,
@@ -812,14 +1047,11 @@ class _Run:
         flags: set[InvalidFlag] = set()
         if ran.summary.fresh_prefix is replay.Fresh.UNVERIFIED:
             flags.add(InvalidFlag.MISSING_EVIDENCE)
-        if not _rows_tallied(ran.summary.tally, len(ran.requests)):
+        if not reconciled(ran.summary.tally, ran.requests):
             flags.add(InvalidFlag.UNRECONCILED_COUNTERS)
         return flags
 
-    def _took(self, requests: Iterable[RequestRecord]) -> None:
-        self.next_request = max((one.request + 1 for one in requests), default=self.next_request)
-
-    async def _replay_cell(self, planned: PlannedCell, stop: asyncio.Event) -> _Driven:
+    async def _replay_cell(self, planned: PlannedCell, sink: _Sink, stop: asyncio.Event) -> _Driven:
         work = replay.run_cell(
             self.plan,
             planned.identity.cell,
@@ -828,64 +1060,81 @@ class _Run:
             stops=replay.Stops(cancel=stop, deadline_ms=self.deadline_ms),
             first_request=self.next_request,
             evidence=self.evidence,
+            on_request=sink.request,
         )
         ran = await self._bounded(work, stop, planned.drain_ms)
         if ran is None:
-            return _Driven(None, [], [], [], [], set())
-        self._took(ran.requests)
-        return _Driven(ran.record, list(ran.requests), [], [ran.summary.tally], [], self._replay_flags(ran))
+            return _Driven(None, planned.identities)
+        return _Driven(ran.record, planned.identities, [ran.summary.tally], flags=self._replay_flags(ran))
 
-    async def _route_warm_up(self, planned: PlannedCell) -> tuple[list[RequestRecord], Tally]:
+    async def _route_warm_up(self, planned: PlannedCell, sink: _Sink, stop: asyncio.Event, tally: Attempts) -> bool:
         """One streamed tool exchange on each route of the suite, as the cohort's first student,
-        under the warm-up's prefix."""
-        attempts = Attempts()
-        records: list[RequestRecord] = []
+        under the warm-up's prefix: whether each answer completed with a call of the tool. None is
+        sent once the cell is stopped."""
         gateway, clock = self.gateway, self.clock
         prefix = f"warm-up {planned.input_seed} namespace {planned.prefix_namespace}"
+        exchanged = True
         async with httpx.AsyncClient(
             base_url=gateway.endpoint, timeout=loadgen.TIMEOUT, transport=gateway.transport, trust_env=False
         ) as http:
             for conversation, name in enumerate(self.plan.spec.protocol["warm_up"]["routes"]):
+                if self._halted(stop):
+                    return False
                 route = Route(name)
                 path, headers, body = route_exchange(route, gateway.model, f"{prefix} route {route.value}")
                 headers |= {"authorization": f"Bearer {self.keys[0]}"}
                 eligible = sent = clock.now_ms()
-                reader = attempts.send(route, sent)
+                reader, called = tally.send(route, sent), _ToolCall(route)
+                ordinal, self.next_request = self.next_request, self.next_request + 1
                 try:
                     async with http.stream("POST", path, headers=headers, content=body) as answer:
                         reader.answered(answer.status_code)
                         async for chunk in answer.aiter_bytes():
                             reader.feed(chunk, clock.now_ms())
+                            called.feed(chunk)
                 except httpx.HTTPError:
                     reader.end(clock.now_ms(), transport_error=True)
-                ended = reader.end(clock.now_ms())
-                records.append(
-                    RequestRecord(
-                        request=self.next_request,
-                        cell=planned.identity.cell,
-                        student=0,
-                        conversation=conversation,
-                        turn=0,
-                        traffic=Traffic.WARM_UP,
-                        trial=None,
-                        eligible_ms=eligible,
-                        finish_reason=None,
-                        **ended.measured(),
+                finally:
+                    # The exchange as it ended, or, cut, as far as it had come.
+                    ended = reader.end(clock.now_ms())
+                    sink.request(
+                        RequestRecord(
+                            request=ordinal,
+                            cell=planned.identity.cell,
+                            student=0,
+                            conversation=conversation,
+                            turn=0,
+                            traffic=Traffic.WARM_UP,
+                            trial=None,
+                            eligible_ms=eligible,
+                            finish_reason=None,
+                            **ended.measured(),
+                        )
                     )
-                )
-                self.next_request += 1
-        return records, attempts.tally()
+                exchanged = exchanged and not ended.failed and called.called
+        return exchanged
 
-    async def _warm_up_cell(self, planned: PlannedCell, stop: asyncio.Event) -> _Driven:
+    def _widened(self, planned: PlannedCell) -> PlannedCell:
+        """The warm-up's replay on one seat for each canary of the cohort, in the warm-up's shape,
+        each from the start: whichever host a student's affinity sends to, a student works it."""
+        slots = len(self.keys) * self.plan.spec.conversations[planned.identity.shape]
+        return dataclasses.replace(planned, identities=len(self.keys), replay_slots=slots, arrivals_ms=(0,) * slots)
+
+    async def _warm_up_cell(self, planned: PlannedCell, sink: _Sink, stop: asyncio.Event) -> _Driven:
         started_ms = self.clock.now_ms()
-        routes, tally = await self._route_warm_up(planned)
-        if any(one.failed for one in routes):
-            self.ended = Ended.ROUTE_WARM_UP_FAILED
-            return _Driven(None, routes, [], [tally], [], set())
+        attempts = Attempts()
+        routed = await self._bounded(self._route_warm_up(planned, sink, stop, attempts), stop, planned.drain_ms)
+        routes = list(sink.requests)
+        if not routed:
+            if not self._halted(stop):
+                self.ended = self.ended or Ended.ROUTE_WARM_UP_FAILED
+            return _Driven(None, 1, [attempts.tally()])
+        flags = set() if reconciled(attempts.tally(), routes) else {InvalidFlag.UNRECONCILED_COUNTERS}
+        widened = self._widened(planned)
         finished = asyncio.Event()
         until_ms = min(self.deadline_ms, started_ms + self.plan.spec.estimates.warm_up_ms)
         work = replay.run_cell(
-            self.plan,
+            _with_cell(self.plan, widened),
             planned.identity.cell,
             self.gateway,
             self.keys,
@@ -893,6 +1142,7 @@ class _Run:
             first_request=self.next_request,
             evidence=self.evidence,
             first_conversation=len(routes),
+            on_request=sink.request,
         )
 
         async def poll() -> None:
@@ -908,16 +1158,57 @@ class _Run:
             polling.cancel()
             await asyncio.gather(polling, return_exceptions=True)
         if ran is None:
-            return _Driven(None, routes, [], [tally], [], set())
-        self._took(ran.requests)
+            return _Driven(None, widened.identities, [attempts.tally()])
         if not finished.is_set() and self.ended is None:
             self.ended = Ended.WARM_UP_INCOMPLETE
         record = dataclasses.replace(ran.record, started_ms=started_ms)
-        requests = [*routes, *ran.requests]
-        return _Driven(record, requests, [], [tally, ran.summary.tally], [], self._replay_flags(ran))
+        flags |= self._replay_flags(ran)
+        return _Driven(record, widened.identities, [attempts.tally(), ran.summary.tally], flags=flags)
 
-    async def _live_cell(self, planned: PlannedCell, stop: asyncio.Event) -> _Driven:
+    def _live_attempt(self, planned: PlannedCell, sink: _Sink, driven: _Driven) -> Callable[[trials.Executed], int]:
+        """What is kept of each live attempt once it is graded: its trial record, linked to the
+        execution it replaces, and its forwarder's requests, numbered from the next ordinal."""
+
+        def kept(executed: trials.Executed) -> int:
+            record = executed.record
+            earlier = self.executions.get(record.trial)
+            if earlier is not None and earlier < record.execution:
+                record = dataclasses.replace(record, replaces=earlier)
+            self.executions[record.trial] = record.execution
+            self.execution = max(self.execution, record.execution + 1)
+            evidence = self.harnesses.evidence.pop(record.trial, None)
+            taken = 0
+            if evidence is not None:
+                rows = []
+                for turn, measured in enumerate(evidence.requests):
+                    rows.append(
+                        measured.request_record(
+                            request=self.next_request,
+                            cell=planned.identity.cell,
+                            student=trials.LIVE_STUDENT,
+                            conversation=len(driven.live),
+                            turn=turn,
+                            trial=record.trial,
+                        )
+                    )
+                    sink.request(rows[-1])
+                    taken += 1
+                driven.live.append((record.trial, evidence))
+                driven.tallies.append(evidence.tally)
+                driven.side_queries += sum(one.side_call for one in evidence.requests)
+                if not reconciled(evidence.tally, rows):
+                    driven.flags.add(InvalidFlag.UNRECONCILED_COUNTERS)
+                # Its starting cache is known from reported usage: the first answers met the prefix uncached.
+                if replay.met_fresh(rows) is not True:
+                    driven.flags.add(InvalidFlag.MISSING_EVIDENCE)
+            sink.trial(record)
+            return taken
+
+        return kept
+
+    async def _live_cell(self, planned: PlannedCell, sink: _Sink, stop: asyncio.Event) -> _Driven:
         self.harnesses.evidence.clear()
+        driven = _Driven(None, planned.identities)
         work = trials.run(
             self.plan,
             self.gateway,
@@ -929,49 +1220,26 @@ class _Run:
             evidence=self.evidence,
             first_execution=self.execution,
             first_request=self.next_request,
+            on_request=sink.request,
+            on_attempt=self._live_attempt(planned, sink, driven),
         )
         ran = await self._bounded(work, stop, planned.drain_ms + round(CANCEL_S * 1000))
         if ran is None or not ran.cells:
-            return _Driven(None, [], [], [], [], set())
+            return driven
         (cell,) = ran.cells
-        self.execution += len(cell.trials)
         background = cell.background
-        requests = list(background.requests)
-        self._took(requests)
-        flags: set[InvalidFlag] = set()
         for one in background.runs:
-            flags |= self._replay_flags(one)
-        tallies = [one.summary.tally for one in background.runs]
-        conversation = max((one.conversation + 1 for one in requests), default=0)
-        live: list[Evidence] = []
-        side = 0
-        for at, executed in enumerate(cell.trials):
-            evidence = self.harnesses.evidence.get(executed.record.trial)
-            if evidence is None:
-                continue
-            live.append(evidence)
-            tallies.append(evidence.tally)
-            if not _rows_tallied(evidence.tally, len(evidence.requests)):
-                flags.add(InvalidFlag.UNRECONCILED_COUNTERS)
-            side += sum(one.side_call for one in evidence.requests)
-            for turn, measured in enumerate(evidence.requests):
-                requests.append(
-                    measured.request_record(
-                        request=self.next_request,
-                        cell=planned.identity.cell,
-                        student=trials.LIVE_STUDENT,
-                        conversation=conversation + at,
-                        turn=turn,
-                        trial=executed.record.trial,
-                    )
-                )
-                self.next_request += 1
+            driven.flags |= self._replay_flags(one)
+        driven.tallies[:0] = [one.summary.tally for one in background.runs]
+        lag = _lag_p95([one for one in sink.requests if one.traffic is Traffic.LIVE])
+        if lag is not None and lag > self.tolerance:
+            driven.flags.add(InvalidFlag.DRIVER_SATURATION)
         record = background.record
         counted = {one.record.trial for one in cell.trials if one.record.counts_as_attempt}
         if record is not None and counted != set(planned.trials):
             record = dataclasses.replace(record, status=CellStatus.INCOMPLETE)
-        trial_records = [one.record for one in cell.trials]
-        return _Driven(record, requests, trial_records, tallies, live, flags, side_queries=side)
+        driven.record = record
+        return driven
 
 
 async def run(
@@ -998,15 +1266,23 @@ async def run(
     session = admitted.outcome.session
     if not admitted.outcome.ready or session is None:
         raise PhaseError(Refusal.BOOKING_NOT_READY)
+    if gateway.model != session.pool or source.pool != session.pool:
+        raise PhaseError(Refusal.BOOKING_MISMATCH)
     keys, aliases = cohort(plan_, canaries)
+    chosen = [one.identity.cell for one in plan_.cells] if cells is None else [0, *(one for one in cells if one)]
+    _graders_held(plan_, chosen, graders)
     manifest = resolve_manifest(plan_, artifacts, source.requested.settings)
-    _write_manifest(journal.directory, manifest)
+    _resumable(plan_, journal, manifest)
+    _history(journal)
     clock = gateway.clock
     found = telemetry.preflight(source.reader, source.pool, source.engine, origin_s + clock.now_ms() / 1000)
     if found.missing or found.hosts < session.instances:
         raise PhaseError(Refusal.TELEMETRY_UNAVAILABLE)
+    if found.hosts > session.instances:
+        raise PhaseError(Refusal.BOOKING_MISMATCH)
     if not await headroom(plan_, clock, keys, admissions_ms=headroom_ms):
         raise PhaseError(Refusal.DRIVER_HEADROOM_MISSED)
+    _write_manifest(journal.directory, manifest)
     booked_ms = round((session.ends_at - origin_s) * 1000) - plan_.spec.estimates.cleanup_ms
     ends_ms = booked_ms if deadline_ms is None else min(booked_ms, deadline_ms)
     runner = _Run(
@@ -1024,7 +1300,6 @@ async def run(
         origin_s,
         ends_ms,
     )
-    chosen = [one.identity.cell for one in plan_.cells] if cells is None else [0, *(one for one in cells if one)]
     done = await runner.run(chosen)
     readings = [one.reading for one in done if one.reading is not None]
     manifest = dataclasses.replace(manifest, observed=_agreed(readings))
