@@ -413,6 +413,9 @@ def test_a_cancel_accepted_while_the_run_is_in_its_preflight_holds_and_nothing_i
     assert answers[0]["ok"] and shown["cancel_requested"]
     assert shown["exit"] == controller.Exit.INCOMPLETE and shown["issue"] is None
     assert host.counts() == (1, 0, 0)
+    # Shown as cancelled with nothing to deliver: no write was attempted, so none was refused.
+    assert shown["publication"] != controller.Publication.PENDING.value
+    assert host.services.fake.github.writes() == []
 
 
 def test_a_client_saves_its_submission_before_sending_it_and_the_same_id_with_other_fields_is_refused(
@@ -574,6 +577,17 @@ def test_a_repository_the_driver_reads_but_cannot_open_an_issue_in_is_admitted_a
     shown = host.settled(sid)
     assert shown["run_id"] == answer["run_id"] and shown["exit"] == controller.Exit.INCOMPLETE
     assert shown.get("issue") is None and host.counts() == (1, 0, 0)
+    # A refused creation shows as a write awaiting confirmation, like a lost answer: delivery
+    # stays pending while the write is refused, and opens that one issue once it is allowed.
+    assert shown["publication"] == controller.Publication.PENDING.value and not shown["cancel_requested"]
+    run_id = answer["run_id"]
+    assert controller.publish_resume(host.runs, run_id, connect=host.services, out=io.StringIO()) == 2
+    assert github.issues == {}
+    monkeypatch.setattr(github, "_route", routed)
+    assert controller.publish_resume(host.runs, run_id, connect=host.services, out=io.StringIO()) == 0
+    (number,) = github.issues
+    assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
+    assert host.counts() == (1, 1, 0)
 
 
 @pytest.mark.parametrize("operator_hosts", [None, 1], ids=["no-session", "another-host-count"])

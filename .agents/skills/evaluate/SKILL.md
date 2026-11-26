@@ -45,15 +45,17 @@ Admission and the issue's creation are two steps. Admission only reads. It answe
 repository has no issues. It also refuses a selected issue that is missing or records another
 workload, or hosts or a `--for` the pool cannot hold. Nothing is created then. The issue is created
 after admission, by the admitted run, before any booking. The `issue` field shows a URL only once
-GitHub has confirmed the issue. If the run cannot get that confirmation, it stops before booking.
+GitHub has confirmed the issue. A run that ends without that confirmation stops before booking:
 `submit` has already returned a run ID, and `inspect --submission <submission-id>` then shows no
-`issue`, `running: false` and `exit: 2`. Two cases follow, and `publication` tells them apart:
+`issue`, `running: false` and `exit: 2`. These fields do not say why, and you never guess a cause:
 
-- `publication: pending`: the creation is in doubt. GitHub may have created the issue and the
-  answer was lost. `scripts/evaluate.sh publish --resume <run-id>` reconciles it and never opens a
-  second one.
-- any other `publication`: GitHub refused the write (the token can read the repository but not
-  open issues in it). No issue exists.
+- `cancel_requested: true`: the run was cancelled before its issue was confirmed.
+- `publication: pending`: a write awaits GitHub's confirmation. GitHub may have created the issue
+  and lost its answer, or refused the write: the driver cannot tell them apart, and neither can
+  you. `scripts/evaluate.sh publish --resume <run-id>` delivers it, finds an issue GitHub did
+  create by the run's marker, and never opens a second one.
+- with neither, nothing awaits delivery and no issue was confirmed. The run's own record is
+  `scripts/evaluate.sh status <run-id>`, in the operator's terminal.
 
 ## The commands
 
@@ -100,15 +102,17 @@ or `--issue <number>`, and optionally `--suite`, `--question`, `--target`, `--in
 2. Until `issue:` appears or `running` is `false`, run `inspect --submission <submission-id>` again
    about every 30 seconds, for at most 10 minutes. The issue is created and confirmed before any
    host is booked, and the preflight may first build the trial image. If `running` is `false` with
-   no `issue`, the driver could not confirm the experiment issue, and no host was booked. Report
-   the run ID, `exit` and `step`, then:
-   - if `publication` is `pending`, GitHub may have created the issue without the driver getting
-     its confirmation. Tell the operator to run `scripts/evaluate.sh publish --resume <run-id>`
-     in their own terminal. It needs no GPU, finds the original issue by the run's marker (or
-     creates it if GitHub never received the request), and never opens a second issue. After
-     that, `inspect` shows the issue;
-   - otherwise GitHub refused the write and no issue exists. Tell the operator to check the driver
-     token's access to the repository's issues.
+   no `issue`, the run ended before an experiment issue was confirmed, and no host was booked.
+   Report the fields of step 1 as the driver gave them, `cancel_requested` included, and say no
+   more about the cause than they do (see "The experiment's repository"). Then:
+   - if `publication` is `pending`, a write awaits confirmation. Tell the operator to run
+     `scripts/evaluate.sh publish --resume <run-id>` in their own terminal. It needs no GPU, finds
+     the issue by the run's marker if GitHub created it (or creates it if GitHub never received
+     the request), and never opens a second issue. After that, `inspect` shows the issue. If it
+     still reports the publication pending, the operator checks the driver token's access to the
+     repository's issues and runs it again;
+   - otherwise nothing awaits delivery. If `cancel_requested` is `true`, the run was cancelled;
+     if not, point the operator to `scripts/evaluate.sh status <run-id>` in their terminal.
 3. Report to the operator:
    - the experiment issue's URL. It is where the run's terminal comment will be;
    - the run ID and the submission ID;
