@@ -281,6 +281,10 @@ class Artifacts:
     trial_image: image.Runner
 
 
+# Told of each attempt about to be checkpointed: its ordinal, its scheduler's tally, its reading.
+type Keep = Callable[[int, Tally | None, telemetry.Reading], None]
+
+
 @dataclass(frozen=True)
 class Admitted:
     """A booking that `booking.Capacity` found ready, and the probe of its continuity: `None` while
@@ -885,10 +889,12 @@ class _Run:
         origin_s: float,
         deadline_ms: int,
         prior: tuple[Settings, Serving] | None,
+        keep: Keep | None = None,
     ) -> None:
         self.plan, self.admitted, self.gateway, self.keys, self.aliases = plan_, admitted, gateway, keys, aliases
         self.source, self.harnesses, self.graders, self.journal = source, _Recorded(harnesses), graders, journal
         self.manifest, self.cancel, self.origin_s, self.deadline_ms = manifest, cancel, origin_s, deadline_ms
+        self.keep = keep
         self.clock = gateway.clock
         self.tolerance = plan_.spec.protocol["driver"]["scheduling_lag_p95_ms_max"]
         self.ordinals = telemetry.Ordinals()
@@ -1128,6 +1134,10 @@ class _Run:
                 self.ended = self.ended or tripped
         checkpointed = record is not None and reading is not None and self.ended is None and not self._halted(stop)
         if checkpointed and record is not None and reading is not None:
+            if self.keep is not None:
+                # What the bundle needs beside the journal, saved before the checkpoint that
+                # makes the cell one a resume keeps.
+                self.keep(sink.attempt, tally, reading)
             self.journal.checkpoint_cell(sink.attempt, record)
             if warm:
                 self.warm_up = window
@@ -1435,11 +1445,13 @@ async def run(
     cancel: asyncio.Event | None = None,
     deadline_ms: int | None = None,
     headroom_ms: int = HEADROOM_MS,
+    keep: Keep | None = None,
 ) -> Result:
     """Runs the plan's cells in order in the admitted booking (the module's text): all of them
     unless `cells` names some, the warm-up first in any case. `origin_s` is the time, in seconds
     since the epoch, at which the run's clock (`gateway.clock`) read zero. `PhaseError`, with
-    nothing sent to the gateway, for a run that cannot be measured."""
+    nothing sent to the gateway, for a run that cannot be measured. `keep`, when given, is told
+    each attempt that is about to be checkpointed, with its scheduler's tally and its reading."""
     session = admitted.outcome.session
     if not admitted.outcome.ready or session is None:
         raise PhaseError(Refusal.BOOKING_NOT_READY)
@@ -1479,6 +1491,7 @@ async def run(
         origin_s,
         ends_ms,
         prior,
+        keep,
     )
     done = await runner.run(chosen)
     # The manifest was written again at each checkpoint: what every window it keeps observed alike.
@@ -1493,6 +1506,7 @@ __all__ = [
     "Canaries",
     "CellResult",
     "Ended",
+    "Keep",
     "PhaseError",
     "Refusal",
     "Result",

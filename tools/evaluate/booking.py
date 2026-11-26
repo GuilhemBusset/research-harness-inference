@@ -35,7 +35,8 @@ all of:
   batch and the cleanup away, and the note still no older than `SUPPLY_FRESH_SECONDS`: a probe
   takes time, and an operator can edit the session during it.
 
-The last moment a batch may start is the bound record's end less the batch and the cleanup. No
+The last moment a batch may start is the bound record's end, or the invocation's own end
+(`until`) when that comes first, less the batch and the cleanup. No
 poll starts after it and none admits a batch after it, so the wait is bounded by the booking
 itself; capacity that turns up later is not used. A record that is no longer the bound one ends
 the wait at once: a session someone else wrote is not waited on, and not used.
@@ -304,13 +305,16 @@ class Capacity:
     """The capacity of one invocation: `acquire`, then the driver's batch, then `release`. After a
     restart, over the journal the earlier process left: `reconcile`, then `wait` or `release`."""
 
-    def __init__(self, selection: Selection, access: Access, journal: Journal) -> None:
+    def __init__(self, selection: Selection, access: Access, journal: Journal, *, until: int | None = None) -> None:
         saved = journal.booking or journal.intended or journal.designated
         if saved is not None and saved.pool != selection.pool:
             raise ValueError("the journal holds a session of another pool than the selected one")
         if saved is not None and saved.instances != selection.instances:
             raise ValueError("the journal holds a session of another number of hosts than the selected one")
         self.selection, self.access, self.journal = selection, access, journal
+        # The end of the authorized invocation, in seconds since the epoch: the batch and its
+        # cleanup end by then, whatever later end the bound record has.
+        self.until = until
         self._hours = access.sessions.session_max_hours
         self._reserved = selection.batch_seconds + selection.cleanup_seconds
 
@@ -323,6 +327,11 @@ class Capacity:
 
     def _end(self, session: Session) -> int:
         return rules.end(session, session_max_hours=self._hours)
+
+    def _usable_end(self, session: Session) -> int:
+        """The end the batch and its cleanup must keep to: the session's, or the invocation's."""
+        end = self._end(session)
+        return end if self.until is None else min(end, self.until)
 
     def _read(self) -> Session | None:
         """The pool's record. One that does not read as a session is not this invocation's: `None`."""
@@ -376,7 +385,7 @@ class Capacity:
         if actual.instances != self.selection.instances:
             return Reason.SESSION_COUNT_MISMATCH
         # The batch runs while the session is active: after its start, when that is still to come.
-        if self._end(actual) - max(now, actual.starts_at) < self._reserved:
+        if self._usable_end(actual) - max(now, actual.starts_at) < self._reserved:
             return Reason.WINDOW_TOO_SHORT
         self.journal.designated = actual
         self.journal.save()
@@ -401,7 +410,7 @@ class Capacity:
             )
         except rules.SessionError:
             return Reason.OUTSIDE_POOL_LIMITS
-        if intended.ends_at - now < self._reserved:
+        if min(intended.ends_at, self.until or intended.ends_at) - now < self._reserved:
             return Reason.WINDOW_TOO_SHORT
         journal.intended = intended
         journal.save()
@@ -463,7 +472,7 @@ class Capacity:
             return Reason.BOOKING_UNCONFIRMED if managed else Reason.SESSION_NOT_FOUND, None
         if self.journal.stops:
             return Reason.BOOKING_RELEASING, None
-        last_start = self._end(bound) - self._reserved
+        last_start = self._usable_end(bound) - self._reserved
         found = None
         while True:
             now = self._now()

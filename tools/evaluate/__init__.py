@@ -83,5 +83,6 @@ the journal alone. It needs the standard library, `evaluate.journal` and the hyg
 selected pool and the experiment's repository. It binds the journal, the preflight, the issue, the
 booking, the phases, the cleanup, the local report and the terminal comment in that order, resumes a
 run after reconciling what it booked, and gives the exit code of the verdict. `evaluate.cli` runs it
-for `run`, `status`, `cancel`, `publish --resume` and `compare --issue`.
+for `run`, `status`, `cancel`, `publish --resume` and `compare --issue`. `evaluate.live` resolves
+the instruments of the selected pool for a live run, from the driver's AWS session and this host.
 """

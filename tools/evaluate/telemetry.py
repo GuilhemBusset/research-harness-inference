@@ -448,6 +448,9 @@ class Host:
     """What its lifecycle agent said it serves, where it said one thing of the grammar."""
     launch_fingerprints: tuple[str, ...]
     """Every fingerprint its agent said in the window: one, on a host that kept its engine."""
+    launch_whole_window: bool
+    """Whether one fingerprint, and nothing else, was said through the host's time in service:
+    a gap in the launch series is not covered by the release series showing the host."""
     in_service_seconds: float
     membership: Reason | None
     """`None` for a host its release samples show through the whole window, or why they do not:
@@ -1183,6 +1186,7 @@ def resolve(
                 image_digest=_held(_only(image for _, image, _ in served), _DIGEST),
                 model_revision=_held(_only(revision for _, _, revision in served), _COMMIT),
                 launch_fingerprints=fingerprints,
+                launch_whole_window=whole,
                 in_service_seconds=seconds_covered(taken, window.started, window.drained),
                 membership=membership,
                 counters=counters,

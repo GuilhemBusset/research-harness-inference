@@ -56,16 +56,23 @@ booking; `--session existing` uses the operator's own booking and leaves its lif
 measured cells are kept, its interrupted ones run again. The run journals are under `--runs`
 (`.cache/eval/runs` by default, outside the repository's history).
 
-`run` prints its progress and the time left in the booking, the issue's URL, the capacity and
-quality verdicts with their limiting rows, the report's paths, the cleanup, and whether the terminal
-comment was delivered or is pending. **Its exit code is the verdict's**: 0 for a completed profile
-that meets its applicable floors, 1 for a measured miss, 2 for invalid, incomplete or inconclusive
-evidence, or a refusal. A comment that GitHub did not take changes no exit code: it stays pending,
-`status` shows it, and `publish --resume` delivers it, which needs no booking and no GPU and exits
-0 once nothing is pending, 2 otherwise. `status` reads a run without taking it, even while a driver
-runs it, and `cancel` asks that driver to stop: it stops admissions and releases the booking it made.
-`compare --issue` compares two runs of the issue from their local bundles and posts the comparison
-once on it.
+`run` prints its progress and the time left in the invocation, the issue's URL, the capacity and
+quality verdicts with their limiting rows, the report's paths, the cleanup, and the publication:
+`delivered` once GitHub confirmed every write, `pending` while the issue's creation or a comment
+waits, `refused` for a comment the hygiene scan or a field check refused, `none` before anything
+was written. **Its exit code is the verdict's**: 0 for a completed profile that meets its applicable
+floors, at every load it measured; 1 for a measured miss of a completed profile; 2 for invalid,
+incomplete or inconclusive evidence, an invocation that failed or was interrupted (whatever it
+measured: its verdict rows still show a miss), or a refusal. The publication changes no exit code:
+`status` shows it, and `publish --resume` delivers what waits, which needs no booking and no GPU
+and exits 0 once nothing is pending, 2 otherwise. `--for` bounds the whole invocation from its
+start, the wait for capacity included; the cells chosen keep the planner's allowance for that wait
+out of the window, as `plan` prints the batches. The report prices the deployed pool's instance
+type unless `--rate` is given. `status` reads a run without taking it, even while a driver runs it,
+and `cancel` asks that driver to stop: it stops admissions and releases the booking it made.
+`compare --issue` compares two runs of the same experiment issue, in the same repository, from their
+local bundles and posts the comparison once on it. A malformed `--repository`, or an issue number
+that is not one, is refused with 2 before anything is connected to.
 """
 
 from __future__ import annotations
@@ -102,6 +109,8 @@ class Source:
 
     EXAMPLE = "example"
     SUPPLIED = "supplied"
+    # The selected pool's deployed price of the instance type that served: what a live run reads.
+    DEPLOYED = "deployed"
 
 
 def _duration_ms(text: str) -> int:
@@ -122,6 +131,13 @@ def _issue(text: str) -> int | None:
     if not _ISSUE.fullmatch(text):
         raise argparse.ArgumentTypeError("needs new or an issue number")
     return None if text == "new" else int(text)
+
+
+def _issue_number(text: str) -> int:
+    found = _issue(text)
+    if found is None:
+        raise argparse.ArgumentTypeError("needs an issue number")
+    return found
 
 
 def _example() -> tuple[int, float]:
@@ -282,7 +298,9 @@ def parser() -> argparse.ArgumentParser:
     )
     compare.add_argument("reference", help="a bundle, or with --issue the reference's run ID")
     compare.add_argument("candidate", help="a bundle, or with --issue the candidate's run ID")
-    compare.add_argument("--issue", type=int, help="post the comparison of two runs of this experiment issue")
+    compare.add_argument(
+        "--issue", type=_issue_number, help="post the comparison of two runs of this experiment issue"
+    )
     export = commands.add_parser("export", help="write a validated public copy of a bundle under docs/evaluations/")
     export.add_argument("bundle", type=Path)
     export.add_argument("--to", dest="destination", type=Path, required=True)
@@ -323,11 +341,16 @@ def parser() -> argparse.ArgumentParser:
 def _live(args: argparse.Namespace, example_rate: float, connect: Connect | None) -> int:
     """`run`, `status`, `cancel`, `publish --resume` and `compare --issue`: the operator
     controller, imported here, since it needs the pool's and the phases' modules."""
-    from evaluate import controller
+    from evaluate import controller, publisher
 
     chosen = controller.connect_live if connect is None else connect
     repository = getattr(args, "repository", None) or os.environ.get(REPOSITORY_VARIABLE)
-    rate = (example_rate, Source.EXAMPLE) if getattr(args, "rate", None) is None else (args.rate, Source.SUPPLIED)
+    if args.command in ("run", "publish", "compare") and repository and not publisher.valid_repository(repository):
+        # Refused before anything is connected to: no lookup, no network.
+        print(f"refused: {controller.Refusal.INVALID_REQUEST.value}: the repository is not owner/name", file=sys.stderr)
+        return 2
+    supplied = None if getattr(args, "rate", None) is None else (args.rate, Source.SUPPLIED)
+    example = (example_rate, Source.EXAMPLE)
     if args.command == "status":
         return controller.status(args.runs, args.run_id, sys.stdout)
     if args.command == "cancel":
@@ -342,7 +365,7 @@ def _live(args: argparse.Namespace, example_rate: float, connect: Connect | None
             args.candidate,
             connect=chosen,
             out=sys.stdout,
-            rate=rate,
+            rate=supplied or example,
             repository=repository,
         )
     if not repository:
@@ -363,7 +386,8 @@ def _live(args: argparse.Namespace, example_rate: float, connect: Connect | None
         target=args.target,
         input_seed=args.input_seed,
         schedule_seed=args.schedule_seed,
-        rate=rate,
+        rate=supplied,
+        fallback_rate=example,
     )
     return controller.execute(request, connect=chosen, root=args.runs, out=sys.stdout)
 
@@ -417,7 +441,7 @@ def main(argv: list[str] | None = None, *, connect: Connect | None = None) -> in
     it is the driver's live one (`controller.connect_live`)."""
     args = parser().parse_args(argv)
     example_window, example_rate = _example()
-    if args.command in ("run", "status", "cancel", "publish") or (args.command == "compare" and args.issue):
+    if args.command in ("run", "status", "cancel", "publish") or (args.command == "compare" and args.issue is not None):
         return _live(args, example_rate, connect)
     if args.command != "plan":
         return _evidence(args, example_rate)

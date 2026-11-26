@@ -32,13 +32,18 @@
 # RHI_EVALUATE_REPOSITORY). It prints its progress, the time left, the issue's URL, both verdicts
 # and their limiting rows, the report's paths, the cleanup and the publication. Exit codes of `run`:
 #
-#   0  a completed profile that meets its applicable floors
-#   1  a measured miss
-#   2  invalid, incomplete or inconclusive evidence, or a refusal
+#   0  a completed profile that meets its applicable floors, at every load it measured
+#   1  a measured miss of a completed profile
+#   2  invalid, incomplete or inconclusive evidence, an invocation that failed or was interrupted
+#      (its verdict rows still show what it measured), or a refusal
 #
-# A comment GitHub did not take is reported as pending and changes no exit code: `status` shows it,
-# and `publish --resume` delivers it with no booking and no GPU (0 once nothing is pending, else 2).
-# `cancel` asks the run's driver to stop; it releases the booking it made.
+# The publication changes no exit code. It is `delivered` once GitHub confirmed every write,
+# `pending` while the issue's creation or a comment waits, `refused` for a comment the scan refused:
+# `status` shows it, and `publish --resume` delivers what waits with no booking and no GPU (0 once
+# nothing is pending, else 2). `--for` bounds the whole invocation, the wait for capacity included.
+# `cancel` asks the run's driver to stop; it releases the booking it made. The driver resolves the
+# selected pool's gateway, telemetry, canaries and release from its own AWS session, and prepares
+# the trial image on this host (tools/evaluate/live.py).
 #
 # The tool is the package tools/evaluate, run with the locked environment (`uv run --locked`). The
 # project does not install it, so this script puts `tools` on the import path itself, with
