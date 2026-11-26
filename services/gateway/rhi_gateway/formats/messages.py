@@ -44,10 +44,11 @@ reference inside a tool result), and its `Tool` object.
 
 **What the request profile rewrites is kept as it is sent** (sections 6.1 and 6.2, step 4): the
 reasoning effort (`output_config.effort`; the vLLM project's replay of Claude Code's traffic
-records `{"effort":"high"}` there `[E28]`), a system message wherever it sits in `messages`, and a
-document block. This list refuses none of them, whatever the pool's model does with them.
+records `{"effort":"high"}` there `[E28]`), a system message wherever it sits in `messages`, a
+document block, and a tool reference inside a tool result. This list refuses none of them, whatever
+the pool's model does with them.
 
-**Three entries are not like their neighbours:**
+**Four entries are not like their neighbours:**
 
 - `thinking` is kept whole, with any type and any field: the engine reads it from vLLM 0.33 on
   (section 6.1). Its `budget_tokens` is not clamped with the output limit.
@@ -56,6 +57,10 @@ document block. This list refuses none of them, whatever the pool's model does w
   field the reference does not give a location or the switch is dropped like any other.
 - `source` is described as the object of an image or a document. On a search result it is a
   string, which the filter keeps as it is.
+- `name`, on a tool reference inside a tool result, is no field of the reference, which names the
+  tool in `tool_name`. vLLM reads `name` where the item has no `tool_name`, and so does the request
+  profile's entry for tool references (`rhi_gateway.profile.tool_reference_as_text`), which is
+  given the filtered body: the name is kept for it to read, on a tool reference only (`Kinds`).
 
 **Blocks this endpoint cannot serve are replaced, never refused** (section 6.2, step 4; ADR 0003,
 decision 7). A block the engine refuses stays in the conversation's history, so every later
@@ -82,7 +87,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-from rhi_gateway.body import KEEP, Fields, Items, Limit, Shapes, Spec
+from rhi_gateway.body import KEEP, Fields, Items, Kinds, Limit, Shapes, Spec
 
 # What the engine reads where a block of each kind was. No number, no name of the deployment.
 SEARCH_RESULT_SENTENCE: Final = (
@@ -233,6 +238,13 @@ _IN_A_TOOL_RESULT: Final[dict[str, Spec]] = {
     "tool_name": KEEP,
 }
 
+# An item of a tool result. A tool reference also keeps `name`, which is no field of the reference:
+# where vLLM, and the request profile's entry for tool references, read the tool's name when the
+# item has no `tool_name` (above). No other item keeps it.
+_TOOL_RESULT_ITEM: Final = Kinds(
+    Fields(_IN_A_TOOL_RESULT), {"tool_reference": Fields({**_IN_A_TOOL_RESULT, "name": KEEP})}
+)
+
 # `tools`, `Tool`: a tool the client defines and runs.
 _TOOL: Final = Fields(
     {
@@ -265,7 +277,7 @@ _IN_A_MESSAGE: Final[dict[str, Spec]] = {
     "toolset_name": KEEP,  # and `ToolResultBlockParam`
     # `ToolResultBlockParam`
     "tool_use_id": KEEP,
-    "content": Items(Fields(_IN_A_TOOL_RESULT)),
+    "content": Items(_TOOL_RESULT_ITEM),
     "is_error": KEEP,
     # Beta: `BetaRequestToolAdditionBlock` and `BetaRequestToolRemovalBlock`, in a system message.
     # `tool` is a `BetaToolChangeToolReference` (`type`, `name`) or, in an addition, a

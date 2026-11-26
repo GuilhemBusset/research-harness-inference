@@ -45,7 +45,8 @@ array: what describes each item), `KEEP` (a value kept whole) and `Limit` (a num
 Where it describes an object, an object is filtered, a string, a number, a boolean or a null is
 kept as it is (it holds no field to drop), and an array is refused; the same holds, turned round,
 where it describes an array. A name the format gives both shapes is a `Shapes`, which describes
-the object and the array, each as strictly as it would be alone. `KEEP` is for a value that is data to the engine and holds no media:
+the object and the array, each as strictly as it would be alone. An object some of whose types
+keep fields the others do not is a `Kinds`, which describes each such type apart. `KEEP` is for a value that is data to the engine and holds no media:
 a tool's schema, a tool call's arguments. Nothing below a `KEEP` is looked at.
 
 **Media.** The engine can be made to fetch an address it is given, so a reference is forwarded
@@ -146,7 +147,23 @@ class Shapes:
         return self.items if isinstance(value, list) else self.fields
 
 
-type Spec = Fields | Items | Shapes | Limit | _Keep
+@dataclass(frozen=True)
+class Kinds:
+    """In an allow-list: an object, some of whose types keep fields of their own.
+
+    An object whose `type` names an entry of `types` is kept as that entry describes it, and any
+    other value as `fields` does.
+    """
+
+    fields: Fields
+    types: Mapping[str, Fields]
+
+    def of(self, value: Any) -> Fields:
+        kind = value.get("type") if isinstance(value, dict) else None
+        return self.types.get(kind, self.fields) if isinstance(kind, str) else self.fields
+
+
+type Spec = Fields | Items | Shapes | Kinds | Limit | _Keep
 
 # A pool's request profile on one route: it gets the filtered body and returns the body to serialize.
 # A format's replacement (step 4) has the same shape: it gets the parsed body and returns the body to filter.
@@ -292,7 +309,7 @@ def _keep(value: Any, spec: Spec, pool: Pool) -> Any:
         return value
     if isinstance(spec, Limit):
         return _clamp(value, spec.of(pool))
-    if isinstance(spec, Shapes):
+    if isinstance(spec, (Shapes, Kinds)):
         spec = spec.of(value)
     if isinstance(spec, Fields):
         if isinstance(value, dict):
@@ -309,7 +326,7 @@ def _keep(value: Any, spec: Spec, pool: Pool) -> Any:
 
 def _refuse_references(value: Any, spec: Spec) -> None:
     """Refuse a media reference that is not inline data, at every level the allow-list describes."""
-    if isinstance(spec, Shapes):
+    if isinstance(spec, (Shapes, Kinds)):
         spec = spec.of(value)
     if isinstance(value, list) and isinstance(spec, Items):
         for inner in value:
