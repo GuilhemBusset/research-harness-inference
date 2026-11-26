@@ -44,7 +44,11 @@ harness. Everything else of the environment is the container's own.
   `workers.TOOLS` is on the `PATH`, so the harness's shell tool calls a tool by its name;
 - *delegation* (`delegation`; Claude Code): the tools that start a worker are among those Claude
   Code may use without asking, since no one is there to ask, and `delegation` reads from Claude
-  Code's own output how many delegated workers ran and whether two of them were alive at once;
+  Code's own output how many delegated workers it started and whether two of them were alive at
+  once: from the events it prints when a worker starts and when it ends, and from the worker's
+  own messages. Workers that are alive at once are also answered at once only when the trial's
+  budget gives each answer an allowance (`forwarding.Budget`, `request_tokens`): a request with
+  none holds every token the trial has left, and the forwarder keeps the next one waiting;
 - *skills* (`skills`; Claude Code): the skill tool is allowed too. Reading a PDF needs nothing more
   than the file tools every Claude Code trial has.
 
@@ -61,7 +65,10 @@ An assignment that asks a harness for a feature it does not have here is refused
   refusal of the call (`CLAUDE_REFUSALS`). For Codex, OpenCode and Pi the adapter reads no such
   event from what they print: there, such a trial shows as the limit it runs into or as an exit
   in failure, and the adapter does not name it;
-- *invalid*, `driver_error`: the harness could not be started, or the runtime failed.
+- *invalid*, `driver_error`: the measurement broke, not the attempt. The harness could not be
+  started (the launcher could not write its profile, or there was no such command), the runtime
+  or the worker's transcript failed, or the harness ended in failure without having asked the
+  model for a single turn: it never worked on the task, whatever the task's folder holds.
 
 A harness that ended in failure for another reason has no reason of the adapter's:
 `Ending.evidence` gives its exit status to the forwarder, which names an endpoint failure when a
@@ -127,37 +134,51 @@ SKILL_TOOL = "Skill"
 # arguments that are not JSON or not the tool's, and a tool it does not have. A tool that ran and
 # failed begins otherwise.
 CLAUDE_REFUSALS = ("<tool_use_error>InputValidationError", "<tool_use_error>Error: No such tool available")
+# The events the pinned Claude Code prints (`type` `system`) when something it runs in the
+# background starts and when it has ended, and what a delegated worker is among those things.
+TASK_STARTED, TASK_ENDED = "task_started", "task_notification"
+LIFECYCLE = (TASK_STARTED, TASK_ENDED)
+AGENT_TASK = "local_agent"
 
 # The SDK tool loop, as the file a trial's home is given.
 SDK_TOOL_LOOP = Path(__file__).with_name("sdk_tool_loop.py")
 SDK_TOOL_LOOP_FILE = "sdk_tool_loop.py"
 # Its exit status when calls it could not carry out ended it (`sdk_tool_loop.MALFORMED_EXIT`).
 MALFORMED_EXIT = 3
-# The exit statuses that say no harness ran: the launcher's own, and the runtime's (it could not
-# run the command, could not start it, did not find it).
-NOT_STARTED = frozenset({125, 126, 127})
+# The exit statuses that say no harness ran: the launcher's own (`SETUP_FAILED` when it could not
+# set the home up, `NO_COMMAND` when it could not become the harness), and the runtime's (it could
+# not run the command, could not start it, did not find it).
+SETUP_FAILED = 125
+NO_COMMAND = 127
+NOT_STARTED = frozenset({SETUP_FAILED, 126, NO_COMMAND})
 
 # The launcher: the command of every step, given one JSON object. It writes the files, makes the
 # commands among them executable, and becomes the harness with its variables, the folders of
-# `path` first on the container's own `PATH`.
-LAUNCHER = """\
+# `path` first on the container's own `PATH`. Whatever stops it before the harness is one of the
+# statuses of `NOT_STARTED`, never a status a harness that ran could have ended with for a task.
+LAUNCHER = f"""\
 import json
 import os
 import sys
 
-asked = json.loads(sys.argv[1])
-for path, text in asked["files"].items():
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        file.write(text)
-for path in asked["commands"]:
-    os.chmod(path, 0o755)
-environment = {**os.environ, **asked["environment"]}
-environment["PATH"] = os.pathsep.join([*asked["path"], os.environ.get("PATH", "")])
+try:
+    asked = json.loads(sys.argv[1])
+    for path, text in asked["files"].items():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            file.write(text)
+    for path in asked["commands"]:
+        os.chmod(path, 0o755)
+    environment = {{**os.environ, **asked["environment"]}}
+    environment["PATH"] = os.pathsep.join([*asked["path"], os.environ.get("PATH", "")])
+except Exception as error:
+    print("the harness was not set up:", type(error).__name__, file=sys.stderr)
+    sys.exit({SETUP_FAILED})
 try:
     os.execvpe(asked["argv"][0], asked["argv"], environment)
-except OSError:
-    sys.exit(127)
+except Exception as error:
+    print("the harness was not started:", type(error).__name__, file=sys.stderr)
+    sys.exit({NO_COMMAND})
 """
 
 
@@ -188,9 +209,9 @@ class Delegation:
     """What Claude Code's output shows of the workers it delegated to."""
 
     workers: int
-    """The delegated workers that ran: each sent a message of its own."""
+    """The delegated workers Claude Code started."""
     overlapped: bool
-    """Two of them were alive at once: each printed a message before the other's last."""
+    """Two of them were alive at once: each had started before the other ended."""
 
 
 @dataclass(frozen=True)
@@ -205,9 +226,14 @@ class Ending:
 
     def evidence(self, forwarder: Forwarder) -> Evidence:
         """The trial's evidence, with this ending: the forwarder's own reading of the exit
-        status, and this ending's failure where the forwarder saw none."""
+        status, and this ending's failure where the forwarder saw none. A harness that did not
+        complete, for no reason either of them names, and that the forwarder admitted no model
+        turn of, never worked on the task: the trial is invalid, the driver's error."""
         observed = forwarder.evidence(invalid=self.invalid, exit_status=self.exit_status)
-        return replace(observed, failure=observed.failure or self.failure)
+        failure, invalid = observed.failure or self.failure, observed.invalid
+        if not self.completed and failure is None and invalid is None and observed.model_turns == 0:
+            invalid = InvalidReason.DRIVER_ERROR
+        return replace(observed, failure=failure, invalid=invalid)
 
 
 @dataclass(frozen=True)
@@ -271,20 +297,43 @@ def _result_text(block: Mapping[str, Any]) -> str:
 
 
 def delegation(output: str) -> Delegation:
-    """The delegated workers Claude Code's output shows, and whether two overlapped. A worker's
-    messages, its model's and its tools' results, name the tool call that started it
-    (`parent_tool_use_id`): the worker is alive from the first of them to the last. The pinned
-    Claude Code starts its workers in the background, so the result of the call that starts one
-    says nothing of when it ended. The events are in the order Claude Code printed them, which is
-    the evidence: two workers overlapped when each printed a message before the other's last."""
+    """The delegated workers one run of Claude Code started, as its output shows them, and whether
+    two overlapped. The pinned Claude Code starts its workers in the background, so the result of
+    the call that starts one says nothing of when it ended. What does:
+
+    - the event it prints when a worker starts (`task_started`, of an agent) and the one it prints
+      when that worker ended, however it did (`task_notification`); each names the tool call that
+      started the worker;
+    - the worker's own messages, its model's and its tools' results, which name that call too
+      (`parent_tool_use_id`).
+
+    A worker is alive from the first of these to the last, and one whose start was printed and
+    whose end was not is alive to the end of the output. The events are in the order Claude Code
+    printed them, which is the evidence: two workers overlapped when each had started before the
+    other ended. A worker that sent a single answer is alive all the same, from its start to its
+    end."""
+    printed = events(output)
     first: dict[str, int] = {}
     last: dict[str, int] = {}
-    for at, event in enumerate(events(output)):
-        parent = event.get("parent_tool_use_id")
-        if isinstance(parent, str):
-            first.setdefault(parent, at)
-            last[parent] = at
-    spans = [(first[one], last[one]) for one in first]
+    running: set[str] = set()
+    for at, event in enumerate(printed):
+        call, lifecycle = event.get("parent_tool_use_id"), None
+        if event.get("type") == "system" and event.get("subtype") in LIFECYCLE:
+            call, lifecycle = event.get("tool_use_id"), event["subtype"]
+        if not isinstance(call, str):
+            continue
+        if lifecycle == TASK_STARTED:
+            # Claude Code prints the same event for the other things it runs in the background.
+            if event.get("task_type") != AGENT_TASK:
+                continue
+            running.add(call)
+        elif lifecycle == TASK_ENDED:
+            if call not in first:
+                continue
+            running.discard(call)
+        first.setdefault(call, at)
+        last[call] = at
+    spans = [(first[call], len(printed) if call in running else last[call]) for call in first]
     overlapped = any(
         start < other_end and other_start < end
         for index, (start, end) in enumerate(spans)
@@ -437,7 +486,9 @@ class Adapter:
 
     def trial(self, worker: Runs, prompts: Sequence[str]) -> Trial:
         """Gives the harness the task's prompt, then each follow-up while the one before
-        completed, and says how the trial ended. A runtime that fails is the driver's error."""
+        completed, and says how the trial ended. A runtime that fails, or a transcript that cannot
+        be written, is the driver's error: the worker has ended its container by then
+        (`Worker.run`), and the trial has its ending all the same."""
         steps: list[Step] = []
         ending = Ending(completed=True)
         try:
@@ -446,10 +497,13 @@ class Adapter:
                 ending = self.ending(steps[-1])
                 if not ending.completed:
                     break
-        except workers.WorkerFault:
+        except (workers.WorkerFault, OSError):
             ending = Ending(completed=False, invalid=InvalidReason.DRIVER_ERROR)
-        delegated = HarnessFeature.DELEGATION in self.features
-        found = delegation("\n".join(step.output for step in steps)) if delegated else None
+        found = None
+        if HarnessFeature.DELEGATION in self.features:
+            # Each step is a run of Claude Code, with workers of its own.
+            runs = [delegation(step.output) for step in steps]
+            found = Delegation(sum(one.workers for one in runs), any(one.overlapped for one in runs))
         return Trial(tuple(steps), ending, found)
 
     def ending(self, step: Step) -> Ending:

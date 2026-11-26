@@ -14,11 +14,12 @@ standard library and the SDK only.
 
 **A tool that fails is the model's to handle.** A file that is not there, a path outside the
 folder, a program that exits in failure: the model is given what happened as the tool's result and
-goes on. **A call that cannot be carried out at all** (arguments that are no JSON object, a tool
-the loop does not have) is answered the same way, so that the model can write it again; after
-`MALFORMED_CALLS` such turns in a row the loop stops, and exits `MALFORMED_EXIT`: the trial did not
-complete because of the calls. It exits 0 with the model's answer, and 1 when the SDK raised or
-`TURNS` calls were made.
+goes on. **A call that cannot be carried out at all** (a call of another kind than a function's, a
+tool the loop does not have, arguments that are no JSON object or that lack a text the tool
+requires) is answered the same way, so that the model can write it again; after `MALFORMED_CALLS`
+such turns in a row the loop stops, and exits `MALFORMED_EXIT`: the trial did not complete because
+of the calls. It exits 0 with the model's answer, and 1 when the SDK raised or `TURNS` calls were
+made.
 """
 
 from __future__ import annotations
@@ -56,10 +57,13 @@ TOOLS: list[Any] = [
     {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
     for name, (description, parameters) in _DESCRIPTIONS.items()
 ]
+# What the model is given for a call that cannot be carried out.
+REFUSAL = "error: not a call of one of the tools: an unknown tool, or arguments that are not the tool's JSON object"
 
 
 class Malformed(Exception):
-    """A call the loop cannot carry out: its arguments are no JSON object, or it names no tool of the loop."""
+    """A call the loop cannot carry out: it is no function's call, it names no tool of the loop,
+    or its arguments are no JSON object that holds each text the tool requires."""
 
 
 def use_tool(folder: Path, name: str, arguments: str) -> str:
@@ -70,17 +74,20 @@ def use_tool(folder: Path, name: str, arguments: str) -> str:
         raise Malformed from None
     if name not in _DESCRIPTIONS or not isinstance(given, dict):
         raise Malformed
+    # Every argument a tool requires is a text.
+    if any(not isinstance(given.get(required), str) for required in _DESCRIPTIONS[name][1].get("required", [])):
+        raise Malformed
     try:
         if name == "list_files":
             return "\n".join(sorted(one.relative_to(folder).as_posix() for one in folder.rglob("*") if one.is_file()))
-        path = (folder / str(given["path"])).resolve()
+        path = (folder / given["path"]).resolve()
         if not path.is_relative_to(folder.resolve()):
             return "refused: the path is outside the working folder"
         if name == "read_file":
             return path.read_text(encoding="utf-8")
         if name == "write_file":
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(str(given["content"]), encoding="utf-8")
+            path.write_text(given["content"], encoding="utf-8")
             return "written"
         ran = subprocess.run(
             [sys.executable, str(path)], cwd=folder, capture_output=True, text=True, timeout=RUN_SECONDS, check=False
@@ -102,16 +109,20 @@ def loop(client: Any, model: str, prompt: str, folder: Path) -> int:
     for _ in range(TURNS):
         message = client.chat.completions.create(model=model, messages=messages, tools=TOOLS).choices[0].message
         messages.append(message.model_dump(exclude_none=True))
-        calls = [call for call in message.tool_calls or [] if getattr(call, "function", None) is not None]
+        calls = message.tool_calls or []
         if not calls:
             print(message.content or "")
             return 0
         refused = False
         for call in calls:
+            # A call of another kind (a custom tool's) has no function: the loop declared none such.
+            function = getattr(call, "function", None)
             try:
-                result = use_tool(folder, call.function.name, call.function.arguments)
+                if function is None:
+                    raise Malformed
+                result = use_tool(folder, function.name, function.arguments)
             except Malformed:
-                refused, result = True, "error: this call names no tool, or its arguments are not a JSON object"
+                refused, result = True, REFUSAL
             messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
         malformed = malformed + 1 if refused else 0
         if malformed >= MALFORMED_CALLS:

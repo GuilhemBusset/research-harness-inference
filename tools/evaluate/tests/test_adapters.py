@@ -18,6 +18,7 @@ tests/container/test_evaluate_adapters.py. Every key, prompt and word here is ma
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import re
 import subprocess
@@ -28,10 +29,21 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
+from openai.types.chat import ChatCompletion
 
-from evaluate import adapters, plan, scripted, workers
+from evaluate import adapters, plan, scripted, sdk_tool_loop, workers
 from evaluate.adapters import Adapter, Delegation, Ending, Step, Unsupported
-from evaluate.contracts import FailureReason, Harness, HarnessAssignment, HarnessFeature, InvalidReason, Limits, Route
+from evaluate.contracts import (
+    FailureReason,
+    Grade,
+    Harness,
+    HarnessAssignment,
+    HarnessFeature,
+    InvalidReason,
+    Limits,
+    Route,
+    TrialOutcome,
+)
 from evaluate.forwarding import PLACEHOLDER_KEY, Budget, Forwarder, run_clock
 from evaluate.scripted import Conversation, Delegate, Phase, Pool, Raw, Read, Say, Shell, Write
 from rhi_cli import harness as login
@@ -259,6 +271,19 @@ def event(kind: str, parent: str | None = None, **more: object) -> str:
     return json.dumps({"type": kind, "parent_tool_use_id": parent, **more})
 
 
+def lifecycle(subtype: str, call: str, **more: object) -> str:
+    """What the pinned Claude Code prints when the worker a tool call started starts, or has ended."""
+    return json.dumps({"type": "system", "subtype": subtype, "tool_use_id": call, "task_id": f"task-{call}", **more})
+
+
+def worker_started(call: str, kind: str = "local_agent") -> str:
+    return lifecycle("task_started", call, task_type=kind)
+
+
+def worker_ended(call: str) -> str:
+    return lifecycle("task_notification", call, status="completed")
+
+
 def tool_result(text: str, *, failed: bool) -> str:
     block = {"type": "tool_result", "tool_use_id": "made-up", "is_error": failed, "content": text}
     return event("user", message={"role": "user", "content": [block]})
@@ -480,6 +505,42 @@ def test_workers_that_ran_one_after_the_other_did_not_overlap() -> None:
     assert adapters.delegation("\n".join(lines)) == Delegation(workers=2, overlapped=False)
 
 
+def test_two_workers_alive_at_once_overlap_though_each_sent_a_single_answer() -> None:
+    # As the pinned Claude Code prints it: both workers started, then each answered once and ended.
+    lines = [
+        worker_started("worker-one"),
+        worker_started("worker-two"),
+        event("assistant", "worker-one"),
+        worker_ended("worker-one"),
+        event("assistant", "worker-two"),
+        worker_ended("worker-two"),
+        event("result", is_error=False),
+    ]
+    assert adapters.delegation("\n".join(lines)) == Delegation(workers=2, overlapped=True)
+
+
+def test_a_worker_that_ended_before_the_next_started_did_not_overlap_it() -> None:
+    lines = [
+        worker_started("worker-one"),
+        event("assistant", "worker-one"),
+        worker_ended("worker-one"),
+        worker_started("worker-two"),
+        event("assistant", "worker-two"),
+        worker_ended("worker-two"),
+    ]
+    assert adapters.delegation("\n".join(lines)) == Delegation(workers=2, overlapped=False)
+
+
+def test_a_worker_whose_end_was_not_printed_is_alive_to_the_end_of_the_output() -> None:
+    lines = [worker_started("worker-one"), event("assistant", "worker-one"), worker_started("worker-two"), worker_ended("worker-two")]
+    assert adapters.delegation("\n".join(lines)) == Delegation(workers=2, overlapped=True)
+
+
+def test_what_else_runs_in_the_background_is_no_delegated_worker() -> None:
+    lines = [worker_started("worker-one"), worker_started("a-shell", "local_bash"), worker_ended("a-shell"), worker_ended("worker-one")]
+    assert adapters.delegation("\n".join(lines)) == Delegation(workers=1, overlapped=False)
+
+
 def test_a_run_that_delegated_nothing_has_no_worker() -> None:
     assert adapters.delegation("\n".join([event("assistant"), event("result")])) == Delegation(0, False)
 
@@ -532,6 +593,44 @@ def test_calls_the_loop_cannot_carry_out_end_the_trial_as_malformed(tmp_path: Pa
     assert (evidence.failure, evidence.may_pass) == (FailureReason.MALFORMED_TOOL_CALL, False)
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        {"type": "custom", "custom": {"name": "no_such_tool", "input": "made-up"}},
+        {"type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+        {"type": "function", "function": {"name": "write_file", "arguments": '{"path": "a.txt", "content": 1}'}},
+    ],
+    ids=["no-function", "required-argument-missing", "required-argument-no-text"],
+)
+def test_a_call_the_loop_has_no_way_to_run_is_refused_to_the_model_and_ends_as_malformed(
+    call: dict[str, object], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    asked: list[list[object]] = []
+
+    class Client:
+        """The SDK's client, as far as the loop uses it: every answer is that call, as the SDK reads it."""
+
+        def __init__(self) -> None:
+            self.chat = self.completions = self
+
+        def create(self, *, model: str, messages: Sequence[object], tools: Sequence[object]) -> ChatCompletion:
+            asked.append(list(messages))
+            message = {"role": "assistant", "tool_calls": [{"id": f"call-{len(asked)}", **call}]}
+            choice = {"index": 0, "message": message, "finish_reason": "tool_calls"}
+            answer = {"id": "made-up", "object": "chat.completion", "created": 0, "model": model, "choices": [choice]}
+            return ChatCompletion.model_validate(answer)
+
+    status = sdk_tool_loop.loop(Client(), POOL, "made-up prompt", tmp_path)
+
+    # It is no answer of the model's and no failure of a tool: the loop stopped for the calls,
+    assert status == sdk_tool_loop.MALFORMED_EXIT
+    assert capsys.readouterr().out == ""
+    assert not (tmp_path / "a.txt").exists()
+    # after it told the model of each, as the result of that call.
+    assert len(asked) == sdk_tool_loop.MALFORMED_CALLS
+    assert asked[-1][-1] == {"role": "tool", "tool_call_id": f"call-{len(asked) - 1}", "content": sdk_tool_loop.REFUSAL}
+
+
 def test_a_model_that_corrects_a_malformed_call_completes(tmp_path: Path) -> None:
     marker = word()
     steps = [lambda _: Raw("read_file", '{"path": '), lambda _: Read("seed.txt"), lambda _: Say("done")]
@@ -575,14 +674,49 @@ def test_a_step_the_wall_time_ended_is_a_timeout_and_a_harness_that_did_not_star
     assert built.ending(step(exit_code=1, tmp_path=tmp_path)) == Ending(completed=False, exit_status=1)
 
 
-def test_a_runtime_that_fails_makes_the_trial_invalid(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "fault",
+    [workers.WorkerFault("made-up fault"), OSError(errno.ENOSPC, "made-up fault of the transcript")],
+    ids=["runtime", "transcript"],
+)
+def test_a_runtime_or_a_transcript_that_fails_makes_the_trial_invalid(fault: Exception, tmp_path: Path) -> None:
     class Broken:
         transcript = tmp_path / "transcript"
 
         def run(self, command: Sequence[str]) -> workers.Ran:
-            raise workers.WorkerFault("made-up fault")
+            raise fault
 
     trial = adapter(Harness.PI).trial(Broken(), ["made-up prompt"])
 
     assert trial.steps == ()
     assert trial.ending == Ending(completed=False, invalid=InvalidReason.DRIVER_ERROR)
+
+
+def test_a_harness_that_could_not_be_set_up_is_an_invalid_trial_whatever_the_grade(tmp_path: Path) -> None:
+    accepted = Grade(properties=(True,), within_limits=True)
+    with bench(tmp_path, Harness.CODEX, []) as made:
+        # The profile's folder cannot be made: the launcher ends before there is a Codex.
+        (made.worker.root / "home" / ".codex").write_text("occupied", encoding="utf-8")
+        trial = adapter(Harness.CODEX).trial(made.worker, ["made-up prompt"])
+        evidence = trial.ending.evidence(made.forwarder)
+
+    assert not (made.worker.work / "started-codex.json").exists()
+    assert (trial.ending.completed, trial.ending.invalid) == (False, InvalidReason.DRIVER_ERROR)
+    assert trial.ending.exit_status in adapters.NOT_STARTED
+    record = evidence.trial_record(execution=0, trial=0, student=0, grade=accepted)
+    assert (record.outcome, record.invalid) == (TrialOutcome.INVALID, InvalidReason.DRIVER_ERROR)
+
+
+def test_a_harness_that_failed_before_any_model_turn_cannot_pass(tmp_path: Path) -> None:
+    marker = word()
+    failed = Ending(completed=False, exit_status=1)
+    with bench(tmp_path, Harness.PI, [Conversation([chained(marker, "seed.txt", "answer.txt")])]) as made:
+        before = failed.evidence(made.forwarder)
+        seeded(made.worker, "seed.txt")
+        assert adapter(Harness.PI).trial(made.worker, [f"Do the task {marker}."]).ending.completed
+        after = failed.evidence(made.forwarder)
+
+    # With no turn asked of the model, the harness never worked on the task: the driver's error.
+    assert (before.model_turns, before.invalid, before.may_pass) == (0, InvalidReason.DRIVER_ERROR, False)
+    # One that ended in failure after it worked has no reason of the adapter's: the grader decides.
+    assert (after.model_turns, after.failure, after.invalid) == (3, None, None)

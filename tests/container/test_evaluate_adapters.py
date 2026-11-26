@@ -60,6 +60,10 @@ LIMITS = Limits(
 PLAN = contracts.Limits(
     trial_wall_time_ms=720_000, trial_model_turns=32, trial_generated_tokens=32_000, drain_ms=60_000
 )
+# The most one answer may generate. A request in flight holds its allowance of the trial's tokens,
+# and with none set the whole of what is left: the forwarder would hold one worker's request until
+# the other's had ended. With an eighth of the trial's each, two workers are answered at once.
+ANSWER_TOKENS = PLAN.trial_generated_tokens // 8
 POOL = "pool-under-test"
 CANARY_KEY = "made-up-canary-key"
 DIGITS = re.compile(r"[0-9a-f]{32}")
@@ -108,7 +112,7 @@ def bench(
     task.mkdir()
     for name, text in files.items():
         (task / name).write_text(text, encoding="utf-8")
-    budget = Budget(PLAN, run_clock())
+    budget = Budget(PLAN, run_clock(), request_tokens=ANSWER_TOKENS)
     with (
         Pool(conversations, model=POOL) as pool,
         Forwarder(pool.url, pool=POOL, key=CANARY_KEY, harness=harness, budget=budget) as forwarder,
@@ -198,10 +202,13 @@ def test_claude_code_delegates_to_workers_that_overlap_and_goes_on_after_a_tool_
     # loop's next request only once both workers were given their last answer.
     both_asked = threading.Barrier(2, timeout=HELD_SECONDS)
     ended = threading.Semaphore(0)
+    alone: list[int] = []
 
     def held(_: Sequence[str]) -> Read:
-        with contextlib.suppress(threading.BrokenBarrierError):
+        try:
             both_asked.wait()
+        except threading.BrokenBarrierError:
+            alone.append(1)
         return Read("seed.txt")
 
     def last(_: Sequence[str]) -> Say:
@@ -246,8 +253,9 @@ def test_claude_code_delegates_to_workers_that_overlap_and_goes_on_after_a_tool_
         assert trial.ending.completed, printed(trial)
         left = submitted(made.worker, "part-1.txt", "part-2.txt", "found.txt", "failed.txt")
 
-    # Two delegated workers ran, each from the file it read, and Claude Code's output shows that
-    # they were alive at once.
+    # Two delegated workers ran, each from the file it read. Both had asked before either was
+    # answered, and Claude Code's output shows that they were alive at once.
+    assert alone == []
     assert trial.delegation == Delegation(workers=2, overlapped=True)
     assert (left["part-1.txt"], left["part-2.txt"]) == (digits[::-1], digits[::-1])
     assert made.pool.turns(1) == made.pool.turns(2) == [(0, 0), (0, 1), (0, 2)]
