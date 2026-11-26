@@ -152,12 +152,15 @@ background = "several_agents"
 features = ["delegation"]
 harnesses = ["claude_code"]
 instances = [
-    { id = "analysis.t01.i01", fixture_digest = "sha256:6b8cc28fc2c280bbc744ca3968cd57d83a16099310210687389ec474cd1164fe", grader_digest = "sha256:3ddd91b459b8d04adb73a5d2ee341f7ff104ba1f343633c43e8eedf9f60e640f" },
-    { id = "analysis.t01.i02", fixture_digest = "sha256:1adcbd81f2631c664f031d366fada4b1a1f5e5182fc0d8ee9fc0edc3a4d7e762", grader_digest = "sha256:4e3fd41a586cdd5a67aa3f07fa5d91af2ff82b83f531a637345036c4199c318d" },
-    { id = "analysis.t01.i03", fixture_digest = "sha256:27e482de852b718cd741b7be57e791cdc02cde4691f75e97b9cc3898782fa041", grader_digest = "sha256:268beeb6c88b191d9ac61864093764c9be85df047386fbc45149a5a67af5045c" },
+    { id = "analysis.t01.i01", fixture_digest = "sha256:d976348731300d863632472d09549aea5898ad0aa92f4c2de557260fc2e93d44", grader_digest = "sha256:ec1d192fefe0a96235d184c814a0022b2016804ddcaab2d60ae303640fde72aa" },
+    { id = "analysis.t01.i02", fixture_digest = "sha256:e4a810aa9aad02c1945655721c9ff6392c9c140d310ae4d8b52cdef9a0c17559", grader_digest = "sha256:3d1084b5ac5eb7f670b4f6c8f53fe279140d7aada37ef6cbd171fbedcaff4e96" },
+    { id = "analysis.t01.i03", fixture_digest = "sha256:0692cf16a3a95a98c717a1c4bf263c6d153146ef67061bc651d1131dbad9095e", grader_digest = "sha256:3170b876537bc816dc0d38844c3cae6b0b4e015d6ad1ec8c4f9472847239ebcf" },
 ]
 
 # Debug and revise: the original cases, the changed cases, and the follow-up constraint.
+# Its instances and its grader are tools/evaluate/course/revision/, whose `fixture_digest` and
+# `grader_digest` compute the digests below; tools/evaluate/tests/test_revision.py holds the two
+# together.
 [[tasks]]
 id = "debugging.t01"
 core = true
@@ -166,9 +169,9 @@ background = "hands_on"
 features = ["follow_up"]
 harnesses = ["claude_code", "codex"]
 instances = [
-    { id = "debugging.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "debugging.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "debugging.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "debugging.t01.i01", fixture_digest = "sha256:682175a3bc99dc22246d20a4a78f03d5b76998d387ea83e53e71226cf08be819", grader_digest = "sha256:69c3575fd0b4b1072ef1161ddda39b75108254def816458b0d6e5adb7ba0b487" },
+    { id = "debugging.t01.i02", fixture_digest = "sha256:7305bdd4be957574ccf39002f2e11f77a97994210fa60aefaeb13fc73c7d89b7", grader_digest = "sha256:149e9b25280387f506786b8f65e866e18698f7ca7361d89f29187c45f73a2bb7" },
+    { id = "debugging.t01.i03", fixture_digest = "sha256:96d81cf4c3637b55978601463fc4d3a697ddaa0e281d80a9fe547882d8722c1a", grader_digest = "sha256:e9f30e38aca92f91c904035a8cc7553588ae50808190a026fa5e15436a0c27eb" },
 ]
 
 # The production-planning model: balance, integrality, capacity, the objective, and the table.

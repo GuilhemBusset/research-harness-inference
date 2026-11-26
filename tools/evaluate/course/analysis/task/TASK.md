@@ -32,6 +32,8 @@ standard library only. Install nothing.
   mark (a short line, a square) in the colour of its line.
 - Set colours and visibility with attributes (`stroke="..."`, or `style="stroke: ..."`) on the
   elements or the groups around them, not in a `<style>` sheet.
+- Keep the lines, the labels, the ticks and the legend inside what the figure shows (its `width`
+  and `height`, or its `viewBox`), uncovered, and each in a colour apart from what is behind it.
 
 ## 3. The comparison
 

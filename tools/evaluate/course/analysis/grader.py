@@ -23,11 +23,18 @@ It runs nothing a run submitted and compares what a run wrote with the instance,
 reference artifacts: a figure of another size, scale, margin or drawing (a polyline or a path,
 in a transformed group, a label in a `tspan`) is accepted when it shows the same.
 
-**What is drawn.** The grader reads an SVG's geometry (`transform`, `x`, `y` and the shapes'
-coordinates) and its paint, from presentation attributes and `style` attributes, inherited as SVG
-inherits them; it reads no style sheet. A line, a text or a mark that is not displayed (`display`,
-`visibility`, an `opacity` of 0, no stroke, a stroke of width 0) is not drawn, nor is anything
-inside `defs` and the other containers SVG never renders.
+**What is drawn.** The grader reads an SVG's geometry (`transform`, `x`, `y`, the shapes'
+coordinates, and each `svg` element's viewport: `width`, `height`, `viewBox`,
+`preserveAspectRatio`) and its paint, from presentation attributes and `style` attributes,
+inherited as SVG inherits them; it reads no style sheet. A colour is one colour however SVG lets it
+be written (a keyword, `#rgb`, `#rrggbb`, `rgb()`, `hsl()`). A line, a text or a mark that is not
+displayed (`display`, `visibility`, an `opacity` of 0, no paint, a stroke of width 0, a text of
+size 0) is not drawn, nor is anything inside `defs` and the other containers SVG never renders,
+nor anything under a mask or a filter, which the grader does not read. What is drawn is seen where
+it is inside the viewport and its clips (a `clip-path` of one `rect`; another clip hides what it
+applies to), not under an opaque rectangle painted after it, and in a colour apart from what is
+behind it there: the last opaque rectangle painted before it, or a white page. A series is shown
+when every point of it is seen; a text or a mark where its anchor, or its middle, is.
 
 **Lifecycle evidence** is the trusted side's, never a file of the run: what `adapters.delegation`
 read from Claude Code's output (a `Delegation`, `Trial.delegation`: how many workers it started
@@ -51,6 +58,7 @@ on what the trusted side gave it.
 
 from __future__ import annotations
 
+import colorsys
 import csv
 import io
 import json
@@ -376,10 +384,57 @@ _INHERITED = {
     "stroke-opacity": "1",
     "fill-opacity": "1",
     "stroke-width": "1",
+    "font-size": "16",
 }
 # What SVG never renders, nor anything inside it.
 _UNRENDERED = {"defs", "clipPath", "mask", "marker", "pattern", "symbol", "metadata", "title", "desc", "style"}
 _MARKS = {"line", "rect", "circle", "ellipse", "polyline", "polygon", "path"}
+# What a viewer shows behind a figure that paints no background of its own.
+_PAGE = "#ffffff"
+
+# The colour keywords of SVG and CSS, as the colour each names.
+_NAMED = dict(
+    re.findall(
+        r"(\w+):(\w+)",
+        """
+    aliceblue:f0f8ff antiquewhite:faebd7 aqua:00ffff aquamarine:7fffd4 azure:f0ffff beige:f5f5dc
+    bisque:ffe4c4 black:000000 blanchedalmond:ffebcd blue:0000ff blueviolet:8a2be2 brown:a52a2a
+    burlywood:deb887 cadetblue:5f9ea0 chartreuse:7fff00 chocolate:d2691e coral:ff7f50
+    cornflowerblue:6495ed cornsilk:fff8dc crimson:dc143c cyan:00ffff darkblue:00008b darkcyan:008b8b
+    darkgoldenrod:b8860b darkgray:a9a9a9 darkgreen:006400 darkgrey:a9a9a9 darkkhaki:bdb76b
+    darkmagenta:8b008b darkolivegreen:556b2f darkorange:ff8c00 darkorchid:9932cc darkred:8b0000
+    darksalmon:e9967a darkseagreen:8fbc8f darkslateblue:483d8b darkslategray:2f4f4f
+    darkslategrey:2f4f4f darkturquoise:00ced1 darkviolet:9400d3 deeppink:ff1493 deepskyblue:00bfff
+    dimgray:696969 dimgrey:696969 dodgerblue:1e90ff firebrick:b22222 floralwhite:fffaf0
+    forestgreen:228b22 fuchsia:ff00ff gainsboro:dcdcdc ghostwhite:f8f8ff gold:ffd700
+    goldenrod:daa520 gray:808080 grey:808080 green:008000 greenyellow:adff2f honeydew:f0fff0
+    hotpink:ff69b4 indianred:cd5c5c indigo:4b0082 ivory:fffff0 khaki:f0e68c lavender:e6e6fa
+    lavenderblush:fff0f5 lawngreen:7cfc00 lemonchiffon:fffacd lightblue:add8e6 lightcoral:f08080
+    lightcyan:e0ffff lightgoldenrodyellow:fafad2 lightgray:d3d3d3 lightgreen:90ee90 lightgrey:d3d3d3
+    lightpink:ffb6c1 lightsalmon:ffa07a lightseagreen:20b2aa lightskyblue:87cefa
+    lightslategray:778899 lightslategrey:778899 lightsteelblue:b0c4de lightyellow:ffffe0 lime:00ff00
+    limegreen:32cd32 linen:faf0e6 magenta:ff00ff maroon:800000 mediumaquamarine:66cdaa
+    mediumblue:0000cd mediumorchid:ba55d3 mediumpurple:9370db mediumseagreen:3cb371
+    mediumslateblue:7b68ee mediumspringgreen:00fa9a mediumturquoise:48d1cc mediumvioletred:c71585
+    midnightblue:191970 mintcream:f5fffa mistyrose:ffe4e1 moccasin:ffe4b5 navajowhite:ffdead
+    navy:000080 oldlace:fdf5e6 olive:808000 olivedrab:6b8e23 orange:ffa500 orangered:ff4500
+    orchid:da70d6 palegoldenrod:eee8aa palegreen:98fb98 paleturquoise:afeeee palevioletred:db7093
+    papayawhip:ffefd5 peachpuff:ffdab9 peru:cd853f pink:ffc0cb plum:dda0dd powderblue:b0e0e6
+    purple:800080 rebeccapurple:663399 red:ff0000 rosybrown:bc8f8f royalblue:4169e1
+    saddlebrown:8b4513 salmon:fa8072 sandybrown:f4a460 seagreen:2e8b57 seashell:fff5ee
+    sienna:a0522d silver:c0c0c0 skyblue:87ceeb slateblue:6a5acd slategray:708090 slategrey:708090
+    snow:fffafa springgreen:00ff7f steelblue:4682b4 tan:d2b48c teal:008080 thistle:d8bfd8
+    tomato:ff6347 turquoise:40e0d0 violet:ee82ee wheat:f5deb3 white:ffffff whitesmoke:f5f5f5
+    yellow:ffff00 yellowgreen:9acd32
+    """,
+    )
+)
+
+# A rectangle of user space: (left, top, right, bottom).
+Rect = tuple[float, float, float, float]
+EVERYWHERE: Rect = (-math.inf, -math.inf, math.inf, math.inf)
+# Room for the rounding of a coordinate written with few digits.
+_EPSILON = 1e-6
 
 
 def _then(outer: Affine, inner: Affine) -> Affine:
@@ -399,6 +454,24 @@ def _then(outer: Affine, inner: Affine) -> Affine:
 def _apply(affine: Affine, x: float, y: float) -> Point:
     a, b, c, d, e, f = affine
     return (a * x + c * y + e, b * x + d * y + f)
+
+
+def _inverse(affine: Affine) -> Affine | None:
+    """The map that undoes an affine one; None for one that flattens the plane."""
+    a, b, c, d, e, f = affine
+    determinant = a * d - b * c
+    if abs(determinant) < 1e-12:
+        return None
+    a2, b2, c2, d2 = d / determinant, -b / determinant, -c / determinant, a / determinant
+    return (a2, b2, c2, d2, -(a2 * e + c2 * f), -(b2 * e + d2 * f))
+
+
+def _inside(rect: Rect, point: Point, *, strictly: bool = False) -> bool:
+    left, top, right, bottom = rect
+    x, y = point
+    if strictly:
+        return left + _EPSILON < x < right - _EPSILON and top + _EPSILON < y < bottom - _EPSILON
+    return left - _EPSILON <= x <= right + _EPSILON and top - _EPSILON <= y <= bottom + _EPSILON
 
 
 def _numbers(text: str, where: str) -> list[float]:
@@ -462,29 +535,64 @@ def _fraction(text: str | None) -> float:
     return min(max(number / 100 if percent else number, 0.0), 1.0)
 
 
-def _colour(text: str, paint: Mapping[str, str]) -> str | None:
-    """A paint as one spelling of its colour; None for no paint."""
+def _rgba(text: str, paint: Mapping[str, str]) -> tuple[str, float] | None:
+    """A paint as one spelling of its colour (`#rrggbb`, whichever way SVG lets it be written)
+    and its alpha; None for no paint. A paint the grader does not know (a gradient) is itself."""
     value = text.strip().casefold()
     if value == "currentcolor":
         value = paint["color"].strip().casefold()
     if value in ("none", "transparent", ""):
         return None
-    if re.fullmatch(r"#[0-9a-f]{3}", value):
-        return "#" + "".join(digit * 2 for digit in value[1:])
-    channels = re.fullmatch(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)", value)
-    if channels:
-        return "#" + "".join(f"{min(int(one), 255):02x}" for one in channels.groups())
-    return value
+    channels: list[float] | None = None
+    alpha = 1.0
+    if value in _NAMED:
+        return "#" + _NAMED[value], 1.0
+    if re.fullmatch(r"#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})", value):
+        digits = value[1:] if len(value) > 5 else "".join(digit * 2 for digit in value[1:])
+        channels = [int(digits[at : at + 2], 16) / 255 for at in (0, 2, 4)]
+        alpha = int(digits[6:8], 16) / 255 if len(digits) == 8 else 1.0
+    elif call := re.fullmatch(r"(rgba?|hsla?)\((.*)\)", value):
+        parts = [part for part in re.split(r"[\s,/]+", call.group(2).strip()) if part]
+        if len(parts) not in (3, 4):
+            return value, 1.0
+        try:
+            numbers = [float(part.removesuffix("%").removesuffix("deg")) for part in parts]
+        except ValueError:
+            return value, 1.0
+        percent = [part.endswith("%") for part in parts]
+        if call.group(1).startswith("rgb"):
+            channels = [number / 100 if is_percent else number / 255 for number, is_percent in zip(numbers, percent)]
+            channels = channels[:3]
+        else:
+            red, green, blue = colorsys.hls_to_rgb((numbers[0] % 360) / 360, numbers[2] / 100, numbers[1] / 100)
+            channels = [red, green, blue]
+        if len(parts) == 4:
+            alpha = numbers[3] / 100 if percent[3] else numbers[3]
+    if channels is None:
+        return value, 1.0
+    alpha = min(max(alpha, 0.0), 1.0)
+    if not alpha > 0:
+        return None
+    return "#" + "".join(f"{round(min(max(one, 0.0), 1.0) * 255):02x}" for one in channels), alpha
+
+
+def _colour(text: str, paint: Mapping[str, str]) -> str | None:
+    """A paint as one spelling of its colour; None for no paint."""
+    rgba = _rgba(text, paint)
+    return rgba[0] if rgba else None
 
 
 @dataclass(frozen=True)
 class _Drawn:
-    """How an element is placed and painted."""
+    """How an element is placed and painted, and the regions of the figure it may show in: each
+    a rectangle of a user space (the viewport of an `svg`, a clip) and the map from that space to
+    the figure."""
 
     affine: Affine
     paint: Mapping[str, str]
     opacity: float
     shown: bool
+    clips: tuple[tuple[Affine, Rect], ...] = ()
 
     def stroke(self) -> str | None:
         """The colour its outline is drawn in, None if it is drawn in none."""
@@ -499,13 +607,34 @@ class _Drawn:
             return None
         return _colour(self.paint["fill"], self.paint) if self.visible() else None
 
+    def opaque_fill(self) -> str | None:
+        """The colour it is filled with when nothing shows through the fill, else None."""
+        rgba = _rgba(self.paint["fill"], self.paint)
+        if not self.visible() or rgba is None or rgba[0].startswith("url"):
+            return None
+        return rgba[0] if min(rgba[1], self.opacity, _fraction(self.paint["fill-opacity"])) >= 1 else None
+
     def visible(self) -> bool:
         return self.shown and self.opacity > 0 and self.paint["visibility"].strip() == "visible"
+
+    def lettered(self) -> bool:
+        """Whether its text has a size to be seen at."""
+        size = _length(self.paint["font-size"])
+        return self.visible() and (size is None or size > 0)
+
+    def shows(self, point: Point) -> bool:
+        """Whether a point of the figure is inside every region this element may show in."""
+        for affine, rect in self.clips:
+            inverse = _inverse(affine)
+            if inverse is None or not _inside(rect, _apply(inverse, *point)):
+                return False
+        return True
 
 
 def _declared(element: ElementTree.Element) -> dict[str, str]:
     """The paint an element sets: its presentation attributes, then its `style` attribute."""
-    declared = {name: value for name in (*_INHERITED, "display", "opacity") if (value := element.get(name))}
+    names = (*_INHERITED, "display", "opacity", "clip-path", "mask", "filter")
+    declared = {name: value for name in names if (value := element.get(name))}
     for declaration in (element.get("style") or "").split(";"):
         name, colon, value = declaration.partition(":")
         if colon:
@@ -513,21 +642,111 @@ def _declared(element: ElementTree.Element) -> dict[str, str]:
     return declared
 
 
-def _placed(element: ElementTree.Element, around: _Drawn) -> Iterator[tuple[ElementTree.Element, _Drawn]]:
-    """Every element of a tree, with how it is placed and painted in the figure."""
+def _size(text: str | None) -> float | None:
+    """A width or a height in user units; None when it is not set or is relative (`100%`)."""
+    if text is None or not re.fullmatch(_NUMBER.pattern + r"(?:px)?", text.strip()):
+        return None
+    return _finite(text.strip().removesuffix("px"), FIGURE)
+
+
+def _viewport(element: ElementTree.Element, nested: bool) -> tuple[Affine, Rect] | None:
+    """What an `svg` element shows: the map from its user space to the space around it, and the
+    rectangle of its user space its viewport shows (`viewBox` and `preserveAspectRatio` as SVG
+    reads them, a size it does not set as large as its content); None when it shows nothing."""
+    x = (_length(element.get("x")) or 0.0) if nested else 0.0
+    y = (_length(element.get("y")) or 0.0) if nested else 0.0
+    width, height = _size(element.get("width")), _size(element.get("height"))
+    if (width is not None and not width > 0) or (height is not None and not height > 0):
+        return None
+    try:
+        box = _numbers(element.get("viewBox") or "", FIGURE)
+    except _Unreadable:
+        box = []
+    if len(box) != 4:  # no viewBox, or one SVG ignores
+        right = x + width if width is not None else math.inf
+        bottom = y + height if height is not None else math.inf
+        return (1, 0, 0, 1, x, y), (0.0, 0.0, right - x, bottom - y)
+    box_x, box_y, box_width, box_height = box
+    if not (box_width > 0 and box_height > 0):
+        return None
+    if width is None:
+        width = box_width if height is None else height * box_width / box_height
+    if height is None:
+        height = width * box_height / box_width
+    words = [word for word in (element.get("preserveAspectRatio") or "").split() if word != "defer"]
+    align = words[0].casefold() if words else "xmidymid"
+    if align == "none":
+        scale_x, scale_y, at_x, at_y = width / box_width, height / box_height, 0.0, 0.0
+    else:
+        fit = max if words[1:2] == ["slice"] else min
+        scale_x = scale_y = fit(width / box_width, height / box_height)
+        at_x = (width - box_width * scale_x) * {"xmin": 0.0, "xmax": 1.0}.get(align[:4], 0.5)
+        at_y = (height - box_height * scale_y) * {"ymin": 0.0, "ymax": 1.0}.get(align[4:], 0.5)
+    affine: Affine = (scale_x, 0, 0, scale_y, x + at_x - scale_x * box_x, y + at_y - scale_y * box_y)
+    shown = (box_x - at_x / scale_x, box_y - at_y / scale_y)
+    return affine, (*shown, shown[0] + width / scale_x, shown[1] + height / scale_y)
+
+
+def _clip(value: str | None, ids: Mapping[str, ElementTree.Element]) -> Rect | None:
+    """The rectangle a `clip-path` lets an element show in, of its user space: everywhere for
+    none, None for a clip the grader does not read (anything but one plain `rect`)."""
+    if value is None or value.strip() in ("", "none"):
+        return EVERYWHERE
+    reference = re.fullmatch(r"url\(\s*['\"]?#([^'\")\s]+)['\"]?\s*\)", value.strip())
+    target = ids.get(reference.group(1)) if reference else None
+    if (
+        target is None
+        or _local(target.tag) != "clipPath"
+        or target.get("transform")
+        or target.get("clipPathUnits", "userSpaceOnUse") != "userSpaceOnUse"
+    ):
+        return None
+    shapes = list(target)
+    if len(shapes) != 1 or _local(shapes[0].tag) != "rect" or shapes[0].get("transform"):
+        return None
+    left, top, width, height = (_length(shapes[0].get(name, "0")) for name in ("x", "y", "width", "height"))
+    if left is None or top is None or width is None or height is None:
+        return None
+    return (left, top, left + width, top + height)
+
+
+def _placed(
+    element: ElementTree.Element,
+    around: _Drawn,
+    ids: Mapping[str, ElementTree.Element],
+    nested: bool = False,
+) -> Iterator[tuple[ElementTree.Element, _Drawn]]:
+    """Every element of a tree, in the order SVG paints them, with how each is placed and painted
+    in the figure."""
     declared = _declared(element)
+    tag = _local(element.tag)
     paint = dict(around.paint)
     paint.update({name: value for name, value in declared.items() if name in _INHERITED and value != "inherit"})
-    shown = around.shown and declared.get("display", "").strip() != "none" and _local(element.tag) not in _UNRENDERED
-    own = _Drawn(
-        _then(around.affine, _transform(element.get("transform"))),
-        paint,
-        around.opacity * _fraction(declared.get("opacity")),
-        shown,
+    shown = (
+        around.shown
+        and declared.get("display", "").strip() != "none"
+        and tag not in _UNRENDERED
+        # A mask or a filter may hide what it applies to, and the grader does not read either.
+        and all(declared.get(name, "none").strip() in ("", "none") for name in ("mask", "filter"))
     )
+    affine = _then(around.affine, _transform(element.get("transform")))
+    clips = around.clips
+    clip = _clip(declared.get("clip-path"), ids)
+    if clip is None:
+        shown = False
+    elif clip != EVERYWHERE:
+        clips = (*clips, (affine, clip))
+    if tag == "svg":
+        viewport = _viewport(element, nested)
+        if viewport is None:
+            shown = False
+        else:
+            affine = _then(affine, viewport[0])
+            clips = (*clips, (affine, viewport[1]))
+    own = _Drawn(affine, paint, around.opacity * _fraction(declared.get("opacity")), shown, clips)
     yield element, own
     for child in element:
-        yield from _placed(child, own)
+        yield from _placed(child, own, ids, nested=True)
 
 
 def _path_points(d: str, identifier: str) -> list[Point]:
@@ -626,6 +845,8 @@ class _Line:
     points: list[Point]
     colour: str | None
     """The colour it is drawn in; None when it is not drawn."""
+    seen: bool
+    """Whether every point of it shows: inside the figure, uncovered, apart from what is behind."""
 
 
 @dataclass(frozen=True)
@@ -633,7 +854,7 @@ class _Text:
     content: str
     """What it says, its spaces folded, in lower case."""
     at: Point
-    colour: str | None
+    colours: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -666,28 +887,76 @@ def _read_figure(path: Path) -> _Figure:
         raise _Unreadable(f"{FIGURE} nests its elements deeper than the grader reads") from None
 
 
+def _paints(drawn: _Drawn, *, line: bool = False) -> frozenset[str]:
+    return frozenset(one for one in (drawn.stroke(), None if line else drawn.fill()) if one)
+
+
 def _drawing(root: ElementTree.Element) -> _Figure:
-    """The lines, texts and marks an SVG draws."""
+    """The lines, texts and marks an SVG draws, each where it shows: inside the viewport and its
+    clips, not under a rectangle painted later and opaque, and in a colour apart from what is
+    painted behind it (the last such rectangle painted before it, or a white page)."""
+    ids = {identifier: element for element in root.iter() if (identifier := element.get("id"))}
+    placed = list(_placed(root, _Drawn(IDENTITY, _INHERITED, 1.0, shown=True), ids))
+    drawn_of = {id(element): drawn for element, drawn in placed}
+    # The opaque rectangles, axis-aligned in the figure, that hide what is under them.
+    covers: list[tuple[int, Rect, str]] = []
+    for index, (element, drawn) in enumerate(placed):
+        _a, b, c, _d, _e, _f = drawn.affine
+        colour = drawn.opaque_fill()
+        if _local(element.tag) != "rect" or colour is None or b or c or len(drawn.clips) > 1:
+            continue
+        corners = [_apply(drawn.affine, x, y) for x, y in _mark_points(element)]
+        if corners:
+            xs, ys = [x for x, _y in corners], [y for _x, y in corners]
+            covers.append((index, (min(xs), min(ys), max(xs), max(ys)), colour))
+
+    def seen(index: int, drawn: _Drawn, colours: frozenset[str], point: Point) -> bool:
+        if not drawn.shows(point):
+            return False
+        if any(later > index and _inside(rect, point, strictly=True) for later, rect, _colour in covers):
+            return False
+        behind = next(
+            (colour for earlier, rect, colour in reversed(covers) if earlier < index and _inside(rect, point)), _PAGE
+        )
+        return bool(colours - {behind})
+
+    def lettering(text: ElementTree.Element) -> frozenset[str]:
+        """The colours a text's characters are painted in, from the elements that hold them."""
+        colours: set[str] = set()
+        for holder in text.iter():
+            if (holder.text or "").strip() and drawn_of[id(holder)].lettered():
+                colours |= _paints(drawn_of[id(holder)])
+            for child in holder:
+                if (child.tail or "").strip() and drawn_of[id(holder)].lettered():
+                    colours |= _paints(drawn_of[id(holder)])
+        return frozenset(colours)
+
     lines: dict[str, _Line] = {}
     texts: list[_Text] = []
     marks: list[_Mark] = []
-    for element, drawn in list(_placed(root, _Drawn(IDENTITY, _INHERITED, 1.0, shown=True))):
+    for index, (element, drawn) in enumerate(placed):
         tag, identifier = _local(element.tag), element.get("id")
         if identifier in LINE_IDS:
             if identifier in lines:
                 raise _Unreadable(f"{FIGURE} has two elements of id {identifier}")
-            local = _line_points(element, identifier)
-            lines[identifier] = _Line([_apply(drawn.affine, x, y) for x, y in local], drawn.stroke())
+            points = [_apply(drawn.affine, x, y) for x, y in _line_points(element, identifier)]
+            colours = _paints(drawn, line=True)
+            shows = all(seen(index, drawn, colours, point) for point in points)
+            lines[identifier] = _Line(points, drawn.stroke(), shows)
         elif tag == "text" and drawn.visible():
             content = " ".join("".join(element.itertext()).split()).casefold()
             at = _apply(drawn.affine, *_first_character(element, None, None))
-            texts.append(_Text(content, at, drawn.fill() or drawn.stroke()))
+            colours = lettering(element)
+            if colours and seen(index, drawn, colours, at):
+                texts.append(_Text(content, at, colours))
         elif tag in _MARKS and drawn.visible():
-            colours = frozenset(one for one in (drawn.stroke(), None if tag == "line" else drawn.fill()) if one)
+            colours = _paints(drawn, line=tag == "line")
             points = [_apply(drawn.affine, x, y) for x, y in _mark_points(element)]
             if colours and points:
                 xs, ys = [x for x, _y in points], [y for _x, y in points]
-                marks.append(_Mark(((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2), colours))
+                middle = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+                if seen(index, drawn, colours, middle):
+                    marks.append(_Mark(middle, colours))
     return _Figure(lines, texts, marks)
 
 
@@ -722,7 +991,7 @@ def _legend_faults(figure: _Figure, instance: Instance) -> list[str]:
 
     def colour_of(text: _Text) -> set[str]:
         if not keys:
-            return {text.colour} if text.colour else set()
+            return set(text.colours)
         nearest = min(keys, key=lambda mark: math.dist(mark.at, text.at))
         return set(nearest.colours)
 
@@ -749,6 +1018,8 @@ def _figure_faults(figure: _Figure, instance: Instance) -> list[str]:
             faults.append(f"{FIGURE} has no line of id {identifier}")
         elif line.colour is None:
             faults.append(f"{FIGURE} does not draw {identifier}: it is hidden, or painted in nothing")
+        elif not line.seen:
+            faults.append(f"{FIGURE} does not show {identifier} at every point: outside the figure, or covered")
         elif len(line.points) != len(instance.x):
             faults.append(f"{FIGURE}: {identifier} has {len(line.points)} points, and the input {len(instance.x)} rows")
     if faults:

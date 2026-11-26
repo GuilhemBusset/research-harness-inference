@@ -306,6 +306,83 @@ def test_a_series_that_is_not_drawn_is_rejected(tmp_path: Path, attribute: str, 
     assert failed(graded_with_edit(tmp_path, EXEMPLAR, hide)) == {Property.DATA}
 
 
+def cover_plot(root: ElementTree.Element, _instance: grader.Instance) -> None:
+    """An opaque rectangle, the colour of the page, painted over the plot after everything."""
+    ElementTree.SubElement(root, SVG + "rect", {"x": "60", "y": "20", "width": "460", "height": "330", "fill": "#fff"})
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        pytest.param(lambda root, _instance: root.set("viewBox", "640 400 640 400"), id="viewport-elsewhere"),
+        pytest.param(cover_plot, id="covered"),
+        pytest.param(
+            lambda root, _instance: [line.set("stroke", "white") for line in series_lines(root)],
+            id="in-the-background-colour",
+        ),
+    ],
+)
+def test_a_series_the_figure_does_not_show_is_rejected(tmp_path: Path, edit: Callable) -> None:
+    assert failed(graded_with_edit(tmp_path, EXEMPLAR, edit)) == {Property.DATA}
+
+
+@pytest.mark.parametrize(
+    "paint",
+    [
+        {"fill": "none", "stroke": "none"},
+        {"style": "fill-opacity: 0"},
+        {"font-size": "0"},
+        {"fill": "rgb(255, 255, 255)"},
+    ],
+)
+def test_an_axis_label_that_is_not_seen_is_rejected(tmp_path: Path, paint: dict[str, str]) -> None:
+    def unseen(root: ElementTree.Element, instance: grader.Instance) -> None:
+        texts(root)[instance.x_label].attrib.update(paint)
+
+    assert failed(graded_with_edit(tmp_path, EXEMPLAR, unseen)) == {Property.DATA}
+
+
+@pytest.mark.parametrize(
+    ("line", "mark"),
+    [("blue", "#0000ff"), ("rgb(0, 0, 255)", "#00F"), ("hsl(240, 100%, 50%)", "Blue"), ("#0000ffff", "blue")],
+)
+def test_one_colour_spelt_two_ways_is_one_colour(tmp_path: Path, line: str, mark: str) -> None:
+    def respell(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        for element in root.iter():
+            if element.get("stroke") == COLOURS[0]:
+                element.set("stroke", line if element.get("id") == "series_a" else mark)
+
+    report = graded_with_edit(tmp_path, EXEMPLAR, respell)
+
+    assert report.accepted, report.faults
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [
+        {"viewBox": "0 0 640 400", "width": "1280", "height": "800"},
+        {"viewBox": "-20 -20 700 440", "preserveAspectRatio": "xMinYMin slice", "width": "640", "height": "400"},
+        {"width": "100%"},
+    ],
+)
+def test_a_viewport_that_shows_the_whole_chart_is_accepted(tmp_path: Path, viewport: dict[str, str]) -> None:
+    report = graded_with_edit(tmp_path, EXEMPLAR, lambda root, _instance: root.attrib.update(viewport))
+
+    assert report.accepted, report.faults
+
+
+def test_a_plot_clipped_to_its_area_is_accepted(tmp_path: Path) -> None:
+    def clipped(root: ElementTree.Element, _instance: grader.Instance) -> None:
+        clip = ElementTree.SubElement(ElementTree.SubElement(root, SVG + "defs"), SVG + "clipPath", {"id": "plot"})
+        ElementTree.SubElement(clip, SVG + "rect", {"x": "70", "y": "20", "width": "440", "height": "330"})
+        for line in series_lines(root):
+            line.set("clip-path", "url(#plot)")
+
+    report = graded_with_edit(tmp_path, EXEMPLAR, clipped)
+
+    assert report.accepted, report.faults
+
+
 def test_a_path_of_points_not_joined_is_rejected(tmp_path: Path) -> None:
     def unjoined(root: ElementTree.Element, _instance: grader.Instance) -> None:
         for line in series_lines(root):
