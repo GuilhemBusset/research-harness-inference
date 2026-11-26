@@ -67,6 +67,7 @@ def request(
     outcome: RequestOutcome = RequestOutcome.COMPLETED,
     lag_ms: int = 0,
     output: bool = True,
+    traffic: Traffic = Traffic.BACKGROUND,
 ) -> RequestRecord:
     eligible = START + 1000 + at * 100
     sent = eligible + lag_ms
@@ -78,7 +79,7 @@ def request(
         student=at % 8,
         conversation=at,
         turn=turn,
-        traffic=Traffic.BACKGROUND,
+        traffic=traffic,
         trial=None,
         route=Route.MESSAGES,
         eligible_ms=eligible,
@@ -98,6 +99,8 @@ def requests(cell: int, count: int, *, offset: int = 0, **given: object) -> list
 
 
 def tally_of(rows: Sequence[RequestRecord]) -> Tally:
+    """What the scheduler counted, for rows whose every output count closed its answer: a stream is
+    eligible when it completed with two tokens or more over a time that is not zero."""
     causes = [cause for cause in RequestOutcome if cause is not RequestOutcome.COMPLETED]
     return Tally(
         attempts=len(rows),
@@ -106,7 +109,13 @@ def tally_of(rows: Sequence[RequestRecord]) -> Tally:
         failures={cause: sum(row.outcome is cause for row in rows) for cause in causes},
         retries=0,
         usage_missing=sum(row.usage_missing for row in rows),
-        eligible=sum(capacity.speed_of(row) is not None for row in rows),
+        eligible=sum(
+            not row.failed
+            and row.usage is not None
+            and (row.usage.output_tokens or 0) >= 2
+            and (row.last_output_ms or 0) > (row.first_output_ms or 0)
+            for row in rows
+        ),
     )
 
 
@@ -283,8 +292,35 @@ def test_midstream_and_connection_failures_are_failed_attempts_and_no_sample():
     assert failures.usage_missing == 3
     low, high = failures.wilson_low, failures.wilson_high
     assert low is not None and high is not None and low < 4 / 104 < high
-    assert (cell.speeds.count, cell.later_turns.count) == (100, 100)
+    # The two midstream failures had a first output: it is a time to first output, never a speed.
+    assert (cell.speeds.count, cell.later_turns.count) == (100, 102)
     assert cell.floors[Floor.FAILED_SHARE] is Check.MISSED and cell.verdict is Verdict.MEASURED_MISS
+    # What reached the client counts as delivered, a failed stream's count included.
+    assert cell.engine is not None and cell.engine.delivered_output_tokens == 101 * 21
+    assert cell.engine.delivered_usage_missing == 1
+
+
+def test_a_slow_first_output_counts_whatever_the_request_came_to():
+    planned = floor_cell()
+    at = planned.identity.cell
+    rows = [
+        *requests(at, 190, ttft_ms=4900),
+        *requests(at, 9, offset=190, ttft_ms=9000),
+        request(at, 199, ttft_ms=9000, outcome=RequestOutcome.ERROR_EVENT),
+    ]
+    cell = read_one(evidence(planned, rows))
+    # Ranks 189 and 190 of 200 sorted times hold the p95 (rank 189.05): 4,900 + 0.05 * 4,100.
+    assert cell.later_turns.count == 200 and cell.later_turns.p95_ms == pytest.approx(5105)
+    assert cell.floors[Floor.TTFT_P95] is Check.MISSED and cell.speeds.count == 199
+
+
+def test_one_failure_and_no_sample_is_insufficient_and_still_shown():
+    planned = floor_cell()
+    row = request(planned.identity.cell, 0, outcome=RequestOutcome.TRANSPORT_ERROR, output=False, tokens=None)
+    cell = read_one(evidence(planned, [row]))
+    assert (cell.failures.failed, cell.failures.attempts) == (1, 1)
+    assert cell.verdict is Verdict.INSUFFICIENT_EVIDENCE and cell.floors[Floor.FAILED_SHARE] is Check.INSUFFICIENT
+    assert cell.observed_misses == (Floor.FAILED_SHARE,)
 
 
 def test_a_send_with_no_row_or_no_outcome_leaves_the_accounting_incomplete():
@@ -298,27 +334,59 @@ def test_a_send_with_no_row_or_no_outcome_leaves_the_accounting_incomplete():
         assert cell.verdict is Verdict.INVALID and Reason.ATTEMPTS_UNACCOUNTED in cell.reasons
     nothing = replace(evidence(planned, rows), tally=None)
     assert Reason.ATTEMPTS_UNACCOUNTED in read_one(nothing).reasons
+    # The same row twice stands for one send: the hundredth has no row of its own.
+    twice = read_one(evidence(planned, [*rows[:-1], rows[0]], tally=sent))
+    assert twice.verdict is Verdict.INVALID and twice.reasons == (Reason.ATTEMPTS_UNACCOUNTED,)
+
+
+def test_the_eligible_streams_are_the_ones_the_scheduler_counted():
+    planned = floor_cell()
+    rows = requests(planned.identity.cell, 100)
+    # The rows give each a speed; the scheduler saw one output count that did not close its answer.
+    cell = read_one(evidence(planned, rows, tally=replace(tally_of(rows), eligible=99)))
+    assert cell.verdict is Verdict.INVALID and cell.reasons == (Reason.ELIGIBILITY_UNRECONCILED,)
+
+
+def test_a_request_that_ends_after_the_drain_has_no_outcome_in_the_window():
+    planned = floor_cell()
+    rows = requests(planned.identity.cell, 99)
+    # Sent in the window, its output all after the drain.
+    late = replace(
+        request(planned.identity.cell, 99),
+        first_output_ms=END + 1,
+        first_answer_ms=END + 1,
+        last_output_ms=END + 1001,
+        ended_ms=END + 1010,
+    )
+    cell = read_one(evidence(planned, [*rows, late]))
+    assert cell.failures.attempts == 100
+    assert cell.verdict is Verdict.INVALID and cell.reasons == (Reason.OUTCOME_AFTER_DRAIN,)
 
 
 # --- Evidence of the hosts --------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("given", "missing", "hosts_observed", "reason"),
+    ("given", "missing", "hosts_observed", "reason", "in_service"),
     [
-        ({}, [(2, HostMetric.PREEMPTIONS_TOTAL)], 2, Reason.PREEMPTIONS_UNCOVERED),
+        ({}, [(2, HostMetric.PREEMPTIONS_TOTAL)], 2, Reason.PREEMPTIONS_UNCOVERED, None),
         (
             {(2, HostMetric.PREEMPTIONS_TOTAL): lambda at: None if 500_000 < at < 520_000 else 0.0},
             [],
             2,
             Reason.PREEMPTIONS_UNCOVERED,
+            None,
         ),
-        ({}, [], 3, Reason.HOSTS_UNRECONCILED),
+        ({}, [], 3, Reason.HOSTS_UNRECONCILED, None),
+        # Hosts 1 and 3 served; the samples are of hosts 1 and 2. Two hosts each, and host 3 has no series.
+        ({}, [], 2, Reason.HOSTS_UNRECONCILED, {1: 1020.0, 3: 1020.0}),
+        ({}, [], 2, Reason.PREEMPTIONS_UNCOVERED, {1: 1020.0, 3: 1020.0}),
     ],
 )
-def test_a_missing_host_series_invalidates_the_cell(given, missing, hosts_observed, reason):
+def test_a_missing_host_series_invalidates_the_cell(given, missing, hosts_observed, reason, in_service):
     planned = floor_cell()
-    cell = read_one(evidence(planned, given=given, missing=missing, hosts_observed=hosts_observed))
+    found = evidence(planned, given=given, missing=missing, hosts_observed=hosts_observed, in_service=in_service)
+    cell = read_one(found)
     assert cell.verdict is Verdict.INVALID and reason in cell.reasons
 
 
@@ -446,7 +514,9 @@ def test_a_multihost_example_with_different_service_times_is_recomputed_through_
     assert engine.delivered_output_tokens == 2100
     assert engine.cached_share == pytest.approx(0.25)
     assert engine.computed_input_tokens == 2 * 75 * 900
-    assert (engine.waiting_requests_mean, engine.waiting_requests_peak) == (4.0, 3.0)
+    # One request waits on host 1 and three on host 2 at every scrape: four wait at once in the pool.
+    assert (engine.waiting_requests_mean, engine.waiting_requests_peak) == (4.0, 4.0)
+    assert [host.gauges[HostMetric.WAITING_REQUESTS].peak for host in engine.hosts] == [1.0, 3.0]
     assert engine.gpu_utilization_mean == pytest.approx(0.7)
     # The hosts cost what they were in service for: 1.5 windows of host time.
     assert engine.host_hours == pytest.approx(1.5 * seconds / 3600)
@@ -479,10 +549,17 @@ def test_opening_and_warm_up_are_reported_outside_steady_state():
     outside = [
         evidence(
             planned,
-            requests(planned.identity.cell, 8, turn=0, ttft_ms=9000)
-            + requests(planned.identity.cell, 8, offset=8, outcome=RequestOutcome.TRANSPORT_ERROR, output=False),
+            requests(planned.identity.cell, 8, turn=0, ttft_ms=9000, traffic=traffic)
+            + requests(
+                planned.identity.cell,
+                8,
+                offset=8,
+                outcome=RequestOutcome.TRANSPORT_ERROR,
+                output=False,
+                traffic=traffic,
+            ),
         )
-        for planned in (warm_up, opening)
+        for planned, traffic in ((warm_up, Traffic.WARM_UP), (opening, Traffic.BACKGROUND))
     ]
     alone = capacity.read(PLAN, steady, usd_per_host_hour=PRICE)
     together = capacity.read(PLAN, steady + outside, usd_per_host_hour=PRICE)
@@ -491,3 +568,16 @@ def test_opening_and_warm_up_are_reported_outside_steady_state():
     reported = {cell.identity.cell: cell for cell in together.outside_steady_state}
     assert set(reported) == {warm_up.identity.cell, opening.identity.cell}
     assert all(cell.first_turns.p95_ms == 9000 and cell.failures.failed == 8 for cell in reported.values())
+
+
+def test_warm_up_traffic_in_a_steady_cell_is_accounted_for_and_not_read():
+    planned = floor_cell()
+    at = planned.identity.cell
+    warm = [
+        request(at, 99, traffic=Traffic.WARM_UP),
+        request(at, 100, outcome=RequestOutcome.TRANSPORT_ERROR, output=False, traffic=Traffic.WARM_UP),
+    ]
+    cell = read_one(evidence(planned, requests(at, 99) + warm))
+    assert cell.warm_up_requests == 2 and not cell.reasons
+    assert (cell.later_turns.count, cell.speeds.count, cell.failures.attempts, cell.failures.failed) == (99, 99, 99, 0)
+    assert cell.verdict is Verdict.INSUFFICIENT_EVIDENCE
