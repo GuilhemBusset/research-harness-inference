@@ -19,42 +19,58 @@ its `selector` and `range_of`. The names are those of the engine's row
 **The window** runs from the cell's start to the end of its drain, in seconds since the epoch.
 Every rate is over those seconds, the ones that elapsed, however long the drain was planned to
 last. Every series is read from before the window (and before the warm-up, when one is given) to
-`ALLOWANCE_SECONDS` after the drain: the scrape after the drain holds what the last answers
-added, and it takes a moment to reach the workspace: read no sooner than `readable_from` says.
+`ALLOWANCE_SECONDS` after the drain, and it takes a moment for the last scrapes to reach the
+workspace: read no sooner than `readable_from` says.
+
+**What a series says of a window** is in the samples that bound it: from its last sample at or
+before the start to its first at or after the drain. A scrape that fell on the drain closes the
+window; otherwise the next one does, since it holds what the last answers added. No later sample
+adds anything. Those samples cover the window when the first is within `ALLOWANCE_SECONDS`
+before the start, the last is at or after the drain, and no two that follow each other are
+further apart than `ALLOWANCE_SECONDS`. A sample that is no number is no sample.
 
 **The hosts** are the instances whose lifecycle agent reported a release
-(`rhi_lifecycle_release_info`) for some seconds of the window. A host is in service within a
-scrape of each of its samples, as in S5, and served the whole window when those seconds are the
-window's to within `ALLOWANCE_SECONDS`, a scrape at each edge. A host that was in service for a
-part of the window only joined or left during it: the cell had a turnover of hosts. So does a
-host whose release samples have a hole, since nothing shows it stayed.
+(`rhi_lifecycle_release_info`) for some seconds of the window, in service within a scrape of
+each sample as in S5, and every other instance of which a series of the pool has a sample in the
+window. A host served the whole window when its release samples start and end within
+`ALLOWANCE_SECONDS` of the window's edges with no hole longer than that between them
+(`Host.membership`). One that started later or ended earlier joined or left: the cell had a
+turnover of hosts. One with a hole is of incomplete coverage, since nothing shows it stayed. One
+with no release sample at all, whose engine counted all the same, is not observed: its work is
+in the totals, and what it ran is unknown.
 
 **Requested and observed** are two `contracts.Settings`, and neither is filled from the other.
-The observed one holds what the telemetry showed: the number of hosts, and the instance type,
-the image digest and the model revision where every host reported the same one. The tokenizer's
-revision and the gateway's profile are in no series: they are observed only when the driver
-hands in what it read of them (`Driver`). A setting no evidence shows stays `None`, also when
-the launch fingerprint matches, because a fingerprint cannot be read back into settings.
+The observed one holds what the telemetry showed, where every host showed the same: the number
+of hosts, the instance type, the image digest and the model revision, and the effective settings
+the engine itself exposes (`EFFECTIVE`: prefix caching and the cache's data type, from the labels
+of the engine's cache information metric, said through the window). The tokenizer's revision and
+the gateway's profile are in no series: they are observed only when the driver hands in what it
+read of them (`Driver`). A setting no evidence shows stays `None`, also when the launch
+fingerprint matches, because a fingerprint cannot be read back into settings. The fingerprints
+themselves are kept: each host's (`Host.launch_fingerprints`), and the pool's beside the
+requested one.
 
 **Each treatment** is one part of the requested settings, and is verified only when the
 telemetry shows that part served the whole window on every host (`Treatment`). For the engine's
 arguments the evidence is the launch fingerprint, `settings_fingerprint` of
-`rhi_lifecycle_launch_info`: every host says one fingerprint through its time in service, the
-same on every host, and it is the one requested. Two hosts of one image and one model revision
-with two fingerprints are a verified release and unverified launch settings. A treatment that is
-not verified has one `Reason`, and its observations are kept. A part the request does not declare
-is unverified too, as `not_declared`: nothing holds the pool to it.
+`rhi_lifecycle_launch_info`: every host says one fingerprint, with no hole, through its time in
+service, the same on every host, and it is the one requested. Two hosts of one image and one
+model revision with two fingerprints are a verified release and unverified launch settings. A
+treatment that is not verified has one `Reason`, and its observations are kept. A part the
+request does not declare is unverified too, as `not_declared`: nothing holds the pool to it.
 
 **Each host's metrics**, from the window's start through the drain (`contracts.HostMetric`): the
 increase of the output, input, cached input and computed input token counters and of the
 preemptions; the mean and the peak of the running and waiting requests and of the GPU
 utilization. The computed input is the engine's own count of it, where its row has one
 (`Further.COMPUTED_INPUT_TOKENS`): input less cached input is not it. A counter that restarted
-is counted across the restart, and the restart is recorded. A series the workspace gave nothing
-of reads `None`, never zero, with the coverage `missing`; one with a hole longer than
-`ALLOWANCE_SECONDS`, no sample just before the window or none after the drain reads what its
-samples give, with the coverage `incomplete`. The pool's total of a counter is the sum over the
-hosts that reported it.
+is counted across the restart, and the restart is recorded. A counter with no sample before the
+start counts the rises its samples show and nothing for its first value, which is no work of the
+window. A series the workspace gave nothing of reads `None`, never zero, with the coverage
+`missing`; one that does not cover the window reads what its samples give, with the coverage
+`incomplete`. A gauge of several series (an engine index each) is read at the scrapes every one
+of them reported, and is incomplete as soon as one of them is. The pool's total of a counter is
+the sum over the hosts that reported it.
 
 **The node's own liveness completion** (`rhi_lifecycle.serving`) goes to the engine and not
 through the gateway. Its tokens are engine work like any other and stay in the totals and the
@@ -62,27 +78,39 @@ rates; nothing flags them.
 
 **Other traffic** is read at the gateway, in aggregate: the increase of
 `rhi_gateway_student_requests_total` over every identity of the pool, and over the canary
-cohort's. What the pool counted beyond the cohort came from someone else, a student or a
+cohort's. An identity's series begins with its first request, so one that begins in the window
+counts from zero. What the pool counted beyond the cohort came from someone else, a student or a
 deployment's smoke test, and is `external_traffic`. What the cohort counted must be what the
 driver says reached the gateway: its attempts, retries included, and the side queries of its
-harnesses. The increase runs from the last scrape before the window, so a setup probe the driver
-sent after that scrape is in it: the driver says how many it sent within that margin, and up to
-that many are taken out of the cohort's count before it is compared. Probes sent earlier are in
-neither count. A difference that remains is `unreconciled_counters`. The same margins hold for
-everyone: a request of someone else within a scrape of the window's edges counts as overlapping.
+harnesses; a difference is `unreconciled_counters`. Matching counts say nothing of seconds the
+gateway's counters do not cover: each of its tasks must have been scraped through the whole
+window, and each series through the drain once it began, or the window lacks evidence
+(`gateway_coverage_incomplete`). The same margins hold for everyone: a request of someone else
+between the scrapes that bound the window counts as overlapping.
+
+**Setup probes** the driver sent well before the window are in the scrape the increase runs
+from, and in no count. One sent after that scrape is in the increase, and no counter tells it
+from a request of the window. So the driver says how many it sent as the cohort from a time on
+(`Driver.setup_probes`, `Driver.setup_from`), and that many are taken out of the cohort's count
+and of the pool's, whatever the driver expected the counts to be. They are placed when every
+series of the cohort was last scraped before that time: the increase then holds them all. With
+no time, or a scrape after it, nothing shows how many the increase holds, and the reading says
+so (`setup_probes_unplaced`) instead of reconciling.
 
 **Warm-up, cache and preflight.** For each host: the output tokens its engine counted during the
-warm-up, and whether they are more than its liveness completions alone would give; the cache
-capacity its lifecycle agent reported, the cache usage at the window's start and its peak. The
-`Preflight` the driver took before the run is kept with the reading.
+warm-up, by the same rule as the window's; whether its required series cover the warm-up; and
+whether the host is so shown to have worked, beyond what its liveness completions alone would
+give. The cache capacity its lifecycle agent reported, the cache usage at the window's start and
+its peak, and whether those series cover the window. The `Preflight` the driver took before the
+run is kept with the reading.
 
 **A window that cannot qualify** has `Reading.reasons`, each of which stands for one
 `contracts.InvalidFlag` (`FLAG_OF`). The reading keeps every observation all the same.
 
 **Nothing private leaves.** An instance's ID becomes the host's ordinal (`Ordinals`, which a run
 keeps across its cells), and aliases and task IDs select series and are dropped. A label's value
-reaches a reading only as a label of an enumeration or as a digest or a revision held to its
-grammar; anything else reads as not observed.
+reaches a reading only as a label of an enumeration or as a digest, a revision or a fingerprint
+held to its grammar; anything else reads as not observed.
 """
 
 from __future__ import annotations
@@ -96,8 +124,8 @@ from itertools import pairwise
 from statistics import fmean
 from typing import TYPE_CHECKING, Any
 
-from evaluate.contracts import INSTANCE_GPUS, HostMetric, InstanceType, InvalidFlag, Settings
-from rhi_common.engine_metrics import Further, Kind, Quantity, further_names, metric_names
+from evaluate.contracts import INSTANCE_GPUS, HostMetric, InstanceType, InvalidFlag, KvDtype, Settings
+from rhi_common.engine_metrics import Further, Kind, Quantity, cache_capacity, further_names, metric_names
 from rhi_dashboards.gpu import COMPUTE as GPU_UTILIZATION_METRIC
 from rhi_gateway.metrics import REQUESTS as GATEWAY_REQUESTS_METRIC
 from rhi_lifecycle.cache import METRIC as CACHE_CAPACITY_METRIC
@@ -133,12 +161,14 @@ class Source(StrEnum):
     RELEASE = "release"
     LAUNCH = "launch"
     CACHE_CAPACITY = "cache_capacity"
+    CACHE_CONFIG = "cache_config"
     CACHE_USAGE = "cache_usage"
     GATEWAY_REQUESTS = "gateway_requests"
 
 
 type Key = Source | HostMetric
 type Answers = Mapping[Key, Sequence[Series]]
+type Sample = tuple[float, float]
 
 COUNTERS = (
     HostMetric.OUTPUT_TOKENS_TOTAL,
@@ -163,6 +193,16 @@ REQUIRED = (
     HostMetric.RUNNING_REQUESTS,
     HostMetric.WAITING_REQUESTS,
 )
+# The effective settings an engine exposes in its cache information metric (the metric its row
+# names for the cache capacity): for each setting of `contracts.Settings`, the label that says
+# it and what each of the label's texts means. The labels are vLLM's, the attributes of its
+# `CacheConfig` written as text; `auto` is the model's own data type, the 16 bits
+# (`rhi.pools.vllm_command`). A text outside the table, or an engine without the label, reads as
+# not observed.
+EFFECTIVE: dict[str, tuple[str, dict[str, object]]] = {
+    "prefix_caching": ("enable_prefix_caching", {"True": True, "False": False}),
+    "kv_dtype": ("cache_dtype", {"fp8": KvDtype.BITS_8, "auto": KvDtype.BITS_16}),
+}
 
 
 class Treatment(StrEnum):
@@ -198,10 +238,14 @@ class Reason(StrEnum):
     ENGINE_SERIES_MISSING = "engine_series_missing"
     PREEMPTION_COVERAGE_MISSING = "preemption_coverage_missing"
     WARM_UP_INCOMPLETE = "warm_up_incomplete"
-    """Not every host was shown to work during a warm-up."""
+    """Not every host was shown to work during a warm-up its required series cover."""
     CACHE_EVIDENCE_MISSING = "cache_evidence_missing"
     GATEWAY_COUNTERS_MISSING = "gateway_counters_missing"
+    GATEWAY_COVERAGE_INCOMPLETE = "gateway_coverage_incomplete"
+    """The gateway's counters do not cover the window: what passed in the rest is unknown."""
     EXTERNAL_TRAFFIC = "external_traffic"
+    SETUP_PROBES_UNPLACED = "setup_probes_unplaced"
+    """Nothing shows how many of the driver's setup probes the window's increase holds."""
     UNRECONCILED_COUNTERS = "unreconciled_counters"
 
 
@@ -214,8 +258,10 @@ FLAG_OF = {
     Reason.WARM_UP_INCOMPLETE: InvalidFlag.MISSING_EVIDENCE,
     Reason.CACHE_EVIDENCE_MISSING: InvalidFlag.MISSING_EVIDENCE,
     Reason.GATEWAY_COUNTERS_MISSING: InvalidFlag.MISSING_EVIDENCE,
+    Reason.GATEWAY_COVERAGE_INCOMPLETE: InvalidFlag.MISSING_EVIDENCE,
     Reason.HOST_TURNOVER: InvalidFlag.HOST_TURNOVER,
     Reason.EXTERNAL_TRAFFIC: InvalidFlag.EXTERNAL_TRAFFIC,
+    Reason.SETUP_PROBES_UNPLACED: InvalidFlag.UNRECONCILED_COUNTERS,
     Reason.UNRECONCILED_COUNTERS: InvalidFlag.UNRECONCILED_COUNTERS,
 }
 
@@ -224,6 +270,13 @@ class Coverage(StrEnum):
     COMPLETE = "complete"
     INCOMPLETE = "incomplete"
     MISSING = "missing"
+
+
+_WORST_FIRST = (Coverage.MISSING, Coverage.INCOMPLETE, Coverage.COMPLETE)
+
+
+def _worst(found: Iterable[Coverage]) -> Coverage:
+    return min(found, key=_WORST_FIRST.index)
 
 
 # --- What the reader is given ----------------------------------------------------------------
@@ -269,15 +322,17 @@ class Driver:
     """What the driver knows and no series says. `cohort` holds the gateway's aliases of the
     canary students the driver sends as: they select series and are never written. `attempts`
     and `side_queries` are the requests of the window that reached the gateway, retries among the
-    first. `setup_probes` are the probes the driver sent as the cohort within
-    `ALLOWANCE_SECONDS` before the window, which the gateway's counters cannot tell from the
-    window's requests. The two provenances are what the driver read of the tokenizer and of the
+    first. `setup_probes` are the probes the driver sent as the cohort before the window from
+    `setup_from` on, a time in seconds since the epoch: the ones a scrape before the window may
+    not hold. A driver that sent its last probe more than `ALLOWANCE_SECONDS` before the window
+    has none to name. The two provenances are what the driver read of the tokenizer and of the
     gateway's profile, `None` for nothing."""
 
     cohort: tuple[str, ...]
     attempts: int
     side_queries: int = 0
     setup_probes: int = 0
+    setup_from: float | None = None
     warm_up: Window | None = None
     preflight: Preflight | None = None
     tokenizer_revision: str | None = None
@@ -310,7 +365,7 @@ class Counted:
 
 @dataclass(frozen=True)
 class Level:
-    """A gauge of one host over the window."""
+    """A gauge of one host over the window, at the scrapes every one of its series reported."""
 
     mean: float | None
     peak: float | None
@@ -319,11 +374,14 @@ class Level:
 
 @dataclass(frozen=True)
 class Cache:
-    """The cache evidence of one host. `None` for what was not reported."""
+    """The cache evidence of one host, `None` for what was not reported: the one capacity its
+    lifecycle agent said in the window, the usage at the window's start and its peak, and whether
+    the capacity's and the usage's series cover the window."""
 
     capacity_tokens: float | None
     usage_at_start: float | None
     usage_peak: float | None
+    coverage: Coverage
 
 
 @dataclass(frozen=True)
@@ -332,16 +390,29 @@ class Host:
 
     host: int
     instance_type: InstanceType | None
+    image_digest: str | None
+    model_revision: str | None
+    """What its lifecycle agent said it serves, where it said one thing of the grammar."""
+    launch_fingerprints: tuple[str, ...]
+    """Every fingerprint its agent said in the window: one, on a host that kept its engine."""
     in_service_seconds: float
-    whole_window: bool
+    membership: Reason | None
+    """`None` for a host its release samples show through the whole window, or why they do not:
+    `host_turnover`, `incomplete_coverage` for a hole, `not_observed` for no release sample."""
     counters: dict[HostMetric, Counted]
     gauges: dict[HostMetric, Level]
     output_tokens_per_s: float | None
     warm_up_output_tokens: float | None
     """What the engine counted during the warm-up; `None` with no warm-up or no sample in it."""
+    warm_up_coverage: Coverage
+    """Whether the host's required series and its preemptions cover the warm-up."""
     warmed: bool
-    """Whether that is more than the host's own liveness completions would give."""
+    """Whether they do, and the tokens are more than the host's own liveness completions give."""
     cache: Cache
+
+    @property
+    def whole_window(self) -> bool:
+        return self.membership is None
 
 
 @dataclass(frozen=True)
@@ -355,20 +426,30 @@ class Totals:
 
 @dataclass(frozen=True)
 class Traffic:
-    """The gateway's requests over the window. `cohort_requests` is the canary cohort's count
-    less the setup probes taken out of it; `external_requests` is what the pool counted beyond
-    the cohort. All three are `None` when the gateway's counters gave nothing."""
+    """The gateway's requests over the window. `pool_requests` and `cohort_requests` are every
+    identity's count and the canary cohort's, each less the setup probes taken out of it;
+    `external_requests` is what the pool counted beyond the cohort. All three are `None` when the
+    gateway's counters gave nothing. `setup_probes_placed` is whether the scrapes show the
+    increase holds the probes taken out, and `coverage` whether the counters cover the window."""
 
     pool_requests: float | None
     cohort_requests: float | None
     external_requests: float | None
     driver_requests: int
     setup_probes_excluded: int
+    setup_probes_placed: bool
+    coverage: Coverage
+
+    @property
+    def matched(self) -> bool:
+        """Whether the cohort's count is the number the driver says reached the gateway."""
+        return self.cohort_requests is not None and round(self.cohort_requests) == self.driver_requests
 
     @property
     def reconciled(self) -> bool:
-        """Whether the cohort's count is what the driver says reached the gateway."""
-        return self.cohort_requests is not None and round(self.cohort_requests) == self.driver_requests
+        """Whether that is established: the counts match, over counters that cover the window,
+        with every setup probe placed."""
+        return self.matched and self.setup_probes_placed and self.coverage is Coverage.COMPLETE
 
 
 @dataclass(frozen=True)
@@ -378,6 +459,9 @@ class Reading:
     seconds: float
     requested: Settings
     observed: Settings
+    requested_launch_fingerprint: str | None
+    observed_launch_fingerprint: str | None
+    """The one fingerprint every host said, `None` when they said none or not the same."""
     treatments: Mapping[Treatment, Reason | None]
     """Each treatment's reason for being unverified, `None` for a verified one."""
     reasons: tuple[Reason, ...]
@@ -403,7 +487,7 @@ class Reading:
 def selectors(pool: str, engine: str) -> dict[Key, str]:
     """The series behind each key on the pool, by the names of `engine`'s row. A quantity the
     row leaves out has no selector, and reads as missing."""
-    names, further = metric_names(engine), further_names(engine)
+    names, further, place = metric_names(engine), further_names(engine), cache_capacity(engine)
 
     def of(name: Name) -> str:
         return selector(name, "_total" if name.kind is Kind.COUNTER else "", pool)
@@ -424,6 +508,8 @@ def selectors(pool: str, engine: str) -> dict[Key, str]:
         HostMetric.WAITING_REQUESTS: of(names[Quantity.WAITING_REQUESTS]),
         HostMetric.GPU_UTILIZATION: plain(GPU_UTILIZATION_METRIC),
     }
+    if place is not None:
+        found[Source.CACHE_CONFIG] = of(place.metric)
     optional = {
         HostMetric.COMPUTED_INPUT_TOKENS_TOTAL: Further.COMPUTED_INPUT_TOKENS,
         HostMetric.PREEMPTIONS_TOTAL: Further.PREEMPTIONS,
@@ -479,7 +565,7 @@ def preflight(reader: Reader, pool: str, engine: str, at: float) -> Preflight:
     return Preflight(hosts=len(hosts), missing=tuple(missing))
 
 
-# --- Reading the answers -----------------------------------------------------------------------
+# --- What a series says of a window ----------------------------------------------------------
 
 
 def _by_host(series: Iterable[Series]) -> dict[str, list[Series]]:
@@ -490,63 +576,118 @@ def _by_host(series: Iterable[Series]) -> dict[str, list[Series]]:
     return found
 
 
-def _scraped(one: Series) -> list[tuple[float, float]]:
+def _scraped(one: Series) -> list[Sample]:
     """The series' samples in the order of their times, a sample that is no number left out."""
     return sorted((at, value) for at, value in one.samples if not math.isnan(value))
 
 
-def _complete(times: Sequence[float], window: Window) -> bool:
-    """Whether samples at `times`, in order, cover the window: one just before it, one after the
-    drain, and no hole longer than the allowance between them."""
-    held = [at for at in times if at >= window.started - ALLOWANCE_SECONDS]
-    if not held or held[0] > window.started or held[-1] < window.drained:
-        return False
-    return all(after - before <= ALLOWANCE_SECONDS for before, after in pairwise(held))
+def _bounding(one: Series, window: Window) -> list[Sample]:
+    """The samples that bound the window: from the last at or before its start to the first at
+    or after its drain. What was scraped beyond them is not the window's."""
+    scraped = _scraped(one)
+    before = [sample for sample in scraped if sample[0] <= window.started]
+    inside = [sample for sample in scraped if window.started < sample[0] < window.drained]
+    after = [sample for sample in scraped if sample[0] >= window.drained]
+    return [*before[-1:], *inside, *after[:1]]
+
+
+def _unbroken(times: Sequence[float]) -> bool:
+    return all(after - before <= ALLOWANCE_SECONDS for before, after in pairwise(times))
+
+
+def _covers(times: Sequence[float], window: Window) -> bool:
+    """Whether bounding samples at `times`, in order, cover the window: one at or before its
+    start, one at or after its drain, and no two further apart than the allowance."""
+    return bool(times) and times[0] <= window.started and times[-1] >= window.drained and _unbroken(times)
+
+
+def _shown(times: Iterable[float], low: float, high: float) -> Reason | None:
+    """Whether an agent's samples at `times` show what they say held from `low` to `high`: `None`
+    when they start and end within the allowance of the two with no hole between. Else why not:
+    no sample, a part of the time only, or a hole."""
+    held = sorted({at for at in times if low - ALLOWANCE_SECONDS <= at <= high + ALLOWANCE_SECONDS})
+    if not held:
+        return Reason.NOT_OBSERVED
+    if held[0] > low + ALLOWANCE_SECONDS or held[-1] < high - ALLOWANCE_SECONDS:
+        return Reason.HOST_TURNOVER
+    return None if _unbroken(held) else Reason.INCOMPLETE_COVERAGE
+
+
+def _risen(one: Series, window: Window, *, from_zero: bool) -> tuple[float, int, list[float]] | None:
+    """One counter series over the window: its increase, its restarts and the times of the
+    samples that bound the window. `None` for a series that is not the window's: its last sample
+    is more than the allowance before the start. One scraped just before the start and never
+    after stopped with the window, and counts nothing over times that do not cover it. A series
+    with no sample before the start counts from zero when `from_zero`, as one that began with
+    its first event; else from its first sample, whose value shows no work of the window."""
+    held = _bounding(one, window)
+    if not held or held[-1][0] < window.started - ALLOWANCE_SECONDS:
+        return None
+    start = window.started if from_zero or held[0][0] <= window.started else held[0][0]
+    # S5's increase is by instance: the series is given one name here, whatever labels it has.
+    alone = dataclasses.replace(one, labels={"instance": "one"}, samples=tuple(held))
+    increase = sum(counted_of([alone], start).values())
+    resets = sum(after < before for (_, before), (_, after) in pairwise(held))
+    return increase, resets, [at for at, _ in held]
 
 
 def _counted(series: Sequence[Series], window: Window) -> Counted:
     """One counter of one host over the window, from its series."""
-    increase = counted_of(series, window.started)
-    if not increase:
+    risen = [found for one in series if (found := _risen(one, window, from_zero=False)) is not None]
+    if not any(times[-1] > window.started for _, _, times in risen):
         return Counted(None, 0, Coverage.MISSING)
-    resets, complete = 0, True
-    for one in series:
-        scraped = _scraped(one)
-        inside = [value for at, value in scraped if at > window.started]
-        if not inside:
-            continue
-        before = [value for at, value in scraped if at <= window.started]
-        resets += sum(after < held for held, after in pairwise([*before[-1:], *inside]))
-        complete = complete and _complete([at for at, _ in scraped], window)
-    return Counted(sum(increase.values()), resets, Coverage.COMPLETE if complete else Coverage.INCOMPLETE)
+    complete = all(_covers(times, window) for _, _, times in risen)
+    return Counted(
+        sum(increase for increase, _, _ in risen),
+        sum(resets for _, resets, _ in risen),
+        Coverage.COMPLETE if complete else Coverage.INCOMPLETE,
+    )
 
 
-def _scrapes(series: Sequence[Series], combine: Callable[[list[float]], float]) -> list[tuple[float, float]]:
-    """One number a scrape of one host's gauge: its series' values at each time, combined."""
-    values: dict[float, list[float]] = {}
-    for one in series:
-        for at, value in _scraped(one):
-            values.setdefault(at, []).append(value)
-    return [(at, combine(held)) for at, held in sorted(values.items())]
+def _gauge(
+    series: Sequence[Series], window: Window, combine: Callable[[list[float]], float]
+) -> tuple[list[Sample], Coverage]:
+    """One gauge of one host: one number at each scrape every one of its series reported, from
+    the samples that bound the window, and whether each of those series covers it. A series with
+    no sample in the window is not one of them; one that stopped within the allowance before the
+    window still makes the gauge incomplete."""
+    near = [dict(_bounding(one, window)) for one in series]
+    near = [one for one in near if one and max(one) >= window.started - ALLOWANCE_SECONDS]
+    held = [one for one in near if any(window.started <= at <= window.drained for at in one)]
+    if not held:
+        return [], Coverage.MISSING
+    complete = all(_covers(sorted(one), window) for one in near)
+    times = sorted(set.intersection(*(set(one) for one in held)))
+    scrapes = [(at, combine([one[at] for one in held])) for at in times]
+    return scrapes, Coverage.COMPLETE if complete else Coverage.INCOMPLETE
 
 
 def _level(series: Sequence[Series], window: Window, combine: Callable[[list[float]], float]) -> Level:
     """One gauge of one host over the window, from its series."""
-    scrapes = _scrapes(series, combine)
+    scrapes, coverage = _gauge(series, window, combine)
     inside = [value for at, value in scrapes if window.started <= at <= window.drained]
-    if not inside:
-        return Level(None, None, Coverage.MISSING)
-    complete = _complete([at for at, _ in scrapes], window)
-    return Level(fmean(inside), max(inside), Coverage.COMPLETE if complete else Coverage.INCOMPLETE)
+    return Level(fmean(inside) if inside else None, max(inside, default=None), coverage)
 
 
-def _times(series: Iterable[Series], labels: Sequence[str]) -> dict[str, dict[tuple[str, ...], list[float]]]:
-    """For each instance, the times of its samples by the values of `labels` they carry."""
-    found: dict[str, dict[tuple[str, ...], list[float]]] = {}
-    for instance, held in _by_host(series).items():
-        for one in held:
-            said = tuple(one.labels.get(label, "") for label in labels)
-            found.setdefault(instance, {}).setdefault(said, []).extend(at for at, _ in one.samples)
+def _cache(capacity: Sequence[Series], usage: Sequence[Series], window: Window) -> Cache:
+    said, capacity_coverage = _gauge(capacity, window, max)
+    capacities = {value for at, value in said if window.started <= at <= window.drained}
+    scrapes, usage_coverage = _gauge(usage, window, max)
+    at_start = [value for at, value in scrapes if window.started - ALLOWANCE_SECONDS <= at <= window.started]
+    return Cache(
+        capacity_tokens=next(iter(capacities)) if len(capacities) == 1 else None,
+        usage_at_start=at_start[-1] if at_start else None,
+        usage_peak=max((value for at, value in scrapes if window.started <= at <= window.drained), default=None),
+        coverage=_worst((capacity_coverage, usage_coverage)),
+    )
+
+
+def _times(series: Iterable[Series], labels: Sequence[str]) -> dict[tuple[str, ...], list[float]]:
+    """The times of one host's samples, by the values of `labels` they carry."""
+    found: dict[tuple[str, ...], list[float]] = {}
+    for one in series:
+        said = tuple(one.labels.get(label, "") for label in labels)
+        found.setdefault(said, []).extend(at for at, _ in _scraped(one))
     return found
 
 
@@ -556,13 +697,26 @@ def _said(by: Mapping[tuple[str, ...], list[float]], window: Window) -> dict[tup
     return {said: held for said, held in seconds.items() if held > 0}
 
 
-def _one(values: set[str], grammar: re.Pattern[str]) -> str | None:
-    """The one value every host reported, when it is one and of its grammar."""
-    return next(iter(values)) if len(values) == 1 and grammar.fullmatch(next(iter(values))) else None
+def _only[T](values: Iterable[T | None]) -> T | None:
+    """The one thing all of `values` are, when there is a value, none is `None` and all agree."""
+    held = list(values)
+    return held[0] if held and all(one is not None and one == held[0] for one in held) else None
 
 
 def _held(value: str | None, grammar: re.Pattern[str]) -> str | None:
     return value if value is not None and grammar.fullmatch(value) else None
+
+
+def _effective(series: Sequence[Series], window: Window) -> dict[str, object]:
+    """What one host's engine said of each setting of `EFFECTIVE`: its meaning where every
+    series of the host that reported in the window said the same text, through the window."""
+    reported = [one for one in series if any(window.started <= at <= window.drained for at, _ in _scraped(one))]
+    whole = _shown((at for one in reported for at, _ in _scraped(one)), window.started, window.drained) is None
+    found: dict[str, object] = {}
+    for setting, (label, meanings) in EFFECTIVE.items():
+        text = _only(one.labels.get(label) for one in reported)
+        found[setting] = meanings.get(text) if whole and text is not None else None
+    return found
 
 
 def _match(declared: Sequence[object], observed: Sequence[object]) -> Reason | None:
@@ -575,7 +729,7 @@ def _match(declared: Sequence[object], observed: Sequence[object]) -> Reason | N
     return None if all(asked == seen for asked, seen in pairs) else Reason.UNEXPECTED
 
 
-def _launch(requested: str | None, hosts: Sequence[tuple[set[str], bool]]) -> Reason | None:
+def _launch(requested: str | None, hosts: Sequence[tuple[tuple[str, ...], bool]]) -> Reason | None:
     """The launch settings' reason, from each host's fingerprints in the window and whether one
     fingerprint, and nothing else, was said through the host's time in service."""
     if _held(requested, _FINGERPRINT) is None:
@@ -592,27 +746,39 @@ def _launch(requested: str | None, hosts: Sequence[tuple[set[str], bool]]) -> Re
 
 def _traffic(series: Sequence[Series], window: Window, driver: Driver) -> Traffic:
     expected = driver.attempts + driver.side_queries
-    pool = counted_of(series, window.started)
-    if not pool:
-        return Traffic(None, None, None, expected, 0)
-    cohort = sum(
-        counted_of([one for one in series if one.labels.get("alias", "") in driver.cohort], window.started).values()
+    risen = [(one, found) for one in series if (found := _risen(one, window, from_zero=True)) is not None]
+    if not any(times[-1] > window.started for _, (_, _, times) in risen):
+        return Traffic(None, None, None, expected, 0, driver.setup_probes == 0, Coverage.MISSING)
+    # Each task of the gateway must show scrapes through the whole window, by any of its series:
+    # only then did a series that begins in the window begin with its first request. And each
+    # series, once it began, must go on to the drain.
+    tasks: dict[str, set[float]] = {}
+    for one, (_, _, times) in risen:
+        tasks.setdefault(one.labels.get("instance", ""), set()).update(times)
+    complete = all(_covers(sorted(times), window) for times in tasks.values()) and all(
+        times[-1] >= window.drained and _unbroken(times) for _, (_, _, times) in risen
     )
-    # A setup probe sent after the last scrape before the window is in the cohort's increase.
-    probes = min(max(round(cohort) - expected, 0), driver.setup_probes)
-    total = sum(pool.values())
-    return Traffic(total, cohort - probes, total - cohort, expected, probes)
-
-
-def _until(series: Sequence[Series], end: float) -> list[Series]:
-    return [
-        dataclasses.replace(one, samples=tuple(sample for sample in one.samples if sample[0] <= end)) for one in series
-    ]
-
-
-def _last(scrapes: Sequence[tuple[float, float]], low: float, high: float) -> float | None:
-    inside = [value for at, value in scrapes if low <= at <= high]
-    return inside[-1] if inside else None
+    pool = sum(increase for _, (increase, _, _) in risen)
+    cohort = [found for one, found in risen if one.labels.get("alias", "") in driver.cohort]
+    counted = sum(increase for increase, _, _ in cohort)
+    # A probe is in the increase when it was sent after the scrape the increase runs from. A
+    # series that begins in the window holds every request of its identity.
+    probes = min(driver.setup_probes, max(round(counted), 0))
+    since = driver.setup_from
+    placed = driver.setup_probes == 0 or (
+        probes == driver.setup_probes
+        and since is not None
+        and all(times[0] > window.started or times[0] < since for _, _, times in cohort)
+    )
+    return Traffic(
+        pool_requests=pool - probes,
+        cohort_requests=counted - probes,
+        external_requests=pool - counted,
+        driver_requests=expected,
+        setup_probes_excluded=probes,
+        setup_probes_placed=placed,
+        coverage=Coverage.COMPLETE if complete else Coverage.INCOMPLETE,
+    )
 
 
 def _reasons(hosts: Sequence[Host], traffic: Traffic) -> tuple[Reason, ...]:
@@ -621,10 +787,12 @@ def _reasons(hosts: Sequence[Host], traffic: Traffic) -> tuple[Reason, ...]:
     if not hosts:
         reasons.add(Reason.NOT_OBSERVED)
     for host in hosts:
-        if not host.whole_window:
-            # A host of a part of the window is the turnover's; the others owe the whole evidence.
-            reasons.add(Reason.HOST_TURNOVER)
-            continue
+        if host.membership is not None:
+            reasons.add(host.membership)
+            if host.membership is not Reason.INCOMPLETE_COVERAGE:
+                # A host of a part of the window, or of no release, does not owe the whole
+                # evidence; the others do, and so does one whose release samples have a hole.
+                continue
         preemptions = host.counters[HostMetric.PREEMPTIONS_TOTAL].coverage
         readings: dict[HostMetric, Counted | Level] = {**host.counters, **host.gauges}
         covered = [readings[metric].coverage for metric in REQUIRED]
@@ -632,20 +800,39 @@ def _reasons(hosts: Sequence[Host], traffic: Traffic) -> tuple[Reason, ...]:
             reasons.add(Reason.ENGINE_SERIES_MISSING)
         if preemptions is Coverage.MISSING:
             reasons.add(Reason.PREEMPTION_COVERAGE_MISSING)
-        if Coverage.INCOMPLETE in (*covered, preemptions):
+        if Coverage.INCOMPLETE in (*covered, preemptions, host.cache.coverage):
             reasons.add(Reason.INCOMPLETE_COVERAGE)
         if not host.warmed:
             reasons.add(Reason.WARM_UP_INCOMPLETE)
         if host.cache.capacity_tokens is None or host.cache.usage_at_start is None:
             reasons.add(Reason.CACHE_EVIDENCE_MISSING)
-    if traffic.pool_requests is None:
+    if traffic.coverage is Coverage.MISSING:
         reasons.add(Reason.GATEWAY_COUNTERS_MISSING)
     else:
+        if traffic.coverage is Coverage.INCOMPLETE:
+            reasons.add(Reason.GATEWAY_COVERAGE_INCOMPLETE)
         if traffic.external_requests:
             reasons.add(Reason.EXTERNAL_TRAFFIC)
-        if not traffic.reconciled:
+        if not traffic.setup_probes_placed:
+            reasons.add(Reason.SETUP_PROBES_UNPLACED)
+        if not traffic.matched:
             reasons.add(Reason.UNRECONCILED_COUNTERS)
     return tuple(sorted(reasons))
+
+
+def _warm_up(of: Callable[[Key], list[Series]], warm_up: Window | None) -> tuple[float | None, Coverage, bool]:
+    """What one host's engine counted during the warm-up, whether the host's required series and
+    its preemptions cover it, and whether the host is so shown to have worked: more tokens than
+    a liveness completion of one token each minute gives between the samples that bound it."""
+    if warm_up is None:
+        return None, Coverage.MISSING, False
+    worked = _counted(of(HostMetric.OUTPUT_TOKENS_TOTAL), warm_up).increase
+    coverage = _worst(
+        _counted(of(metric), warm_up).coverage if metric in COUNTERS else _gauge(of(metric), warm_up, GAUGES[metric])[1]
+        for metric in (*REQUIRED, HostMetric.PREEMPTIONS_TOTAL)
+    )
+    liveness = int((warm_up.seconds + 2 * ALLOWANCE_SECONDS) // PROBE_INTERVAL_SECONDS) + 1
+    return worked, coverage, coverage is Coverage.COMPLETE and worked is not None and worked > liveness
 
 
 def resolve(
@@ -655,70 +842,75 @@ def resolve(
     ones, each treatment verified or not, each host's metrics and the pool's totals, the gateway's
     traffic, and the reasons the window cannot qualify."""
     ordinals = Ordinals() if ordinals is None else ordinals
-    by_key = {key: _by_host(series) for key, series in answers.items()}
-    releases = _times(answers.get(Source.RELEASE, ()), ("instance_type", "image_digest", "model_revision"))
-    launches = _times(answers.get(Source.LAUNCH, ()), ("settings_fingerprint",))
+    by_key = {key: _by_host(series) for key, series in answers.items() if key is not Source.GATEWAY_REQUESTS}
+    # A host is an instance that reported a release in the window, or anything else in it.
+    instances = {
+        instance
+        for held in by_key.values()
+        for instance, series in held.items()
+        if any(window.started <= at <= window.drained for one in series for at, _ in _scraped(one))
+    }
 
     hosts: list[Host] = []
-    identities: set[tuple[str, ...]] = set()
-    launched: list[tuple[set[str], bool]] = []
-    for instance in sorted(releases):
-        served = _said(releases[instance], window)
-        if not served:
-            continue
-        taken = [at for times in releases[instance].values() for at in times]
-        in_service = seconds_covered(taken, window.started, window.drained)
-        identities |= set(served)
-
-        said = _said(launches.get(instance, {}), window)
-        valid = {one for (one,) in said if _FINGERPRINT.fullmatch(one)}
-        whole = len(said) == 1 and len(valid) == 1 and max(said.values()) >= in_service - ALLOWANCE_SECONDS
-        launched.append((valid, whole))
+    identities: set[tuple[str, str]] = set()
+    launched: list[tuple[tuple[str, ...], bool]] = []
+    effective: list[dict[str, object]] = []
+    for instance in sorted(instances | set(by_key.get(Source.RELEASE, {}))):
 
         def of(key: Key, instance: str = instance) -> list[Series]:
             return by_key.get(key, {}).get(instance, [])
 
+        releases = _times(of(Source.RELEASE), ("instance_type", "image_digest", "model_revision"))
+        served = _said(releases, window)
+        if not served and instance not in instances:
+            continue
+        taken = [at for times in releases.values() for at in times]
+        membership = _shown(taken, window.started, window.drained) if served else Reason.NOT_OBSERVED
+        identities |= {(image, revision) for _, image, revision in served}
+
+        # The fingerprint must be said through the host's time in service: the window, or the
+        # part of it the release samples of a host that joined or left show.
+        low, high = window.started, window.drained
+        if membership is Reason.HOST_TURNOVER:
+            near = [at for at in taken if low - ALLOWANCE_SECONDS <= at <= high + ALLOWANCE_SECONDS]
+            low, high = max(low, min(near)), min(high, max(near))
+        said = _said(_times(of(Source.LAUNCH), ("settings_fingerprint",)), window)
+        fingerprints = tuple(sorted(one for (one,) in said if _FINGERPRINT.fullmatch(one)))
+        whole = (
+            len(said) == 1
+            and len(fingerprints) == 1
+            and _shown((at for one in of(Source.LAUNCH) for at, _ in _scraped(one)), low, high) is None
+        )
+        launched.append((fingerprints, whole))
+        effective.append(_effective(of(Source.CACHE_CONFIG), window))
+
         counters = {metric: _counted(of(metric), window) for metric in COUNTERS}
         output = counters[HostMetric.OUTPUT_TOKENS_TOTAL].increase
-        warm_up = driver.warm_up
-        worked = (
-            None
-            if warm_up is None
-            else _counted(_until(of(HostMetric.OUTPUT_TOKENS_TOTAL), warm_up.drained), warm_up).increase
-        )
-        liveness = 0 if warm_up is None else int(warm_up.seconds // PROBE_INTERVAL_SECONDS) + 1
-        usage = _scrapes(of(Source.CACHE_USAGE), max)
-        capacity = _scrapes(of(Source.CACHE_CAPACITY), max)
-        kinds = {kind for kind, _, _ in served}
+        worked, warm_up_coverage, warmed = _warm_up(of, driver.warm_up)
+        kind = _only(kind for kind, _, _ in served)
         hosts.append(
             Host(
                 host=ordinals.of(instance),
-                instance_type=InstanceType(next(iter(kinds)))
-                if len(kinds) == 1 and kinds <= set(InstanceType)
-                else None,
-                in_service_seconds=in_service,
-                whole_window=in_service >= window.seconds - ALLOWANCE_SECONDS,
+                instance_type=InstanceType(kind) if kind in set(InstanceType) else None,
+                image_digest=_held(_only(image for _, image, _ in served), _DIGEST),
+                model_revision=_held(_only(revision for _, _, revision in served), _COMMIT),
+                launch_fingerprints=fingerprints,
+                in_service_seconds=seconds_covered(taken, window.started, window.drained),
+                membership=membership,
                 counters=counters,
                 gauges={metric: _level(of(metric), window, combine) for metric, combine in GAUGES.items()},
                 output_tokens_per_s=None if output is None else output / window.seconds,
                 warm_up_output_tokens=worked,
-                warmed=worked is not None and worked > liveness,
-                cache=Cache(
-                    capacity_tokens=_last(capacity, window.started - ALLOWANCE_SECONDS, window.drained),
-                    usage_at_start=_last(usage, window.started - ALLOWANCE_SECONDS, window.started),
-                    usage_peak=max(
-                        (value for at, value in usage if window.started <= at <= window.drained), default=None
-                    ),
-                ),
+                warm_up_coverage=warm_up_coverage,
+                warmed=warmed,
+                cache=_cache(of(Source.CACHE_CAPACITY), of(Source.CACHE_USAGE), window),
             )
         )
 
-    turnover = any(not host.whole_window for host in hosts)
-    types = {host.instance_type for host in hosts}
-    instance_type = next(iter(types)) if len(types) == 1 else None
+    instance_type = _only(host.instance_type for host in hosts)
     gpu_type, gpus = INSTANCE_GPUS[instance_type] if instance_type is not None else (None, None)
-    image = _one({image for _, image, _ in identities}, _DIGEST)
-    revision = _one({revision for _, _, revision in identities}, _COMMIT)
+    image = _only(host.image_digest for host in hosts)
+    revision = _only(host.model_revision for host in hosts)
     observed: dict[str, Any] = dict.fromkeys(spec.name for spec in dataclasses.fields(Settings))
     observed |= {
         "host_count": len(hosts) or None,
@@ -729,23 +921,39 @@ def resolve(
         "engine_image_digest": image,
         "tokenizer_revision": _held(driver.tokenizer_revision, _COMMIT),
         "gateway_profile_digest": _held(driver.gateway_profile_digest, _DIGEST),
+        **{setting: _only(said[setting] for said in effective) for setting in EFFECTIVE},
     }
     seen = Settings(**observed)
     asked = requested.settings
 
+    # What stands in the way of a claim about every host through the window, the worst first.
+    memberships = {host.membership for host in hosts}
+    gap = next(
+        (
+            reason
+            for reason in (Reason.HOST_TURNOVER, Reason.NOT_OBSERVED, Reason.INCOMPLETE_COVERAGE)
+            if reason in memberships
+        ),
+        None,
+    )
     if asked.host_count is None and asked.instance_type is None:
         membership = Reason.NOT_DECLARED
     elif not hosts:
         membership = Reason.NOT_OBSERVED
-    elif turnover:
-        membership = Reason.HOST_TURNOVER
-    elif len(types) > 1:
+    elif gap is not None:
+        membership = gap
+    elif len({host.instance_type for host in hosts} - {None}) > 1:
         membership = Reason.MIXED
     else:
         membership = _match((asked.host_count, asked.instance_type), (seen.host_count, seen.instance_type))
     release = _match((asked.engine_image_digest, asked.model_revision), (image, revision))
-    if release is not Reason.NOT_DECLARED and len({served[1:] for served in identities}) > 1:
-        release = Reason.MIXED
+    if release is not Reason.NOT_DECLARED:
+        if len(identities) > 1:
+            release = Reason.MIXED
+        elif Reason.NOT_OBSERVED in memberships:
+            release = Reason.NOT_OBSERVED
+        elif Reason.INCOMPLETE_COVERAGE in memberships:
+            release = Reason.INCOMPLETE_COVERAGE
     treatments = {
         Treatment.HOSTS: membership,
         Treatment.RELEASE: release,
@@ -766,6 +974,8 @@ def resolve(
         seconds=window.seconds,
         requested=asked,
         observed=seen,
+        requested_launch_fingerprint=_held(requested.launch_fingerprint, _FINGERPRINT),
+        observed_launch_fingerprint=_only(said[0] if len(said) == 1 else None for said, _ in launched),
         treatments=treatments,
         reasons=_reasons(hosts, traffic),
         hosts=tuple(sorted(hosts, key=lambda host: host.host)),
