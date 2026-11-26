@@ -1,0 +1,33 @@
+{
+  "weeks": 6,
+  "machine_hours_per_week": [130, 130, 100, 130, 130, 80],
+  "products": {
+    "frame": {
+      "demand": [18, 10, 22, 12, 26, 14],
+      "initial_stock": 6,
+      "unit_cost": 42,
+      "holding_cost": 3,
+      "setup_cost": 260,
+      "hours_per_unit": 3,
+      "setup_hours": 8
+    },
+    "wheel": {
+      "demand": [30, 44, 16, 38, 24, 40],
+      "initial_stock": 10,
+      "unit_cost": 15,
+      "holding_cost": 1,
+      "setup_cost": 180,
+      "hours_per_unit": 1,
+      "setup_hours": 5
+    },
+    "saddle": {
+      "demand": [8, 14, 12, 6, 16, 10],
+      "initial_stock": 0,
+      "unit_cost": 23,
+      "holding_cost": 2,
+      "setup_cost": 150,
+      "hours_per_unit": 2,
+      "setup_hours": 6
+    }
+  }
+}
