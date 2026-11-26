@@ -190,18 +190,14 @@ def test_a_failing_research_family_stays_visible_beside_rates_above_the_floor() 
 def test_invalid_and_superseded_executions_are_kept_and_left_out_of_the_denominator() -> None:
     (retried,) = chosen(Load.CLASS, Family.ANALYSIS, instance=1, attempt=0)
     (broken,) = chosen(Load.CLASS, Family.RESEARCH, instance=2, attempt=1)
-    (rerun,) = chosen(Load.CLASS, Family.DEBUGGING, Harness.CODEX, instance=3, attempt=2)
     (missing,) = chosen(Load.CLASS, Family.OPTIMIZATION, Harness.PI, instance=1, attempt=0)
     timed_out = chosen(Load.CLASS, Family.OPTIMIZATION, Harness.PI, instance=1, attempt=1)
     run = records(
         timed_out,
         invalid={retried, broken},
         absent={missing},
-        # An invalid execution replaced by a failure, and a pass replaced by a failure.
-        also=(
-            ran(retried, FAILED, execution=1000, replaces=retried),
-            ran(rerun, FAILED, execution=1001, replaces=rerun),
-        ),
+        # An invalid execution replaced by a failure.
+        also=(ran(retried, FAILED, execution=1000, replaces=retried),),
     )
     loaded = read(run)[Load.CLASS]
 
@@ -212,8 +208,6 @@ def test_invalid_and_superseded_executions_are_kept_and_left_out_of_the_denomina
     # The replaced invalid execution is kept and the trial counts once, as the failure: 8 of 9.
     assert counts(Family.ANALYSIS, Harness.CLAUDE_CODE) == (10, 9, 8, 2)
     assert loaded.cell(Family.ANALYSIS, Harness.CLAUDE_CODE).floor_outcome is Outcome.PASS
-    # So does the replaced pass: what counts is the execution that replaced it.
-    assert counts(Family.DEBUGGING, Harness.CODEX) == (10, 9, 8, 2)
     # An invalid execution that nothing replaced is out of the denominator, and the cell is not
     # read as 8 of 8: a planned trial is missing, so its floor is not met.
     research = loaded.cell(Family.RESEARCH, Harness.CLAUDE_CODE)
@@ -243,6 +237,60 @@ def test_a_cell_that_is_not_valid_for_qualification_leaves_its_trials_missing() 
     assert all(cell.floor_outcome is Outcome.PASS for cell in reading[Load.LOW].cells)
     with pytest.raises(QualityError):
         read(replace(run, trials=(*run.trials, ran(len(CLASS.trials)))))
+
+
+def test_a_cell_run_again_counts_only_what_ran_in_its_valid_window() -> None:
+    """The first research cell at class load is flagged with three passes in it, and run again
+    from the 40th minute: two of its trials have an execution there, a pass and a timeout."""
+    absent, passed, timed_out = sorted(chosen(Load.CLASS, Family.RESEARCH, attempt=0))
+    cell = CLASS.trials[absent].cell
+    again = replace(window(cell), started_ms=2_400_000, admissions_ended_ms=4_200_000, ended_ms=4_200_000)
+    run = records()
+    run = replace(
+        run,
+        cells=(
+            *(window(one.cell, InvalidFlag.EXTERNAL_TRAFFIC) if one.cell == cell else one for one in run.cells),
+            again,
+        ),
+        trials=(
+            *run.trials,
+            replace(ran(passed, execution=1000, replaces=passed), started_ms=2_400_000, ended_ms=2_460_000),
+            replace(
+                ran(timed_out, FAILED, execution=1001, replaces=timed_out), started_ms=2_460_000, ended_ms=2_520_000
+            ),
+        ),
+    )
+    loaded = read(run)[Load.CLASS]
+    research = loaded.cell(Family.RESEARCH, Harness.CLAUDE_CODE)
+
+    # The 6 trials of the two other cells, and the 2 run again: 7 of 8, and not the pass that
+    # the flagged window holds for the ninth, nor the one it holds for the timeout.
+    assert (research.executions, research.attempts, research.successes) == (11, 8, 7)
+    assert (research.instances_all_passed, research.floor_outcome) == (1, Outcome.INCONCLUSIVE)
+    # Both windows of the cell are paid for: 13 windows of thirty minutes on two hosts.
+    assert (loaded.throughput.elapsed_hours, loaded.throughput.instance_hours) == (6.5, 13.0)
+    # Two valid records of one cell, or two windows of it that overlap, measure nothing.
+    with pytest.raises(QualityError):
+        read(replace(run, cells=(*records().cells, again)))
+    with pytest.raises(QualityError):
+        read(replace(run, cells=(*run.cells[:-1], replace(again, started_ms=1_000_000))))
+
+
+def test_a_completed_attempt_of_a_measured_cell_cannot_be_run_again_into_a_pass() -> None:
+    """One research instance times out on its three repeats at class load, in valid cells: 6 of 9
+    is the result. Passes that name the timeouts as replaced are refused, and passes that name
+    nothing leave the three trials with two executions each, which count for nothing."""
+    timed_out = sorted(chosen(Load.CLASS, Family.RESEARCH, instance=1))
+    for replaces in (True, False):
+        passes = tuple(ran(trial, execution=1000 + trial, replaces=trial if replaces else None) for trial in timed_out)
+        run = records(timed_out, also=passes)
+        if replaces:
+            with pytest.raises(QualityError):
+                read(run)
+        else:
+            research = read(run)[Load.CLASS].cell(Family.RESEARCH, Harness.CLAUDE_CODE)
+            assert (research.executions, research.attempts, research.successes) == (12, 6, 6)
+            assert research.floor_outcome is Outcome.INCONCLUSIVE
 
 
 def test_time_and_host_cost_count_failed_and_background_work_and_no_success_leaves_the_ratio_undefined() -> None:
@@ -352,6 +400,38 @@ def test_repeats_are_resampled_within_each_instance() -> None:
 
     assert (lower, observed) == (pytest.approx(-100 / 3), pytest.approx(-50 / 3))
     assert upper in (pytest.approx(-50 / 9), 0.0)
+
+
+def test_a_draw_keeps_every_harness_of_a_family_at_its_equal_weight() -> None:
+    """Debugging is planned as two tasks: one instance on Claude Code and Codex, and two on
+    Claude Code alone. The candidate fails it on Codex and the reference on Claude Code, so it
+    gains 1 on one harness and loses 1 on the other: 0 as observed. A draw without the Codex
+    instance would read the gain alone, +50 points of hands-on. No draw is: the Codex instance
+    is in each, and every draw gives 0."""
+    task = next(one for one in SUITE.suite.tasks if one.family is Family.DEBUGGING)
+    both = replace(task, instances=task.instances[:1])
+    alone = replace(
+        task,
+        task_id="debugging.t02",
+        harnesses=task.harnesses[:1],
+        instances=tuple(replace(one, instance_id=one.instance_id.replace("t01", "t02")) for one in task.instances[1:]),
+    )
+    assert [assignment.harness for assignment in alone.harnesses] == [Harness.CLAUDE_CODE]
+    tasks = sorted([one for one in SUITE.suite.tasks if one != task] + [both, alone], key=lambda one: one.task_id)
+    spec = replace(
+        SUITE,
+        suite=replace(SUITE.suite, tasks=tuple(tasks)),
+        background=SUITE.background | {alone.task_id: Shape.HANDS_ON},
+    )
+    workload = plan.expand(spec, Profile.QUALIFY, 8).workload
+
+    def failing_on(harness: Harness) -> Records:
+        return records(chosen(Load.LOW, Family.DEBUGGING, harness, workload=workload), workload=workload)
+
+    decision = quality.compare(failing_on(Harness.CODEX), failing_on(Harness.CLAUDE_CODE)).of(Load.LOW, Shape.HANDS_ON)
+
+    assert (decision.outcome, decision.reason) == (Outcome.INCONCLUSIVE, Reason.DEGENERATE_PRECISION)
+    assert (decision.difference_points, decision.lower_points, decision.upper_points) == (0.0, None, None)
 
 
 def test_the_same_records_give_the_same_intervals_in_any_order() -> None:

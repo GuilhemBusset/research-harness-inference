@@ -13,12 +13,20 @@ seat can load a task, so the plan has low-load cells only and each carries both 
 (`evaluate.plan`): its trials are read at low load and at class load, once in each reading. A
 load the plan has no trial for has no reading, and its paired decisions are inconclusive.
 
-**What counts.** Every execution of a trial is kept, and one planned trial counts once, through
-the execution that no later execution of that trial replaces. It counts when that execution
-completed, as a pass or a failure, in a cell of the plan with a record that is valid for
-qualification. An invalid execution that was not replaced, a trial with no execution, one with
-several that do not replace each other, and a trial of a cell that is flagged, incomplete or
-without a record do not count: the trial is then missing, never a failure and never a pass.
+**What counts.** Every execution of a trial and every record of a cell is kept. A cell is
+measured by its one record that is valid for qualification, and only what ran inside the window
+of that record is read: a cell that is run again is run whole, so an execution in the window of a
+flagged or incomplete record of the cell, or in none, never counts, whatever replaces it. One
+planned trial counts once, through the execution in that window that no execution of the trial
+replaces, when it completed, as a pass or a failure. An invalid execution that was not replaced,
+a trial with no execution in the window, one with several there that do not replace each other,
+and a trial of a cell with no valid record do not count: the trial is then missing, never a
+failure and never a pass.
+
+A completed attempt of a measured cell is a result, and only an invalid execution is run again.
+Records that say otherwise are refused (`QualityError`), not read: an execution that replaces
+such an attempt, two valid records of one cell, two records of one cell whose windows overlap,
+and a trial or cell record of nothing the workload plans.
 
 **A quality cell** (`CellQuality`) is a family on a harness at a load. It has its successes over
 its counted attempts, the instances that passed every planned repeat, and the floor: met or
@@ -51,7 +59,11 @@ The interval is a bootstrap. A draw resamples the instances of each family, with
 harnesses, and within each sampled instance the repeat indices, the same ones for both runs and
 for every harness. The generator of a family is seeded from the workload's identity and the
 family, and only its `random()` is used, whose sequence Python keeps: the same records give the
-same interval. The bounds are the 2.5th and 97.5th percentiles of the draws, interpolated as
+same interval. The instances of a family that are planned on different harnesses are resampled
+apart, each among those planned on the same ones: every draw then has every harness of the
+family, on as many instances as were planned, and the equal weight of the harnesses is the same
+in every draw as in the observed difference. In the course suite every instance of a family is on
+all its harnesses, so these are the instances of the family. The bounds are the 2.5th and 97.5th percentiles of the draws, interpolated as
 `common.percentile` does. A lower bound at or above the margin passes, an interval wholly below
 it fails, and one that spans it is inconclusive. When every draw gives the same difference there
 is no interval: the observed difference is reported and the decision is inconclusive.
@@ -59,8 +71,7 @@ is no interval: the observed difference is reported and the decision is inconclu
 Differences are kept as whole numbers over one denominator until they are reported, so that
 equal differences are equal and a bound on the margin is exactly on it.
 
-A trial or cell record of nothing the workload plans is refused (`QualityError`). It needs
-`spikes` on the path, for `common.percentile`, and what `spikes/common.py` imports.
+It needs `spikes` on the path, for `common.percentile`, and what `spikes/common.py` imports.
 """
 
 from __future__ import annotations
@@ -70,6 +81,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from fractions import Fraction
+from itertools import pairwise
 from random import Random
 from typing import TYPE_CHECKING
 
@@ -119,7 +131,8 @@ class Reason(StrEnum):
 
 
 class QualityError(ValueError):
-    """Records that are not of their workload. The message names the rule, never a value."""
+    """Records that are not of their workload, or that put a result aside. The message names the
+    rule, never a value."""
 
 
 @dataclass(frozen=True)
@@ -262,12 +275,30 @@ def _planned(workload: Workload, load: Load) -> list[TrialIdentity]:
     return [trial for trial in workload.trials if load in loads_of(workload, trial.cell)]
 
 
+def _measured(records: Records) -> dict[int, CellRecord]:
+    """The record that measures each cell of the plan that has one: its valid one."""
+    windows: dict[int, list[CellRecord]] = {}
+    for record in records.cells:
+        if record.cell >= len(records.workload.cells):
+            raise QualityError("a cell record is of a cell of the plan")
+        windows.setdefault(record.cell, []).append(record)
+    measured = {}
+    for cell, kept in windows.items():
+        kept.sort(key=lambda record: (record.started_ms, record.ended_ms))
+        if any(later.started_ms < earlier.ended_ms for earlier, later in pairwise(kept)):
+            raise QualityError("the records of a cell do not overlap")
+        valid = [record for record in kept if record.valid_for_qualification]
+        if len(valid) > 1:
+            raise QualityError("a cell is measured once")
+        if valid:
+            measured[cell] = valid[0]
+    return measured
+
+
 def _counted(records: Records) -> dict[int, TrialRecord]:
     """The execution that counts for each planned trial that has one."""
     workload = records.workload
-    if any(record.cell >= len(workload.cells) for record in records.cells):
-        raise QualityError("a cell record is of a cell of the plan")
-    measured = {record.cell for record in records.cells if record.valid_for_qualification}
+    measured = _measured(records)
     executions: dict[int, list[TrialRecord]] = {}
     for record in records.trials:
         if record.trial >= len(workload.trials):
@@ -275,9 +306,17 @@ def _counted(records: Records) -> dict[int, TrialRecord]:
         executions.setdefault(record.trial, []).append(record)
     counted = {}
     for trial, kept in executions.items():
+        window = measured.get(workload.trials[trial].cell)
+        if window is None:
+            continue
         replaced = {record.replaces for record in kept}
-        last = [record for record in kept if record.execution not in replaced]
-        if len(last) == 1 and last[0].counts_as_attempt and workload.trials[trial].cell in measured:
+        inside = [
+            record for record in kept if window.started_ms <= record.started_ms and record.ended_ms <= window.ended_ms
+        ]
+        if any(record.counts_as_attempt and record.execution in replaced for record in inside):
+            raise QualityError("a completed attempt of a measured cell is not replaced")
+        last = [record for record in inside if record.execution not in replaced]
+        if len(last) == 1 and last[0].counts_as_attempt:
             counted[trial] = last[0]
     return counted
 
@@ -442,8 +481,8 @@ def _tally(sample: Iterable[tuple[_Instance, _Rows]], width: int) -> _Tally:
 
 
 def _difference(tally: _Tally) -> Fraction:
-    """The family's difference: each harness's mean, then equally over the harnesses sampled."""
-    rates = [Fraction(total, count) for total, count in zip(*tally, strict=True) if count]
+    """The family's difference: each harness's mean, then equally over its harnesses."""
+    rates = [Fraction(total, count) for total, count in zip(*tally, strict=True)]
     return sum(rates, Fraction(0)) / len(rates)
 
 
@@ -474,18 +513,23 @@ def _paired(
 
 
 def _bootstrap(instances: list[_Instance], draws: int, generator: Random) -> _Series:
-    """The observed difference of a family and its bootstrap draws. Only `random()` is used: its
-    sequence is the one Python keeps from a release to the next."""
+    """The observed difference of a family and its bootstrap draws. A draw resamples the instances
+    among those on the same harnesses, so that it has every harness of the family. Only `random()`
+    is used: its sequence is the one Python keeps from a release to the next."""
     width = 1 + max(column for instance in instances for column in instance.columns)
-    size = len(instances)
+    together: dict[tuple[int, ...], list[_Instance]] = {}
+    for instance in instances:
+        together.setdefault(instance.columns, []).append(instance)
+    strata = [together[columns] for columns in sorted(together)]
     observed = _tally(((instance, instance.rows) for instance in instances), width)
     tallies = []
     for _draw in range(draws):
         sample = []
-        for _pick in range(size):
-            instance = instances[int(generator.random() * size)]
-            rows = instance.rows
-            sample.append((instance, [rows[int(generator.random() * len(rows))] for _repeat in rows]))
+        for stratum in strata:
+            for _pick in stratum:
+                instance = stratum[int(generator.random() * len(stratum))]
+                rows = instance.rows
+                sample.append((instance, [rows[int(generator.random() * len(rows))] for _repeat in rows]))
         tallies.append(_tally(sample, width))
     exact = {tally: _difference(tally) for tally in {observed, *tallies}}
     denominator = math.lcm(*(value.denominator for value in exact.values()))
