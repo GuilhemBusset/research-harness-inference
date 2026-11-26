@@ -739,9 +739,35 @@ def test_a_class_replay_idle_through_part_of_its_admissions_cannot_qualify(
 
     assert compared(reference, FIXTURE)["recommendation"]["shapes"]["hands_on"]["host_count"] == 2
     candidate = requests_changed(FIXTURE, tmp_path / "candidate", changed)
-    assert json.loads(scorecard(candidate).summary)["capacity"]["hands_on"]["seats_shown"] == [False] * 3
+    summary = json.loads(scorecard(candidate).summary)
+    shape = summary["capacity"]["hands_on"]
+    assert shape["seats_shown"] == [False] * 3
+    sweep = [row for row in summary["capacity_sweep"] if row["class_floor"] and row["shape"] == "hands_on"]
+    assert shape["verdict"] != "pass" and all(row["verdict"] != "pass" for row in (*shape["repetitions"], *sweep))
     hands_on = compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]
     assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["capacity"] == "unknown"
+
+
+def test_a_class_replay_that_stopped_early_shows_its_rows_but_no_capacity_pass(tmp_path: Path):
+    """Each seat stopped 600 s into its admissions, every repetition still over its sample
+    minimums and its floors: the rows stay shown, the shape and its class-size rows are no pass."""
+
+    def stopped(cell: plan.PlannedCell, rows: tuple[RequestRecord, ...]) -> Sequence[RequestRecord]:
+        if Role.CLASS_FLOOR not in cell.roles or cell.identity.shape.value != "hands_on":
+            return rows
+        cutoff = min(row.sent_ms for row in rows) + 600_000
+        return tuple(row for row in rows if row.sent_ms < cutoff)
+
+    derived = scorecard(requests_changed(FIXTURE, tmp_path / "stopped", stopped))
+    summary = json.loads(derived.summary)
+    shape = summary["capacity"]["hands_on"]
+    sweep = [row for row in summary["capacity_sweep"] if row["class_floor"] and row["shape"] == "hands_on"]
+    assert shape["seats_shown"] == [False] * 3 and shape["verdict"] == "inconclusive" and len(sweep) == 3
+    for row in (*shape["repetitions"], *sweep):
+        assert row["verdict"] == "insufficient_evidence" and row["reasons"] == [report.SEATS_UNSHOWN]
+        assert row["later_turns"] >= row["later_turns_min"] and row["ttft_p95_ms"] is not None
+    # The Markdown headline shows the same verdict as the summary.
+    assert f"**hands_on** at {shape['agent_slots']} agent slots: inconclusive;" in derived.report
 
 
 def test_a_trial_run_again_after_the_next_one_ended_overlaps_nothing(tmp_path: Path):
@@ -766,6 +792,36 @@ def test_a_trial_run_again_after_the_next_one_ended_overlaps_nothing(tmp_path: P
     candidate = class_load_changed(FIXTURE, tmp_path / "candidate", retried)
     evidence = json.loads(scorecard(candidate).summary)["class_load_evidence"]["hands_on"]
     assert evidence and all((row["status"], row["gap"]) == ("met", None) for row in evidence)
+
+
+def test_a_counted_retry_needs_requests_of_its_own(reference: Path, tmp_path: Path):
+    """The interrupted run sent every request of the trial; the run graded in its place, later,
+    sent none: the interrupted run's requests do not show the load the grade was made under."""
+
+    def retry_without_send(live: Live) -> Live:
+        rows, trials, record = live
+        first, *rest = trials
+        ended = max(row.ended_ms for row in rows if row.trial == first.trial)
+        interrupted = replace(
+            first,
+            ended_ms=ended,
+            outcome=TrialOutcome.INVALID,
+            failure=None,
+            invalid=contracts.InvalidReason.INTERRUPTED,
+            grade=None,
+        )
+        execution = max(one.execution for one in trials) + 1
+        retry = replace(first, started_ms=ended + 1000, execution=execution, replaces=first.execution)
+        return rows, (interrupted, retry, *rest), record
+
+    assert compared(reference, FIXTURE)["recommendation"]["shapes"]["hands_on"]["host_count"] == 2
+    candidate = class_load_changed(FIXTURE, tmp_path / "candidate", retry_without_send)
+    gaps = {row["gap"] for row in json.loads(scorecard(candidate).summary)["class_load_evidence"]["hands_on"]}
+    assert "trial_unsent" in gaps
+    comparison = compared(reference, candidate)
+    paired = next(one for one in comparison["decisions"] if (one["load"], one["shape"]) == ("class_load", "hands_on"))
+    assert (paired["outcome"], paired["reason"]) == ("inconclusive", report.LOAD_UNSHOWN)
+    assert comparison["recommendation"]["shapes"]["hands_on"]["host_count"] is None
 
 
 @pytest.mark.parametrize(("phase", "load"), [(Phase.LIVE_LOW_LOAD, "low_load"), (Phase.LIVE_CLASS_LOAD, "class_load")])

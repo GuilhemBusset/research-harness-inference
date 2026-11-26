@@ -570,14 +570,22 @@ def limiting_row(shape: capacity.ShapeReading, objectives: Objectives) -> dict[s
     return {"floor": floor.value, "headroom": _n(headroom), "missed": not met, "repetition": repetition}
 
 
-def _repetition(cell: capacity.CellReading) -> dict[str, Any]:
+# Why a repetition that met its floors is no pass: it was not sent from the class's seats
+# (`_seats_shown`), so its rows, still shown, are no measure of the class.
+SEATS_UNSHOWN = "seats_unshown"
+
+
+def _repetition(cell: capacity.CellReading, seats_shown: bool = True) -> dict[str, Any]:
     engine = cell.engine
     failures = cell.failures
+    verdict, reasons = cell.verdict.value, [reason.value for reason in cell.reasons]
+    if cell.verdict is capacity.Verdict.PASS and not seats_shown:
+        verdict, reasons = capacity.Verdict.INSUFFICIENT_EVIDENCE.value, [*reasons, SEATS_UNSHOWN]
     return {
         "repetition": cell.identity.repetition,
         "cell": cell.identity.cell,
-        "verdict": cell.verdict.value,
-        "reasons": [reason.value for reason in cell.reasons],
+        "verdict": verdict,
+        "reasons": reasons,
         "floors": {floor.value: check.value for floor, check in cell.floors.items()},
         "observed_misses": [floor.value for floor in cell.observed_misses],
         "later_turns": cell.later_turns.count,
@@ -679,17 +687,22 @@ def _capacity(reading: Reading) -> dict[str, Any]:
     measured = {attempt.record.cell: attempt for attempt in _measured(reading.bundle)}
     shapes = {}
     for shape, one in reading.capacity.shapes.items():
+        # Whether each repetition was sent from the class's seats, each in the shape.
+        shown = [
+            _seats_shown(plan, plan.cells[cell.identity.cell], measured.get(cell.identity.cell))
+            for cell in one.repetitions
+        ]
+        # A pass needs every repetition sent from the class's seats; a known miss stands.
+        verdict = one.verdict
+        if verdict is ShapeVerdict.PASS and not (shown and all(shown)):
+            verdict = ShapeVerdict.INCONCLUSIVE
         shapes[shape.value] = {
             "agent_slots": one.agent_slots,
-            "verdict": one.verdict.value,
-            # Whether each repetition was sent from the class's seats, each in the shape.
-            "seats_shown": [
-                _seats_shown(plan, plan.cells[cell.identity.cell], measured.get(cell.identity.cell))
-                for cell in one.repetitions
-            ],
+            "verdict": verdict.value,
+            "seats_shown": shown,
             "missed_repetitions": list(one.missed_repetitions),
             "limiting_row": limiting_row(one, objectives),
-            "repetitions": [_repetition(cell) for cell in one.repetitions],
+            "repetitions": [_repetition(cell, seats) for cell, seats in zip(one.repetitions, shown, strict=True)],
             "spread": {
                 "ttft_p95_ms": [_n(one.ttft_p95_ms.low), _n(one.ttft_p95_ms.high)],
                 "speed_p50_tokens_per_s": [_n(one.speed_p50_tokens_per_s.low), _n(one.speed_p50_tokens_per_s.high)],
@@ -703,13 +716,15 @@ def _capacity(reading: Reading) -> dict[str, Any]:
 def _sweep(reading: Reading) -> list[dict[str, Any]]:
     """Every measured cell of the capacity sweep, each shape at each load it was driven at, with
     its rows and its verdict: where a shape crosses a floor. Descriptive: the recommendation is read
-    at the class size alone."""
+    at the class size alone. A row that was not sent from its seats (`_seats_shown`) is no pass."""
+    plan = reading.bundle.plan
+    measured = {attempt.record.cell: attempt for attempt in _measured(reading.bundle)}
     rows = [
         {
             "shape": cell.identity.shape.value,
             "agent_slots": cell.identity.agent_slots,
             "class_floor": cell.class_floor,
-            **_repetition(cell),
+            **_repetition(cell, _seats_shown(plan, plan.cells[cell.identity.cell], measured.get(cell.identity.cell))),
         }
         for cell in reading.capacity.cells
         if cell.record is not None and cell.identity.phase is contracts.Phase.CAPACITY_SWEEP
@@ -1039,15 +1054,29 @@ def _background_gap(
     return first_gap
 
 
-def _trials_overlap(trials: Sequence[TrialRecord], live: Sequence[RequestRecord]) -> bool:
-    """Whether two trials of a live cell ran at once: the seat runs one task at a time, so a trial
-    begins once the one before it, each run of it and every request of it, has ended. The requests
-    of one run may run side by side. Each run of a trial is its own span: a request belongs to the
-    last run of its trial that had started when it was sent (or the first run, sent before any),
-    so that a retry after another trial is no overlap with it."""
+def _runs_by_trial(trials: Sequence[TrialRecord]) -> dict[int, list[TrialRecord]]:
+    """Each trial's runs, in the order they started."""
     runs: dict[int, list[TrialRecord]] = {}
     for trial in sorted(trials, key=lambda one: (one.started_ms, one.execution)):
         runs.setdefault(trial.trial, []).append(trial)
+    return runs
+
+
+def _run_of(runs: Mapping[int, Sequence[TrialRecord]], request: RequestRecord) -> TrialRecord | None:
+    """The run a live request belongs to: the last run of its trial that had started when it was
+    sent, or the first run when it was sent before any. `None` for a request of no recorded run."""
+    if request.trial is None or request.trial not in runs:
+        return None
+    started = [run for run in runs[request.trial] if run.started_ms <= request.sent_ms]
+    return started[-1] if started else runs[request.trial][0]
+
+
+def _trials_overlap(trials: Sequence[TrialRecord], live: Sequence[RequestRecord]) -> bool:
+    """Whether two trials of a live cell ran at once: the seat runs one task at a time, so a trial
+    begins once the one before it, each run of it and every request of it, has ended. The requests
+    of one run may run side by side. Each run of a trial is its own span: a request belongs to its
+    run (`_run_of`), so that a retry after another trial is no overlap with it."""
+    runs = _runs_by_trial(trials)
     # A run by its execution; the requests of a trial with no run recorded, by their trial.
     spans: dict[tuple[str, int], tuple[int, int]] = {
         ("run", trial.execution): (trial.started_ms, trial.ended_ms) for trial in trials
@@ -1055,11 +1084,8 @@ def _trials_overlap(trials: Sequence[TrialRecord], live: Sequence[RequestRecord]
     for one in live:
         if one.trial is None:
             continue
-        if one.trial in runs:
-            started = [run for run in runs[one.trial] if run.started_ms <= one.sent_ms]
-            key = ("run", (started[-1] if started else runs[one.trial][0]).execution)
-        else:
-            key = ("trial", one.trial)
+        run = _run_of(runs, one)
+        key = ("trial", one.trial) if run is None else ("run", run.execution)
         before = spans.get(key, (one.sent_ms, one.ended_ms))
         spans[key] = (min(before[0], one.sent_ms), max(before[1], one.ended_ms))
     return any(after[0] < before[1] for before, after in pairwise(sorted(spans.values())))
@@ -1081,7 +1107,11 @@ def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt 
             return gap
     trials = [trial for trial in attempt.trials if trial.counts_as_attempt]
     live = [request for request in attempt.requests if request.traffic is Traffic.LIVE]
-    if any(trial.trial not in {request.trial for request in live} for trial in trials):
+    # The run whose grade counts must have sent requests of its own: an interrupted run's
+    # requests do not show the load its replacement was graded under.
+    runs = _runs_by_trial(attempt.trials)
+    sent = {run.execution for one in live if (run := _run_of(runs, one)) is not None}
+    if any(trial.execution not in sent for trial in trials):
         return LoadGap.TRIAL_UNSENT
     if _trials_overlap(attempt.trials, live):
         return LoadGap.TRIALS_OVERLAP
