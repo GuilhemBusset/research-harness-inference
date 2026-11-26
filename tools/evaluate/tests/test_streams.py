@@ -452,6 +452,33 @@ def test_a_count_from_before_the_answer_stopped_is_not_its_own_though_no_output_
     assert not attempt.output_counted
 
 
+def test_the_usage_chunk_that_ends_a_chat_stream_is_the_answers_own_without_a_finish_reason() -> None:
+    final_usage = event({"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 4}})
+
+    attempt = replay(CHAT, (100, opening(CHAT) + text(CHAT)), (200, final_usage + last_event(CHAT, None)))
+
+    assert (attempt.outcome, attempt.output_counted) == (RequestOutcome.COMPLETED, True)
+    assert attempt.usage is not None
+    assert attempt.usage.output_tokens == 4
+
+
+@routes
+def test_a_count_from_before_the_answers_output_is_not_its_own(route: Route) -> None:
+    early = {
+        MESSAGES: opening(MESSAGES),
+        RESPONSES: opening(RESPONSES) + last_event(RESPONSES, 1, "response.in_progress"),
+        # On Chat Completions, a chunk of usage with no choices, sent before any output.
+        CHAT: event({"choices": [], "usage": {"completion_tokens": 1}}) + opening(CHAT),
+    }[route]
+
+    attempt = replay(route, (100, early + text(route)), (200, ending(route, None)))
+
+    assert attempt.outcome is RequestOutcome.COMPLETED
+    assert attempt.usage is not None
+    assert attempt.usage.output_tokens == 1
+    assert not attempt.output_counted
+
+
 def test_a_chat_count_is_the_answers_own_once_every_choice_asked_for_has_stopped() -> None:
     def read(choices: int, *stops: bytes) -> Attempt:
         reader = Attempts().send(CHAT, 0, choices=choices)

@@ -653,6 +653,30 @@ def test_a_count_reported_before_the_output_does_not_give_back_what_was_generate
     assert fails(evidence, FailureReason.TOKEN_LIMIT)
 
 
+def test_the_usage_chunk_that_ends_a_chat_stream_settles_its_allowance_without_a_finish_reason(
+    gateway: Gateway,
+) -> None:
+    def answer(call: Call) -> None:
+        # One token of output, no choice that gives its finish_reason, then the usage and the end.
+        call.begin()
+        call.write(event({"choices": [{"index": 0, "delta": {"content": ANSWER_TEXT}}]}))
+        call.write(event({"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 1}}))
+        call.write(event("[DONE]"))
+
+    gateway.play = answer
+    with forwarding(gateway, tokens=31_990) as forwarder:
+        assert ask(forwarder, asking(CHAT), CHAT)[0] == 200
+        assert settled(forwarder)
+        [measured] = forwarder.evidence().requests
+        assert (measured.attempt.outcome, measured.attempt.output_counted) == (RequestOutcome.COMPLETED, True)
+        # The 10 tokens left were its allowance: it settles at the one it reported.
+        assert (gateway.calls[0].limit, measured.charged_tokens, forwarder.budget.generated_tokens) == (10, 1, 31_991)
+        # The next request is admitted with the 9 tokens that are left.
+        assert ask(forwarder, asking(CHAT, text="made-up next turn"), CHAT)[0] == 200
+        assert settled(forwarder)
+    assert (len(gateway.calls), gateway.calls[1].limit) == (2, 9)
+
+
 @pytest.mark.parametrize("route", list(Route))
 def test_a_token_that_only_ends_the_answer_is_not_given_back_by_the_count_that_opened_it(
     gateway: Gateway, route: Route
