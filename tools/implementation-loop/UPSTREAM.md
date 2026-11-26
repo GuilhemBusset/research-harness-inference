@@ -25,6 +25,22 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## A reproduction that cannot load the verifier's plugin runs again with it (2026-11-26)
+
+A local patch, not in upstream. The verifier loads its pytest result plugin through
+`PYTHONPATH`. #766's examiner wrote probes run by `env PYTHONPATH=tools:tools/evaluate/tests uv run
+--locked pytest ...`: pytest could not load the plugin, so the run failed on every head whatever
+the code did. A finding closes only when its reproduction passes, and the builder may not change
+an examiner's command: the findings stayed open, the builder answered that it had fixed them, and
+the issue went round until it would fail `no_progress`. The engine's version stays 1.2.22: a
+finding still open is run again at its issue's next verification.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/engine.py` | `_reproduction` runs the command as written. Only when pytest could not load the verifier's plugin in that run (the note `verify.run_check` recorded, `verify._notes`) does it run the command once more, in a fresh copy, through `extended_pythonpath`, which adds a fresh directory (`_plugin_only`) after a `PYTHONPATH=<value>` at the head of the command (after `env`, its `-u NAME` options or `export`, and other assignments), every value literal path characters. That directory holds a copy of the plugin under the name the verifier loads it by (`implement_loop/loop_pytest.py`) and the engine's own `__init__.py` (`PLUGIN_PACKAGE`), never the engine's directory. Importing that package takes the directory off `sys.path` and out of the path-importer cache; the plugin still loads through the package's `__path__` and drops the package once loaded, so a probe then imports the code under review's `implement_loop`, or none, and never the verifier's. That run decides the finding only when it left a pytest record; otherwise the first run does. A command that ran is judged as written. A quote, an escape, an expansion (`$PYTHONPATH` among them), a substitution (`<(...)`), a glob, a brace or a tilde, and a PYTHONPATH set anywhere else in the command, are left as written. The rule that a finding closes only when its reproduction passes is unchanged. The first run, like every check, still runs with whatever PYTHONPATH the verifier's environment holds (its engine's directory first) unless the command replaces it; this change leaves that as it was. |
+| `prompts/examine.md` | A reproduction or probe command that runs pytest extends `PYTHONPATH`, never replaces or unsets it; the engine extends only a plain assignment that opens the command, and only when pytest could not load the plugin. |
+| `tests/test_reproduction_pythonpath.py` | New: #766's finding, a pytest probe whose command replaces PYTHONPATH, closes once the code passes; such a run is judged on its second run, passing or failing; there a probe imports the `implement_loop` of the code under review and, when it has none, neither the verifier's nor the plugin's package, bare or with a submodule; a second run that left no pytest record proves nothing; a command that fails on its own (`import implement_loop`) is judged as written; a process substitution is left as written and still fails; the forms above, run through bash, print the extended value; any other command is left as written. |
+
 ## The tests' repositories run none of git's background maintenance (2026-11-26)
 
 A local patch, not in upstream, to the tests alone. A fetch, a commit, a merge and a received push
