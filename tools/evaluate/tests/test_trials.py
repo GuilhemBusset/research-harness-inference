@@ -456,7 +456,14 @@ def short(trial: TrialIdentity, work: trials.Work) -> Grade:
     return Grade(properties=(True,) * (trials.task_of(CLASS, trial).required_properties - 1), within_limits=True)
 
 
-@pytest.mark.parametrize("grader", [broken, short], ids=["raises", "answers-too-few-properties"])
+def no_grade(trial: TrialIdentity, work: trials.Work) -> Grade:
+    """A grader that ends without a grade."""
+    return None  # ty: ignore[invalid-explicit-return] - a broken grader double steps outside its annotation
+
+
+@pytest.mark.parametrize(
+    "grader", [broken, short, no_grade], ids=["raises", "answers-too-few-properties", "gives-no-grade"]
+)
 def test_a_broken_grader_leaves_the_attempt_invalid_and_its_cell_incomplete(
     grader: trials.Grader, tmp_path: Path
 ) -> None:
@@ -509,6 +516,29 @@ def test_cancellation_stops_all_background_work_and_releases_the_attempt(how: st
         assert ran.incomplete == (cell.cell.identity.cell,)
         assert executed.background is not None
         assert executed.background.summary.stopped_by is replay.Stop.CANCELLED
+
+
+def test_a_cancellation_during_the_first_background_request_stops_every_other_seat(tmp_path: Path) -> None:
+    clock = Clock()
+    cancel = asyncio.Event()
+    after: list[int] = []
+
+    class Cancelling(Gateway):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if cancel.is_set():
+                after.append(self.clock.now_ms())
+            cancel.set()
+            return await super().handle_async_request(request)
+
+    pool = Cancelling(clock, KEYS)
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock, pool)
+    chosen = cells(CLASS, Family.OPTIMIZATION, phase=Phase.LIVE_CLASS_LOAD)
+    ran = clock.drive(trials.run(CLASS, gateway, KEYS, Harnesses(clock, tmp_path), GRADERS, cells=chosen, cancel=cancel))
+
+    # The seats that had not sent yet send nothing, and the stream that was open is cut.
+    assert ran.cancelled
+    assert (len(pool.arrived), after) == (1, [])
+    assert sum(pool.open.values()) == 0
 
 
 def test_a_cancelled_run_sends_nothing_more_while_its_attempt_is_released(tmp_path: Path) -> None:

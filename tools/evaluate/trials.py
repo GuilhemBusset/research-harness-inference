@@ -38,7 +38,8 @@ and it returns only once the attempt's worker is disposed of.
   a turn or token limit, made a call it could not go on from, or the endpoint refused it. It
   counts as an attempt and stays in the denominator. Only an attempt that may still pass is
   graded: a crossed limit fails whatever the grade would say;
-- *invalid*: the driver or the grader broke (a grader that raises is `grader_error`), or the run
+- *invalid*: the driver or the grader broke (a grader that raises, gives no grade or answers other
+  properties than its task requires is `grader_error`), or the run
   was cancelled during it. It does not count, and its cell is incomplete until it is replaced.
 
 Every attempt is kept (`Executed`), with what the contract's record holds (outcome and reason,
@@ -369,14 +370,16 @@ class _Runner:
         """One attempt in its own background: started before it, sending until it has ended,
         drained before it is graded. When the task running it is cancelled, the background stops
         sending and cuts its streams at once, while the attempt's worker is released."""
-        finished, started, stop, halt = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
+        finished, started, stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
         background = asyncio.ensure_future(
             replay.run_cell(
                 self.plan,
                 cell.identity.cell,
                 self.gateway,
                 self.keys,
-                stops=replay.Stops(finished=finished, cancel=halt),
+                # The run's own cancellation, which the replay reads at the instant of each
+                # dispatch: once it is set, no seat sends anything more.
+                stops=replay.Stops(finished=finished, cancel=self.cancel),
                 first_request=self.request,
                 evidence=self.evidence,
                 started=started,
@@ -384,7 +387,7 @@ class _Runner:
             )
         )
         # The attempt stops at once when the run is cancelled or its background ends before it.
-        watch = asyncio.ensure_future(self._watch(background, stop, halt))
+        watch = asyncio.ensure_future(self._watch(background, stop))
         try:
             await _first(started.wait(), asyncio.shield(background))
             if not started.is_set():
@@ -393,22 +396,20 @@ class _Runner:
             try:
                 return await asyncio.shield(live)
             except asyncio.CancelledError:
-                # Nothing more is sent beside an attempt whose run was cancelled, while it unwinds.
-                halt.set()
+                # Nothing more is sent beside an attempt whose run was cancelled, while it unwinds:
+                # its background is cancelled, which cuts every stream it has open.
+                background.cancel()
                 stop.set()
                 live.cancel()
                 await _settled(asyncio.wait({live}))
                 raise
         finally:
-            halt.set()
             watch.cancel()
             background.cancel()
             await _settled(asyncio.gather(watch, background, return_exceptions=True))
 
-    async def _watch(self, background: asyncio.Future[replay.CellRun], stop: asyncio.Event, halt: asyncio.Event) -> None:
+    async def _watch(self, background: asyncio.Future[replay.CellRun], stop: asyncio.Event) -> None:
         await _first(asyncio.shield(background), self.cancel.wait())
-        if self.cancel.is_set():
-            halt.set()
         stop.set()
 
     async def _attempted(
@@ -436,18 +437,19 @@ class _Runner:
             )
             if reason is not None and evidence.invalid is None:
                 evidence = replace(evidence, invalid=reason)
-            grade = None
+            grade: Grade | None = None
             if evidence.may_pass:
                 try:
-                    grade = self.graders[_family(trial)](trial, work)
+                    graded: object = self.graders[_family(trial)](trial, work)
                 except Exception:  # noqa: BLE001 - a grader that could not grade makes the attempt invalid
-                    evidence = replace(evidence, invalid=InvalidReason.GRADER_ERROR)
+                    graded = None
+                required = task_of(self.plan, trial).required_properties
+                if isinstance(graded, Grade) and len(graded.properties) == required:
+                    grade = graded
                 else:
-                    if len(grade.properties) != task_of(self.plan, trial).required_properties:
-                        # A grade answers each required property of its task: one that does not
-                        # could not grade it, and accepts nothing.
-                        grade = None
-                        evidence = replace(evidence, invalid=InvalidReason.GRADER_ERROR)
+                    # A grade answers each required property of its task: a grader that raised,
+                    # gave no grade or answered other properties could not grade it.
+                    evidence = replace(evidence, invalid=InvalidReason.GRADER_ERROR)
             record = evidence.trial_record(
                 execution=self.execution, trial=trial.trial, student=LIVE_STUDENT, grade=grade
             )
