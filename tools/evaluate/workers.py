@@ -417,12 +417,16 @@ def host_configuration(homes: Sequence[Path]) -> tuple[Path, ...]:
     return tuple(kept)
 
 
+_ROOT = Path("/")
+
+
 def _passed(path: Path) -> Iterator[Path]:
     """Every entry met on the way to where a path leads, links followed one at a time: each is
     named by the real folder that holds it, and the last one is the resolved path. A path that
     is only reached through a folder (a link kept in it) names that folder here, which the
-    resolved path alone no longer does."""
-    at = Path(path.anchor or "/")
+    resolved path alone no longer does. Every one starts at the one root Linux has, as a
+    resolved path does: `//tmp` and `/tmp` are the same folder, and are named the same here."""
+    at = _ROOT
     rest = list(reversed(path.absolute().parts[1:]))
     links = 0
     while rest:
@@ -440,7 +444,7 @@ def _passed(path: Path) -> Iterator[Path]:
             raise Refused(f"{path} leads through too many links")
         target = Path(os.readlink(step))
         if target.is_absolute():
-            at = Path(target.anchor)
+            at = _ROOT
         rest.extend(reversed(target.parts[1:] if target.is_absolute() else target.parts))
 
 

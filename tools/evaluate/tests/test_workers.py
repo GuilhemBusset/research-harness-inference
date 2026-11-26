@@ -412,6 +412,9 @@ def test_a_link_kept_in_the_configuration_is_no_source_wherever_it_leads(
     (home / ".config" / "tool").symlink_to(settings, target_is_directory=True)
     # A link from elsewhere that leads through the configuration.
     (tmp_path / "through").symlink_to(home / ".config" / "tool", target_is_directory=True)
+    # The same link named from the doubled root, which Linux reads as the root.
+    doubled = Path(f"/{home}") / ".config" / "tool"
+    (tmp_path / "doubled").symlink_to(doubled, target_is_directory=True)
     (home / "course").mkdir()
 
     with Workers(scratch, runtime=runtime) as started:
@@ -420,6 +423,8 @@ def test_a_link_kept_in_the_configuration_is_no_source_wherever_it_leads(
             home / ".config" / "tool" / "profile",
             home / "course" / ".." / ".config" / "tool",
             tmp_path / "through",
+            doubled,
+            tmp_path / "doubled",
         )
         for folder in chosen:
             for spec in (Spec(IMAGE, folder, LIMITS), Spec(IMAGE, task, LIMITS, tools={"search": folder})):
@@ -429,6 +434,8 @@ def test_a_link_kept_in_the_configuration_is_no_source_wherever_it_leads(
         assert left_in(scratch) == []
         with pytest.raises(Refused):
             Workers(home / ".config" / "tool" / "evaluate", runtime=runtime)
+        with pytest.raises(Refused):
+            Workers(doubled / "evaluate", runtime=runtime)
         # The same folder by a path that passes no configuration is a task's folder like any other.
         started.start(Spec(IMAGE, settings, LIMITS))
 
