@@ -45,12 +45,14 @@ under the run's tokenizer. And the recommendation.
 
 **The recommendation** is made for each shape at the class size, from runs that were measured:
 the run's observed host count is a candidate only when every scheduled repetition passed capacity
-(`ShapeVerdict.PASS`), every required family/harness cell of the shape meets the absolute floor at
-class load, the paired relative check at class load passes, the class load was there (each live
-cell read at class load has every counted send as a row, a driver within its lag tolerance, a
-request of each trial, the live task alone on the first seat, and the replay of every other seat
-from before its first trial until after its last, never idle longer than its schedule pauses:
-`load_evidence`), and that host count served (requested and observed in the manifest, and the hosts each attempt the
+(`ShapeVerdict.PASS`) sent from the class's seats (each student of the class, each with the
+shape's conversations side by side: `_seats_shown`), every required family/harness cell of the
+shape meets the absolute floor at class load, the paired relative check at class load passes, the
+class load was there (each live cell read at class load has every counted send as a row, a driver
+within its lag tolerance, a request of each trial, the live task alone on the first seat, and on
+every other seat its shape's conversations side by side through each trial, never idle longer
+than its schedule pauses, a trial that ends during such a pause included: `load_evidence`), and
+that host count served (requested and observed in the manifest, and the hosts each attempt the
 shape is read on observed and accounted for). A low-load miss is shown in its own rows and decides
 nothing at class size. A run with no paired decision of its own is never recommended: one read
 alone, and the reference of a comparison, the baseline the change is measured from. The smallest
@@ -66,7 +68,8 @@ its requested ones is refused (`CONTRADICTED_SETTING`): no change can be attribu
 requested. Observed settings that differ with their lever not declared changed are refused as
 undeclared, setting by setting: a declared host count does not cover another instance type
 observed. A paired decision is withheld (inconclusive, `LOAD_UNSHOWN`) unless both runs show the
-load it is read at, the reference as much as the candidate.
+load it is read at, the reference as much as the candidate: at low load, each live task alone,
+with nothing sent beside it.
 Two runs compare only when they are one planned workload: a changed floor (`objectives`) or sample
 budget (`sampling`) is refused by name, any other change of the workload as incompatible. Each
 lever that changed must be shown to have served, in both runs: the hosts and the release by the
@@ -617,13 +620,45 @@ def _repetition(cell: capacity.CellReading) -> dict[str, Any]:
     }
 
 
+def _seats_shown(plan: planning.Plan, planned: planning.PlannedCell, attempt: Attempt | None) -> bool:
+    """Whether a replayed cell ran as the plan's seats (`replay.seat_of`): its replay from each of
+    the cell's students, no conversation shared by two, and each student's conversations side by
+    side as many at once as the slots the plan gives that seat, one in hands-on, two in
+    several-agents. A repetition one student sent all of is no measure of a class."""
+    if attempt is None:
+        return False
+    per = plan.spec.conversations[planned.identity.shape]
+    background = [one for one in attempt.requests if one.traffic is Traffic.BACKGROUND]
+    spans: dict[tuple[int, int], tuple[int, int]] = {}
+    for one in background:
+        start, end = spans.get((one.student, one.conversation), (one.eligible_ms, one.ended_ms))
+        spans[one.student, one.conversation] = (min(start, one.eligible_ms), max(end, one.ended_ms))
+    if len({conversation for _student, conversation in spans}) != len(spans):
+        return False
+    seats = range(planned.identities)
+    if {student for student, _conversation in spans} != set(seats):
+        return False
+    return all(
+        _peak(span for (student, _conversation), span in spans.items() if student == seat)
+        == sum(slot // per == seat for slot in range(planned.replay_slots))
+        for seat in seats
+    )
+
+
 def _capacity(reading: Reading) -> dict[str, Any]:
     objectives = reading.manifest.workload.objectives
+    plan = reading.bundle.plan
+    measured = {attempt.record.cell: attempt for attempt in _measured(reading.bundle)}
     shapes = {}
     for shape, one in reading.capacity.shapes.items():
         shapes[shape.value] = {
             "agent_slots": one.agent_slots,
             "verdict": one.verdict.value,
+            # Whether each repetition was sent from the class's seats, each in the shape.
+            "seats_shown": [
+                _seats_shown(plan, plan.cells[cell.identity.cell], measured.get(cell.identity.cell))
+                for cell in one.repetitions
+            ],
             "missed_repetitions": list(one.missed_repetitions),
             "limiting_row": limiting_row(one, objectives),
             "repetitions": [_repetition(cell) for cell in one.repetitions],
@@ -911,6 +946,8 @@ class LoadGap(StrEnum):
     BACKGROUND_MISSING = "background_missing"
     BACKGROUND_SHORT = "background_short"
     BACKGROUND_IDLE = "background_idle"
+    BACKGROUND_SERIAL = "background_serial"
+    NOT_ALONE = "not_alone"
 
 
 # What `capacity` finds in a live cell that keeps it from showing its load: a send that is no row,
@@ -928,33 +965,59 @@ def _longest_pause_ms(plan: planning.Plan) -> float:
     return float(protocol["replay"]["tool_delay_ms"][1]) + float(protocol["driver"]["scheduling_lag_p95_ms_max"])
 
 
-def _background_gap(background: Sequence[RequestRecord], first: int, last: int, pause: float) -> LoadGap | None:
-    """Whether a seat's replay kept up its load from the first trial's start to the last one's
-    end: a request of the seat open or due (from the time it was eligible until it ended) at the
-    first start and at the last end, and no idle stretch between them longer than its schedule
-    pauses."""
+def _merged(spans: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Spans joined where they meet or overlap."""
+    joined: list[tuple[float, float]] = []
+    for start, end in sorted(spans):
+        if joined and start <= joined[-1][1]:
+            joined[-1] = (joined[-1][0], max(joined[-1][1], end))
+        else:
+            joined.append((start, end))
+    return joined
+
+
+def _background_gap(
+    background: Sequence[RequestRecord], windows: Sequence[tuple[int, int]], pause: float, conversations: int
+) -> LoadGap | None:
+    """Whether a seat's replay kept up its shape's load through each trial: `conversations` of the
+    seat side by side at every instant of every trial's window. A conversation holds its place from
+    the time a request of it was eligible until it ended and then for as long as its schedule may
+    pause (`pause`), so a trial that ends while its seat waits on a tool, the next send not yet due,
+    still ran loaded. The first instant the load is missing names the gap: a seat that never ran
+    its conversations side by side is serial, one whose replay had not begun when a trial started
+    is short, one that stopped or paused longer than its schedule during a trial is idle."""
     if not background:
         return LoadGap.BACKGROUND_MISSING
-    spans = sorted((one.eligible_ms, one.ended_ms) for one in background)
-    if spans[0][0] > first:
-        return LoadGap.BACKGROUND_SHORT
-    reach = spans[0][1]
-    for start, end in spans[1:]:
-        if reach >= last:
-            break
-        if start > first and start - reach > pause:
-            return LoadGap.BACKGROUND_IDLE
-        reach = max(reach, end)
-    return LoadGap.BACKGROUND_SHORT if reach < last else None
+    by_conversation: dict[int, list[tuple[float, float]]] = {}
+    for one in background:
+        by_conversation.setdefault(one.conversation, []).append((one.eligible_ms, one.ended_ms + pause))
+    # One place for each conversation, however its turns overlap their pauses.
+    held = [span for spans in by_conversation.values() for span in _merged(spans)]
+
+    def depth(at: float) -> int:
+        return sum(start <= at < end for start, end in held)
+
+    peak, first_gap = 0, None
+    for begin, finish in windows:
+        cuts = sorted({begin, finish, *(edge for span in held for edge in span if begin < edge < finish)})
+        for at in cuts[:-1] if len(cuts) > 1 else cuts:
+            now = depth(at)
+            peak = max(peak, now)
+            if now < conversations and first_gap is None:
+                first_gap = LoadGap.BACKGROUND_SHORT if at == begin else LoadGap.BACKGROUND_IDLE
+    if 0 < peak < conversations:
+        return LoadGap.BACKGROUND_SERIAL
+    return first_gap
 
 
 def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt | None) -> LoadGap | None:
     """What a live cell lacks to show the load it is read at, or `None`. Every send the scheduler
     counted must be a row (`capacity`'s reconciliation), the driver must have kept to its schedule
     within the protocol's tolerance, and every trial that counts must have sent its own requests.
+    At low load the live task runs alone: nothing but its own requests, all from the first seat.
     At class load the live task runs alone on the first seat, each other seat the plan gives the
-    background sends replay and nothing else, and each kept up its load from before the first trial
-    started until after the last one ended, never idle longer than its schedule pauses."""
+    background sends replay and nothing else, and each kept its shape's conversations side by side
+    through every trial, never idle longer than its schedule pauses (`_background_gap`)."""
     if attempt is None:
         return LoadGap.NOT_MEASURED
     cell = next(one for one in reading.capacity.cells if one.identity.cell == planned.identity.cell)
@@ -965,16 +1028,21 @@ def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt 
     live = [request for request in attempt.requests if request.traffic is Traffic.LIVE]
     if any(trial.trial not in {request.trial for request in live} for trial in trials):
         return LoadGap.TRIAL_UNSENT
+    if planned.identity.phase is contracts.Phase.LIVE_LOW_LOAD:
+        alone = len(live) == len(attempt.requests) and all(one.student == 0 for one in (*attempt.trials, *live))
+        return None if alone else LoadGap.NOT_ALONE
     if planned.identity.phase is not contracts.Phase.LIVE_CLASS_LOAD or not trials:
         return None
     seats = range(1, planned.identities)
     background = [request for request in attempt.requests if request.traffic is Traffic.BACKGROUND]
     if any(one.student != 0 for one in (*attempt.trials, *live)) or any(one.student not in seats for one in background):
         return LoadGap.SEATS_UNPLANNED
-    first, last = min(trial.started_ms for trial in trials), max(trial.ended_ms for trial in trials)
-    pause = _longest_pause_ms(reading.bundle.plan)
+    plan = reading.bundle.plan
+    windows = sorted((trial.started_ms, trial.ended_ms) for trial in trials)
+    pause = _longest_pause_ms(plan)
+    conversations = plan.spec.conversations[planned.identity.shape]
     for seat in seats:
-        gap = _background_gap([one for one in background if one.student == seat], first, last, pause)
+        gap = _background_gap([one for one in background if one.student == seat], windows, pause, conversations)
         if gap is not None:
             return gap
     return None
@@ -1029,11 +1097,26 @@ def _hosts_served(reading: Reading, shape: Shape) -> bool:
     )
 
 
+def _capacity_seats(reading: Reading, shape: Shape) -> bool:
+    """Whether every class-size repetition of a shape was sent from the class's seats."""
+    shaped = reading.capacity.shapes.get(shape)
+    if shaped is None or not shaped.repetitions:
+        return False
+    plan = reading.bundle.plan
+    measured = {attempt.record.cell: attempt for attempt in _measured(reading.bundle)}
+    return all(
+        _seats_shown(plan, plan.cells[cell.identity.cell], measured.get(cell.identity.cell))
+        for cell in shaped.repetitions
+    )
+
+
 def _checks(reading: Reading, shape: Shape, relative: Outcome | str) -> dict[str, str]:
     """The checks a shape needs at class size, each met, missed or unknown."""
     shaped = reading.capacity.shapes.get(shape)
     verdict = None if shaped is None else shaped.verdict
     capacity_check = MET if verdict is ShapeVerdict.PASS else MISSED if verdict is ShapeVerdict.KNOWN_MISS else UNKNOWN
+    if capacity_check == MET and not _capacity_seats(reading, shape):
+        capacity_check = UNKNOWN
     at_class = reading.quality.get(Load.CLASS)
     cells = [] if at_class is None else [cell for cell in at_class.cells if cell.family in SHAPE_FAMILIES[shape]]
     families = {cell.family for cell in cells}
@@ -1539,7 +1622,12 @@ def _run_lines(summary: Mapping[str, Any], level: str = "##") -> list[str]:
             else f"{row['floor']} (headroom {_cell(row['headroom'])}, repetition {row['repetition']}"
             + (", missed)" if row["missed"] else ")")
         )
-        lines += [f"**{shape}** at {one['agent_slots']} agent slots: {one['verdict']}; limiting row: {limit}.", ""]
+        seats = "yes" if one["seats_shown"] and all(one["seats_shown"]) else "no"
+        heading = (
+            f"**{shape}** at {one['agent_slots']} agent slots: {one['verdict']}; limiting row: {limit};"
+            f" sent from the class's seats in every repetition: {seats}."
+        )
+        lines += [heading, ""]
         lines += _table(
             (
                 "Rep",

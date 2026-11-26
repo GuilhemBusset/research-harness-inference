@@ -671,6 +671,100 @@ def test_class_load_quality_needs_the_class_load_it_was_measured_under(
     assert gaps == {gap}
 
 
+def requests_changed(
+    source: Path, target: Path, change: Callable[[plan.PlannedCell, tuple[RequestRecord, ...]], Sequence[RequestRecord]]
+) -> Path:
+    """A copy of a bundle with the requests of each attempt changed, its sends counted again."""
+    bundle = report.load(source)
+    evidence = []
+    for attempt in bundle.attempts:
+        rows = tuple(change(bundle.plan.cells[attempt.record.cell], attempt.requests))
+        checkpoint = attempt.checkpoint
+        observations = (*rows, *attempt.trials, *attempt.samples)
+        evidence.append(
+            report.Evidence(
+                attempt.record, observations, tally(rows), checkpoint.hosts, checkpoint.requested_launch_fingerprint
+            )
+        )
+    report.write_evidence(target, bundle.manifest, evidence)
+    return target
+
+
+def test_class_capacity_is_measured_from_each_seat_of_the_class(reference: Path, tmp_path: Path):
+    def one_student(cell: plan.PlannedCell, rows: tuple[RequestRecord, ...]) -> Sequence[RequestRecord]:
+        floor = Role.CLASS_FLOOR in cell.roles and cell.identity.shape.value == "hands_on"
+        return tuple(replace(row, student=0) for row in rows) if floor else rows
+
+    candidate = requests_changed(FIXTURE, tmp_path / "candidate", one_student)
+    assert json.loads(scorecard(candidate).summary)["capacity"]["hands_on"]["seats_shown"] == [False] * 3
+    hands_on = compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]
+    assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["capacity"] == "unknown"
+
+
+def test_several_agents_class_load_needs_each_seats_conversations_side_by_side(reference: Path, tmp_path: Path):
+    passing = build(tmp_path / "passing", replace(CANDIDATE, slow_several_agents_repetition=None))
+    assert compared(reference, passing)["recommendation"]["shapes"]["several_agents"]["host_count"] == 2
+
+    def serial(live: Live) -> Live:
+        rows, trials, record = live
+        return tuple(row for row in rows if row.traffic is Traffic.LIVE or row.conversation == 0), trials, record
+
+    candidate = class_load_changed(passing, tmp_path / "serial", serial)
+    several = compared(reference, candidate)["recommendation"]["shapes"]["several_agents"]
+    assert several["host_count"] is None and several["tested"][1]["checks"]["class_load_evidence"] == "unknown"
+    gaps = {row["gap"] for row in json.loads(scorecard(candidate).summary)["class_load_evidence"]["several_agents"]}
+    assert gaps == {"background_serial"}
+
+
+@pytest.mark.parametrize(("early_ms", "host_count"), [(0, 2), (30_000, None)])
+def test_a_trial_ending_in_its_seats_scheduled_pause_ran_loaded(
+    reference: Path, tmp_path: Path, early_ms: int, host_count: int | None
+):
+    """The replay stops sending once told the trial has finished; its seat may be waiting on a
+    tool then. A replay that stopped longer before than its schedule pauses left the trial idle."""
+
+    quiet_at_the_end = []
+
+    def stopped(live: Live) -> Live:
+        rows, trials, record = live
+        ended = max(trial.ended_ms for trial in trials)
+        kept = tuple(row for row in rows if row.traffic is Traffic.LIVE or row.sent_ms <= ended - early_ms)
+        quiet_at_the_end.append(max(row.ended_ms for row in kept if row.traffic is Traffic.BACKGROUND) < ended)
+        return kept, trials, record
+
+    candidate = class_load_changed(FIXTURE, tmp_path / "candidate", stopped)
+    assert any(quiet_at_the_end)
+    assert compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]["host_count"] == host_count
+
+
+def test_a_low_load_pair_is_decided_only_when_each_live_task_ran_alone(tmp_path: Path):
+    failure = ("low_load", "optimization.t01.i01", "claude_code", 2)
+    reference = build(tmp_path / "reference", replace(REFERENCE, fails=REFERENCE.fails | {failure}))
+
+    def low_load(comparison: dict) -> dict:
+        return next(one for one in comparison["decisions"] if (one["load"], one["shape"]) == ("low_load", "hands_on"))
+
+    assert low_load(compared(reference, FIXTURE))["outcome"] == "pass"
+
+    def loaded(cell: plan.PlannedCell, rows: tuple[RequestRecord, ...]) -> Sequence[RequestRecord]:
+        if cell.identity.phase is not Phase.LIVE_LOW_LOAD:
+            return rows
+        first = max(row.request for row in rows) + 1
+        beside = (
+            replace(row, request=first + n, student=1, trial=None, traffic=Traffic.BACKGROUND)
+            for n, row in enumerate(rows)
+        )
+        return (*rows, *beside)
+
+    candidate = requests_changed(FIXTURE, tmp_path / "candidate", loaded)
+    decision = low_load(compared(reference, candidate))
+    assert (decision["outcome"], decision["reason"], decision["load_unshown"]) == (
+        "inconclusive",
+        report.LOAD_UNSHOWN,
+        ["candidate"],
+    )
+
+
 def test_an_unloaded_reference_qualifies_no_candidate(tmp_path: Path):
     reference = class_load_changed(
         build(tmp_path / "original", REFERENCE), tmp_path / "reference", without(Traffic.BACKGROUND)

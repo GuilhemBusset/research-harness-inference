@@ -1,6 +1,6 @@
 # Evaluation scorecard
 
-Summary digest: `sha256:279f092622df12c275604a43e1379c448518b4d469b1ca85be1dec6528e4b4dd`
+Summary digest: `sha256:16e74fddd9592c3d20e0ace05e2d8953b18f93f9a95567d97bb7da03f6b7ba55`
 
 Run `sha256:af56506c217fe7e4224846c66c7ea9e6a68c98c529a13a5df2c0506e49d9d298`, workload `sha256:7f62a46abda53cb7df50d9088621ae380cdbd208616fe2ccf5c18dd0fd69b2ba`, treatment `sha256:ee1b33aaf2e3f77f617a0ad0b079867172d3e63f5aadc98190352b2560f55170`.
 Suite course-v1, profile qualify, class size 2.
@@ -40,7 +40,7 @@ Class size 2. Common configuration: none. Any other class size or host count: un
 
 Host cost is an estimate at 3.36 USD a host-hour (example rate).
 
-**hands_on** at 2 agent slots: pass; limiting row: ttft_p95 (headroom 0.22, repetition 0).
+**hands_on** at 2 agent slots: pass; limiting row: ttft_p95 (headroom 0.22, repetition 0); sent from the class's seats in every repetition: yes.
 
 | Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s (by host) | Cost / M output USD (estimate) |
 |---|---|---|---|---|---|---|---|---|---|
@@ -50,7 +50,7 @@ Host cost is an estimate at 3.36 USD a host-hour (example rate).
 
 Across repetitions: p95 TTFT 3900 to 3900 ms, p10 speed 20 to 20 tok/s, failed share 0 to 0.
 
-**several_agents** at 4 agent slots: known_miss; limiting row: speed_p10 (headroom -0.5, repetition 1, missed).
+**several_agents** at 4 agent slots: known_miss; limiting row: speed_p10 (headroom -0.5, repetition 1, missed); sent from the class's seats in every repetition: yes.
 
 | Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s (by host) | Cost / M output USD (estimate) |
 |---|---|---|---|---|---|---|---|---|---|

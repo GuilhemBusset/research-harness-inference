@@ -170,6 +170,11 @@
           "waiting_requests_peak": null
         }
       ],
+      "seats_shown": [
+        true,
+        true,
+        true
+      ],
       "spread": {
         "failed_share": [
           0.0,
@@ -363,6 +368,11 @@
           "verdict": "pass",
           "waiting_requests_peak": null
         }
+      ],
+      "seats_shown": [
+        true,
+        true,
+        true
       ],
       "spread": {
         "failed_share": [
