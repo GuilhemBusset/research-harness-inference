@@ -1,0 +1,16 @@
+{
+  "id": "research.t01.i01",
+  "question": "A timber-frame wall is to be insulated with the cork panel tested in the packet's laboratory report, so that the insulation alone has a thermal resistance of 2.5 m²·K/W. The panel's conductivity is the one measured dry, at a mean temperature of 10 °C. What mass of oven-dry panel does one square metre of wall need?",
+  "thermal_resistance": {
+    "value": 2.5,
+    "unit": "m²·K/W"
+  },
+  "facts": {
+    "conductivity.cork.dry": "the thermal conductivity of the cork panel measured dry, at a mean temperature of 10 °C",
+    "density.cork": "the oven-dry density of the cork panel's specimens"
+  },
+  "result": {
+    "fact": "mass_per_area.cork.dry",
+    "description": "the mass of oven-dry cork panel per square metre of wall: thermal resistance × conductivity × density"
+  }
+}

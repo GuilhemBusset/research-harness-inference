@@ -1,0 +1,35 @@
+{
+  "instance": "research.t01.i02",
+  "facts": {
+    "conductivity.cork.humid": {
+      "figure": "0.043",
+      "unit": "W/(m·K)",
+      "source": "S1",
+      "locations": [
+        {
+          "page": 2,
+          "table": "2"
+        }
+      ]
+    },
+    "density.cork": {
+      "figure": "110",
+      "unit": "kg/m³",
+      "source": "S2",
+      "locations": [
+        {
+          "table": "1"
+        }
+      ]
+    }
+  },
+  "result": {
+    "fact": "mass_per_area.cork.humid",
+    "value": 11.825,
+    "unit": "kg/m²",
+    "rests_on": [
+      "conductivity.cork.humid",
+      "density.cork"
+    ]
+  }
+}
