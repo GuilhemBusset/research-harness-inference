@@ -25,6 +25,22 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## The second run of a reproduction loads the plugin under a module name of its own (2026-11-27)
+
+A local patch, not in upstream, that changes how "A reproduction that cannot load the verifier's
+plugin runs again with it" below exposes the plugin. Its directory held the plugin as
+`implement_loop.loop_pytest`, under a stub `implement_loop` package that took the directory off
+`sys.path` in the pytest process alone: a process a test started inherited the PYTHONPATH entry,
+and its `import implement_loop` found the stub where the code under review has none. The directory
+now holds the plugin alone, as a top-level module, so it exposes no `implement_loop` package to
+anything. The engine's version stays 1.2.22: nothing waits for this change.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/verify.py` | `run_check` takes `plugin_dir`, a directory that holds a copy of the plugin as the top-level module `PLUGIN_COPY` (`implement_loop_result_plugin`). Given one, pytest loads the plugin by that name (`-p PLUGIN_COPY`, and an inherited `-p PLUGIN`, which an outer verifier's run gives the engine's own tests, is left out), and the directory comes after the engine's on PYTHONPATH, so a pytest the command's assignment does not reach finds it too, and is bound read-only into the sandbox. Without one, nothing changes. |
+| `implement_loop/engine.py` | `_plugin_only` writes the copy alone as `PLUGIN_COPY`; the stub package (`PLUGIN_PACKAGE`) is gone. `_run_reproduction` passes the directory to `run_check` as `plugin_dir`, which binds it. |
+| `tests/test_reproduction_pythonpath.py` | New tests: a process a test of the second run starts inherits its PYTHONPATH and finds no `implement_loop`, and that run's test is recorded; the directory holds the copy alone, byte for byte the plugin; a second pytest in the command, with the verifier's PYTHONPATH, is recorded too; a run under another verifier's `-p` of the plugin loads the copy. |
+
 ## A reproduction that cannot load the verifier's plugin runs again with it (2026-11-26)
 
 A local patch, not in upstream. The verifier loads its pytest result plugin through

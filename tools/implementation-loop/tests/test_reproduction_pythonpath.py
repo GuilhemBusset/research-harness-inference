@@ -151,6 +151,55 @@ def test_a_bare_import_on_the_extended_run_finds_the_implement_loop_under_review
     assert reproduces(engine, wt, REPLACES, probe) is holds
 
 
+# A probe whose test starts a Python process of its own, with the environment it was given: that
+# process inherits the extended PYTHONPATH (the probe's `lib` and the directory that holds the
+# plugin), and finds there no `implement_loop`, since the code under review has none.
+CHILD = ("import os\nimport subprocess\nimport sys\n\n\ndef test_x():\n"
+         "    assert len(os.environ['PYTHONPATH'].split(os.pathsep)) == 2\n"
+         "    found = subprocess.run([sys.executable, '-c', 'import importlib.util; "
+         "print(importlib.util.find_spec(\"implement_loop\"))'], capture_output=True, text=True, check=True)\n"
+         "    assert found.stdout.strip() == 'None'\n")
+
+
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+def test_a_process_the_extended_run_starts_finds_no_implement_loop_and_its_tests_are_recorded(engine, wt):
+    """Codex's review of the fourth version: the directory added to PYTHONPATH held the plugin as
+    `implement_loop.loop_pytest`, under a package of that name, and only the pytest process took it
+    off `sys.path`. A process a test started inherited the entry and imported that package. The
+    directory now holds the plugin alone, as a top-level module of its own name
+    (`verify.PLUGIN_COPY`), and the run still records its tests through it."""
+    commit(wt, {"README.md": "code under review\n"})
+    ran = engine._reproduction(wt, REPLACES, ".", ("checks/probe_x.py", CHILD))
+    assert (ran.passed, ran.tests) == (True, {"passed": 1, "failed": 0, "skipped": 0}), ran.output_tail
+
+
+def test_the_directory_added_to_pythonpath_holds_the_plugin_alone_under_its_own_name(tmp_path):
+    verify = L.engine.verify
+    root = L.engine.Engine._plugin_only(tmp_path)
+    assert [p.relative_to(root).as_posix() for p in root.rglob("*")] == [f"{verify.PLUGIN_COPY}.py"]
+    assert "." not in verify.PLUGIN_COPY, "a top-level module, under no package"
+    source = verify.ENGINE_DIR.joinpath(*verify.PLUGIN.split(".")).with_suffix(".py")
+    assert (root / f"{verify.PLUGIN_COPY}.py").read_bytes() == source.read_bytes()
+
+
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+@pytest.mark.parametrize(("probe", "holds"), [(PASSES, False), (FAILS, True)])
+def test_a_pytest_of_the_extended_run_that_keeps_the_verifiers_pythonpath_loads_the_plugin_too(engine, wt, probe, holds):
+    """A second pytest in the command, which the assignment at its head does not reach, runs with
+    the verifier's PYTHONPATH: it finds the plugin there by the same name, and is recorded."""
+    command = f"{REPLACES} && {PY} -m pytest -q checks/probe_x.py"
+    assert reproduces(engine, wt, command, probe) is holds
+
+
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+def test_an_extended_run_under_another_verifiers_pytest_loads_the_copy_alone(engine, wt, monkeypatch):
+    """The engine's own tests, run as a verifier's check, inherit that verifier's `-p` of the plugin
+    by its package name, which a command that replaces PYTHONPATH cannot reach: the extended run
+    leaves it out and loads the copy."""
+    monkeypatch.setenv("PYTEST_ADDOPTS", f"-p {L.engine.verify.PLUGIN} -p no:cacheprovider")
+    assert reproduces(engine, wt, REPLACES, PASSES) is False
+
+
 def test_an_extended_run_that_left_no_pytest_record_proves_nothing(engine, wt):
     """Codex's review of the second version: its second run closed a finding on exit 0 alone. As
     written, this command runs pytest, which cannot load the plugin; extended, it runs none."""
