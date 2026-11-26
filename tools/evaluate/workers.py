@@ -14,7 +14,9 @@ workspace of its own on this host. `Workers.start` makes it from a `Spec`:
   one is refused, and so is one that holds the checkout or the home folder, or that is, holds
   or lies in a hidden entry of the home folder (`.aws`, `.ssh`, `.config`, ...): the
   configuration and the credentials of this host, also where such an entry is a link to a
-  folder kept elsewhere. A copy keeps links as links and refuses a socket or a device.
+  folder kept elsewhere, and also where the source is a link kept in such an entry: what was
+  chosen from the configuration stays outside, wherever it leads. A copy keeps links as links
+  and refuses a socket or a device.
 - *A fresh home.* The root file system is read-only. Home, the working folder, the temporary
   folder and the output folder are memory file systems of a fixed size, empty at the start, and
   the task's files are copied into the working folder. No variable of this machine is passed.
@@ -81,7 +83,7 @@ from typing import TYPE_CHECKING, Protocol, Self
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
     from types import TracebackType
 
 REPO = Path(__file__).resolve().parents[2]
@@ -124,6 +126,8 @@ _PYTHON = ("python", "-I", "-c")
 
 _MEBIBYTE = 1024 * 1024
 _TOOL_NAME = re.compile(r"[a-z0-9][a-z0-9_-]*")
+# How many links a path may lead through, as the system itself allows.
+_LINKS = 40
 
 # The first process of every worker, and the relay of this host: one program. It ends by itself
 # after `lifetime` seconds. Given `listen` and `upstream`, it accepts connections on the first and
@@ -413,23 +417,56 @@ def host_configuration(homes: Sequence[Path]) -> tuple[Path, ...]:
     return tuple(kept)
 
 
+def _passed(path: Path) -> Iterator[Path]:
+    """Every entry met on the way to where a path leads, links followed one at a time: each is
+    named by the real folder that holds it, and the last one is the resolved path. A path that
+    is only reached through a folder (a link kept in it) names that folder here, which the
+    resolved path alone no longer does."""
+    at = Path(path.anchor or "/")
+    rest = list(reversed(path.absolute().parts[1:]))
+    links = 0
+    while rest:
+        part = rest.pop()
+        if part == "..":
+            at = at.parent
+            continue
+        step = at / part
+        yield step
+        if not step.is_symlink():
+            at = step
+            continue
+        links += 1
+        if links > _LINKS:
+            raise Refused(f"{path} leads through too many links")
+        target = Path(os.readlink(step))
+        if target.is_absolute():
+            at = Path(target.anchor)
+        rest.extend(reversed(target.parts[1:] if target.is_absolute() else target.parts))
+
+
 def _in_host_configuration(path: Path, homes: Sequence[Path], kept: Sequence[Path]) -> bool:
-    """Whether a resolved path is, or lies in, the host's configuration: a hidden entry of a home
-    folder by its name, or the place one of them leads to."""
-    named = any(home in path.parents and path.relative_to(home).parts[0].startswith(".") for home in homes)
-    return named or any(_within(path, entry) for entry in kept)
+    """Whether a path is, lies in or is reached through the host's configuration: a hidden entry
+    of a home folder by its name, or the place one of them leads to. The path is taken as it was
+    given, so that a link kept in the configuration is still a choice from it."""
+
+    def configuration(step: Path) -> bool:
+        named = any(home in step.parents and step.relative_to(home).parts[0].startswith(".") for home in homes)
+        return named or any(_within(step, entry) for entry in kept)
+
+    return any(configuration(step) for step in _passed(path))
 
 
 def check_source(source: Path, sealed: Sequence[Path], outside: Sequence[Path], homes: Sequence[Path] = ()) -> Path:
     """The folder a worker's files are copied from, resolved. Refused when it is not a folder,
     when it is, holds or lies in a sealed folder, when it holds a folder that stays outside, or
-    when it is, holds or lies in the host's configuration: a hidden entry of one of `homes`, by
-    whatever path it is named and wherever a link has moved it."""
+    when it is, holds, lies in or is reached through the host's configuration: a hidden entry
+    of one of `homes`, by whatever path it is named and wherever a link has moved it, and also a
+    link kept in such an entry, wherever that link leads."""
     resolved = source.resolve()
     if not resolved.is_dir():
         raise Refused(f"{source} is not a folder")
     configuration = host_configuration(homes)
-    if _in_host_configuration(resolved, homes, configuration):
+    if _in_host_configuration(source, homes, configuration):
         raise Refused(f"{source} lies in the configuration of this host, which stays outside the workers")
     if any(_within(entry, resolved) for entry in configuration):
         raise Refused(f"{source} holds configuration of this host, which stays outside the workers")
@@ -703,7 +740,7 @@ class Workers:
         self._homes = _home()
         self._outside = (REPO, self.root, *self._homes)
         # What a worker writes is given to the next one from here, so this is a source as well.
-        if _in_host_configuration(self.root, self._homes, host_configuration(self._homes)):
+        if _in_host_configuration(root, self._homes, host_configuration(self._homes)):
             raise Refused("the scratch folder lies in the configuration of this host")
         self._runtime: Runtime = runtime if runtime is not None else Docker()
         self._workers: list[Worker] = []

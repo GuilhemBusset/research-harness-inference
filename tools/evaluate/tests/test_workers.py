@@ -401,6 +401,38 @@ def test_configuration_kept_elsewhere_through_a_link_is_no_source_either(
         started.start(Spec(IMAGE, tmp_path / "disk" / "course", LIMITS))
 
 
+def test_a_link_kept_in_the_configuration_is_no_source_wherever_it_leads(
+    runtime: Runtime, scratch: Path, task: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "operator"
+    (home / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    settings = tmp_path / "settings"
+    (settings / "profile").mkdir(parents=True)
+    (home / ".config" / "tool").symlink_to(settings, target_is_directory=True)
+    # A link from elsewhere that leads through the configuration.
+    (tmp_path / "through").symlink_to(home / ".config" / "tool", target_is_directory=True)
+    (home / "course").mkdir()
+
+    with Workers(scratch, runtime=runtime) as started:
+        chosen = (
+            home / ".config" / "tool",
+            home / ".config" / "tool" / "profile",
+            home / "course" / ".." / ".config" / "tool",
+            tmp_path / "through",
+        )
+        for folder in chosen:
+            for spec in (Spec(IMAGE, folder, LIMITS), Spec(IMAGE, task, LIMITS, tools={"search": folder})):
+                with pytest.raises(Refused):
+                    started.start(spec)
+        assert runtime.calls == []
+        assert left_in(scratch) == []
+        with pytest.raises(Refused):
+            Workers(home / ".config" / "tool" / "evaluate", runtime=runtime)
+        # The same folder by a path that passes no configuration is a task's folder like any other.
+        started.start(Spec(IMAGE, settings, LIMITS))
+
+
 def test_a_copy_follows_no_link_and_takes_no_socket(runtime: Runtime, scratch: Path, task: Path, sealed: Path) -> None:
     (task / "answer.json").symlink_to(sealed / "references" / "optimum.json")
     with Workers(scratch, sealed=[sealed], runtime=runtime) as started:
