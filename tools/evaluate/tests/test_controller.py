@@ -1,0 +1,541 @@
+"""The operator's terminal workflow (tools/evaluate/controller.py), driven through `cli.main`, the
+entry point of scripts/evaluate.sh, with fake external services: GitHub in memory (the publisher
+tests' `FakeGitHub`), the deployed pool over moto (the booking tests' `Deployed`: table, scaler,
+probes and a clock only a sleep moves), and a measurement that journals each cell as `phases`
+does and counts every request it would send to the gateway. The evidence bundle is one the report
+tests build, so the verdicts and the exit codes are the real report's. No account, no network.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import io
+import shutil
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import pytest
+
+from evaluate import booking, cli, controller, phases, publisher, report
+from evaluate import plan as planning
+from evaluate.contracts import Profile, Settings, TrialOutcome, TrialRecord
+from evaluate.journal import AttemptStatus, Journal
+from evaluate.tests.test_booking import POOL, RELEASE, Deployed, pool, stored  # noqa: F401 - `pool` is a fixture
+from evaluate.tests.test_publisher import REPO, FakeGitHub
+from evaluate.tests.test_report import CANDIDATE, build
+from rhi_admin import pools as admin_pools
+from rhi_admin import session as admin_session
+from rhi_common import sessions as rules
+from rhi_common.records import Session
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Generator, Sequence
+
+    from evaluate.plan import Plan
+
+# A deployment whose sessions may last two days, so that one booking holds the whole profile.
+SESSION_HOURS = 48
+PASSING = replace(CANDIDATE, slow_several_agents_repetition=None)
+FEW_TURNS = replace(PASSING, later_turns=20)  # too few later turns to grade capacity: inconclusive
+SERVED = "sha256:" + "5" * 64
+OPERATOR = "user/operator"
+PLAN = planning.expand(planning.load_suite(), Profile.QUALIFY, 2)
+# The window that holds every cell of the plan, its warm-up and its cleanup, in minutes.
+WHOLE = -(-(sum(PLAN.reserved_ms(cell) for cell in PLAN.cells) + PLAN.spec.estimates.cleanup_ms) // 60_000)
+
+
+class Died(BaseException):
+    """The driver's process ending where it stands: no handler of it runs."""
+
+
+@pytest.fixture(scope="module")
+def bundles(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    """The evidence a measurement leaves, built once: a pass, a measured miss, too few turns."""
+    root = tmp_path_factory.mktemp("bundles")
+    return {name: build(root / name, variant) for name, variant in (("pass", PASSING), ("miss", CANDIDATE), ("few", FEW_TURNS))}
+
+
+class GitHub(FakeGitHub):
+    """The fake GitHub, logging each record it stores in the shared order of events."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self.events = events
+        self.on_comment: Callable[[], None] | None = None
+
+    def post_issue(self, login: str, body: str) -> int:
+        self.events.append("issue")
+        return super().post_issue(login, body)
+
+    def post_comment(self, login: str, number: int, body: str) -> int:
+        self.events.append("comment")
+        if self.on_comment is not None:
+            self.on_comment()
+        return super().post_comment(login, number, body)
+
+
+class Pool(Deployed):
+    """The deployed pool, logging each write of the driver: the booking, then its stop."""
+
+    def __init__(self, table: Any, events: list[str]) -> None:
+        super().__init__(table)
+        self.events, self.markers = events, set()
+        self.hosts = 2
+        self.on_book: Callable[[], None] | None = None
+
+    def put_item(self, **request: Any) -> dict[str, Any]:
+        written = Session.from_item(request["Item"])
+        kind = "stop" if written.set_by in self.markers else "book"
+        self.markers.add(written.set_by)
+        if kind == "book" and self.on_book is not None:
+            self.on_book()
+        self.events.append(kind)
+        return super().put_item(**request)
+
+
+@dataclass
+class Script:
+    """What the fake measurement does: the cell it raises in, the cell the operator cancels in,
+    the cell whose checkpoint records a failed trial, a hook before each cell, and the bundle the
+    report is read from."""
+
+    bundle: str = "pass"
+    fail_at: int | None = None
+    cancel_at: int | None = None
+    failed_trial_at: int | None = None
+    before_cell: Callable[[int], None] | None = None
+
+
+@dataclass
+class Driver:
+    """The fake services one invocation is connected to, and what each was asked for."""
+
+    pool: Pool
+    github: GitHub
+    events: list[str]
+    bundles: dict[str, Path]
+    runs: Path
+    script: Script = field(default_factory=Script)
+    sent: list[int] = field(default_factory=list)  # each request sent to the gateway, by cell
+    asked: list[str] = field(default_factory=list)  # what the runtimes were asked for
+    scope_pool: str | None = None
+
+    @contextlib.contextmanager
+    def __call__(self, scope: controller.Scope) -> Generator[Runtime]:
+        yield Runtime(self, controller.Scope(self.scope_pool or scope.pool, scope.repository))
+
+
+class Runtime:
+    def __init__(self, driver: Driver, scope: controller.Scope) -> None:
+        self.driver, self.scope = driver, scope
+
+    def github(self) -> publisher.GitHub:
+        return publisher.GitHub(self.driver.github, self.scope.repository)
+
+    def access(self) -> booking.Access:
+        self.driver.asked.append("access")
+        deployed = self.driver.pool
+        pools = admin_pools.Pools(table=deployed, functions=deployed, scaler="scaler-under-test", caller=lambda: "user/driver")
+        sessions = admin_session.Sessions(pools=pools, time_zone="UTC", session_max_hours=SESSION_HOURS, default_pool=None)
+        return booking.Access(sessions, deployed.gateway_ready, deployed.releases, clock=deployed.clock, sleep=deployed.sleep)
+
+    def release(self) -> str:
+        return RELEASE
+
+    def requested(self) -> Settings:
+        return report.read_manifest(self.driver.bundles["pass"]).requested
+
+    def source_commit(self) -> str:
+        return "a" * 40
+
+    def preflight(self, plan: Plan) -> Sequence[str]:
+        self.driver.events.append("preflight")
+        return []
+
+    async def measure(
+        self,
+        plan: Plan,
+        admitted: phases.Admitted,
+        journal: Journal,
+        cells: Sequence[int],
+        *,
+        cancel: asyncio.Event,
+        deadline_s: float,
+    ) -> phases.Ended:
+        driver, script = self.driver, self.driver.script
+        driver.asked.append("measure")
+        assert admitted.outcome.ready
+        evidence = report.load(driver.bundles["pass"])
+        record = evidence.attempts[0].record
+        request = evidence.attempts[0].requests[0]
+        failed = next(one for attempt in evidence.attempts for one in attempt.trials if one.outcome is TrialOutcome.FAILED)
+        for cell in (0, *cells):
+            if script.before_cell is not None:
+                script.before_cell(cell)
+            again = any(one.cell == cell and one.reusable for one in journal.attempts)
+            attempt = journal.start_cell(cell, plan.workload_hash, SERVED, again=again).ordinal
+            driver.sent.append(cell)
+            driver.events.append("cell")
+            journal.append(attempt, replace(request, cell=cell))
+            if cell == script.fail_at:
+                journal.interrupt(attempt)
+                raise RuntimeError("the trial worker could not be started")
+            if cell == script.cancel_at:
+                assert cli.main(["cancel", journal.run_id, "--runs", str(driver.runs)]) == 0
+                await asyncio.wait_for(cancel.wait(), timeout=10)
+                journal.interrupt(attempt)
+                return phases.Ended.CANCELLED
+            if cell == script.failed_trial_at:
+                journal.append(attempt, failed)
+            journal.checkpoint_cell(attempt, replace(record, cell=cell))
+            await asyncio.sleep(0)
+        return phases.Ended.COMPLETED
+
+    def write_bundle(self, plan: Plan, journal: Journal, directory: Path) -> bool:
+        self.driver.events.append("report")
+        if not any(one.status is AttemptStatus.COMPLETE for one in journal.attempts):
+            return False
+        shutil.copytree(self.driver.bundles[self.driver.script.bundle], directory)
+        return True
+
+
+@pytest.fixture
+def driver(pool: Deployed, bundles: dict[str, Path], tmp_path: Path) -> Driver:  # noqa: F811 - the booking tests' fixture
+    events: list[str] = []
+    return Driver(Pool(pool.table, events), GitHub(events), events, bundles, tmp_path / "runs")
+
+
+def run(driver: Driver, *extra: str, minutes: int = WHOLE, issue: str = "new") -> int:
+    window = [] if "--session" in extra else ["--for", f"{minutes}m"]
+    argv = ["run", "--profile", "qualify", "--pool", POOL, "--students", "2", "--instances", "2", *window]
+    argv += ["--issue", issue, "--repository", REPO, "--runs", str(driver.runs), *extra]
+    return cli.main(argv, connect=driver)
+
+
+def only_run(driver: Driver) -> str:
+    (run_id,) = sorted(path.name for path in driver.runs.iterdir())
+    return run_id
+
+
+def state(driver: Driver, run_id: str) -> dict[str, Any]:
+    return controller.saved_state(driver.runs, run_id)
+
+
+def comments(driver: Driver) -> list[str]:
+    return [one["body"] for one in driver.github.comments]
+
+
+def booking_writes(driver: Driver) -> list[Session]:
+    return driver.pool.puts
+
+
+def held_by_operator(driver: Driver) -> Session:
+    """A session the operator booked by hand, written past the driver."""
+    now = driver.pool.now
+    session = rules.started(
+        None,
+        pool=POOL,
+        instances=2,
+        starts_at=now,
+        ends_at=now + (SESSION_HOURS - 1) * 3600,
+        set_by=OPERATOR,
+        now=now,
+        max_instances=2,
+        session_max_hours=SESSION_HOURS,
+    )
+    driver.pool.table.put_item(Item=session.to_item())
+    return session
+
+
+# --- The whole workflow, in order ---
+
+
+def test_a_run_goes_from_preflight_through_its_issue_booking_cells_cleanup_and_report_to_its_comment(
+    driver: Driver, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def at_booking() -> None:
+        seen["issue_at_booking"] = state(driver, only_run(driver))["issue_number"]
+
+    def at_comment() -> None:
+        seen["report_at_comment"] = (driver.runs / only_run(driver) / "bundle" / report.SUMMARY).is_file()
+
+    driver.pool.on_book, driver.github.on_comment = at_booking, at_comment
+
+    assert run(driver) == controller.Exit.PASS
+
+    cells = len(PLAN.cells)
+    assert driver.events == ["preflight", "issue", "book", *["cell"] * cells, "stop", "report", "comment"]
+    run_id = only_run(driver)
+    saved = state(driver, run_id)
+    # The issue was confirmed and journaled before the booking was written.
+    assert seen == {"issue_at_booking": saved["issue_number"], "report_at_comment": True}
+    # The exact booking: what the booking's journal saved is what the table stored, and the stop is its own.
+    booked, stop = booking_writes(driver)
+    capacity_journal = booking.Journal.load(driver.runs / run_id / "booking-0.json")
+    assert capacity_journal.booking == booked and capacity_journal.marker == booked.set_by
+    assert stop in capacity_journal.stops and capacity_journal.cleanup is booking.Cleanup.RELEASED
+    assert stored(driver.pool) == stop and stop.set_by == booked.set_by
+    # Every planned cell measured once, and checkpointed.
+    assert driver.sent == list(range(cells))
+    assert all(attempt["status"] == "complete" for attempt in saved["attempts"])
+    # One terminal comment, with the run's marker and its cleanup.
+    (body,) = comments(driver)
+    assert f"<!-- evaluate/{run_id}/" in body and "`released`" in body and f"Completed cells: {cells}/{cells}" in body
+    shown = capsys.readouterr().out
+    url = controller.issue_url(REPO, saved["issue_number"])
+    for line in (
+        f"issue: {url}",
+        "capacity: pass",
+        "quality: pass",
+        "cleanup: released",
+        "publication: delivered",
+        "exit: 0",
+    ):
+        assert any(one.startswith(line) for one in shown.splitlines()), line
+    assert "limiting hands_on:" in shown and "left" in shown and f"{cells}/{cells} cells measured" in shown
+    assert str(driver.runs / run_id / "bundle" / report.REPORT) in shown
+
+
+def test_in_a_session_the_operator_booked_nothing_is_written_to_the_pool(driver: Driver) -> None:
+    operator = held_by_operator(driver)
+
+    assert run(driver, "--session", "existing") == controller.Exit.PASS
+
+    assert driver.events[:2] == ["preflight", "issue"] and "book" not in driver.events and "stop" not in driver.events
+    assert booking_writes(driver) == [] and stored(driver.pool) == operator
+    assert "`not-owned`" in comments(driver)[0]
+
+
+def test_a_runtime_bound_to_another_pool_is_refused_before_anything_is_created(driver: Driver) -> None:
+    driver.scope_pool = "elsewhere"
+
+    assert run(driver) == controller.Exit.INCOMPLETE
+
+    assert driver.github.writes() == [] and booking_writes(driver) == [] and driver.sent == []
+    assert not driver.runs.exists() or not any(driver.runs.iterdir())
+
+
+# --- Faults ---
+
+
+def test_an_issue_github_does_not_confirm_stops_the_run_before_it_books_and_a_restart_creates_it_once(
+    driver: Driver,
+) -> None:
+    driver.github.faults.append(("POST", "unsent"))
+
+    assert run(driver) == controller.Exit.INCOMPLETE
+
+    run_id = only_run(driver)
+    assert driver.github.issues == {} and booking_writes(driver) == [] and driver.sent == []
+    assert "access" in driver.asked  # the preflight read the pool's limits, and nothing was written
+
+    assert run(driver, "--resume", run_id) == controller.Exit.PASS
+
+    assert len(driver.github.issues) == 1 and len(comments(driver)) == 1
+    assert state(driver, run_id)["issue_number"] == next(iter(driver.github.issues))
+    assert driver.sent == list(range(len(PLAN.cells)))
+
+
+@pytest.mark.parametrize("refusal", ["pool-already-booked", "capacity-unavailable"])
+def test_a_capacity_refusal_measures_nothing_releases_what_it_booked_and_says_why(driver: Driver, refusal: str) -> None:
+    operator = held_by_operator(driver) if refusal == "pool-already-booked" else None
+    if operator is None:
+        driver.pool.hosts = 1  # one of the two hosts never comes
+
+    assert run(driver) == controller.Exit.INCOMPLETE
+
+    assert driver.sent == [] and "measure" not in driver.asked
+    (body,) = comments(driver)
+    assert f"Reason: `{refusal}`" in body
+    if operator is not None:
+        # The race was lost: nothing of the operator's was touched, and nothing was ours to stop.
+        assert stored(driver.pool) == operator and "`not-owned`" in body and booking_writes(driver) == []
+        assert driver.events == ["preflight", "issue", "report", "comment"]
+    else:
+        booked, stop = booking_writes(driver)
+        assert stop.set_by == booked.set_by and stored(driver.pool) == stop and "`released`" in body
+        assert driver.events == ["preflight", "issue", "book", "stop", "report", "comment"]
+
+
+def test_a_worker_error_releases_the_booking_and_a_resume_keeps_every_measured_cell(driver: Driver) -> None:
+    driver.script = Script(fail_at=5, failed_trial_at=4)
+
+    assert run(driver) == controller.Exit.INCOMPLETE
+
+    run_id = only_run(driver)
+    assert driver.sent == [0, 1, 2, 3, 4, 5]
+    assert driver.events[-3:] == ["stop", "report", "comment"]
+    (first,) = comments(driver)
+    assert "Reason: `driver-error`" in first and "`released`" in first and "Completed cells: 5/" in first
+    before = {attempt["cell"]: attempt for attempt in state(driver, run_id)["attempts"]}
+    issue = state(driver, run_id)["issue_number"]
+
+    # The same request again, on the same issue.
+    driver.script = Script()
+    assert run(driver, "--resume", issue=str(issue)) == controller.Exit.PASS
+
+    assert len(driver.github.issues) == 1  # no second issue
+    # Only the warm-up, which every booking runs, the interrupted cell and those never started.
+    assert driver.sent[6:] == [0, *range(5, len(PLAN.cells))]
+    after = state(driver, run_id)["attempts"]
+    # The measured cells, the failed trial among them, are the attempts the first booking made.
+    for cell in (1, 2, 3, 4):
+        assert after[before[cell]["ordinal"]] == before[cell]
+    with Journal.open(driver.runs, run_id) as journal:
+        assert any(isinstance(one, TrialRecord) and one.outcome is TrialOutcome.FAILED for one in journal.observations(4))
+    # The interrupted attempt stays, with its observation, superseded by the fresh one.
+    interrupted = after[before[5]["ordinal"]]
+    assert interrupted["status"] == "interrupted" and interrupted["observed"] == 1
+    assert after[interrupted["replaced_by"]]["status"] == "complete"
+    # One comment for each booking's invocation, and each booking stopped.
+    assert len(comments(driver)) == 2 and "Completed cells: 58/58" in comments(driver)[1]
+    assert driver.events.count("stop") == 2
+
+
+def test_a_driver_stopped_between_the_booking_write_and_its_confirmation_resumes_on_that_booking(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def died() -> None:
+        raise Died
+
+    def no_cleanup(_self: booking.Capacity) -> booking.Cleanup:
+        raise Died
+
+    driver.pool.after_put = died
+    monkeypatch.setattr(booking.Capacity, "release", no_cleanup)
+    with pytest.raises(Died):
+        run(driver)
+    monkeypatch.undo()
+    run_id = only_run(driver)
+    (booked,) = booking_writes(driver)
+    assert booking.Journal.load(driver.runs / run_id / "booking-0.json").booking is None  # never confirmed
+
+    assert run(driver, "--resume", run_id) == controller.Exit.PASS
+
+    # The saved intent was found in the pool's record, waited on and used, then stopped: no second booking.
+    assert "reconciled: booking booking-0.json held" in capsys.readouterr().out
+    assert booking_writes(driver)[0] == booked and len(booking_writes(driver)) == 2
+    last = stored(driver.pool)
+    assert last is not None and last.set_by == booked.set_by and last != booked
+    assert driver.sent == list(range(len(PLAN.cells)))
+
+
+def test_a_comment_whose_answer_is_lost_is_found_by_its_marker_and_not_posted_again(driver: Driver) -> None:
+    last = len(PLAN.cells) - 1
+
+    def lose_the_next_post(cell: int) -> None:
+        if cell == last:
+            driver.github.faults.append(("POST", "lost"))
+
+    driver.script = Script(bundle="miss", before_cell=lose_the_next_post)
+
+    assert run(driver) == controller.Exit.MEASURED_MISS
+
+    (body,) = comments(driver)
+    assert driver.github.writes().count(("POST", f"/repos/{REPO}/issues/1/comments")) == 1
+    assert controller.status(driver.runs, only_run(driver), out=io.StringIO()) == 0
+    assert state(driver, only_run(driver))["intents"][-1]["status"] == "confirmed"
+    assert "Capacity by shape: hands_on pass, several_agents measured-miss" in body
+
+
+def test_a_publication_failure_leaves_the_verdict_and_publish_resume_delivers_once_without_the_pool(
+    driver: Driver, capsys: pytest.CaptureFixture[str]
+) -> None:
+    last = len(PLAN.cells) - 1
+
+    def github_goes_down(cell: int) -> None:
+        if cell == last:
+            driver.github.down = True
+
+    driver.script = Script(bundle="miss", before_cell=github_goes_down)
+
+    # The verdict's exit code, whether or not the comment was delivered.
+    assert run(driver) == controller.Exit.MEASURED_MISS
+
+    run_id = only_run(driver)
+    assert comments(driver) == [] and driver.events[-2:] == ["stop", "report"]  # capacity released first
+    assert "publication: pending (1)" in capsys.readouterr().out
+    shown = io.StringIO()
+    controller.status(driver.runs, run_id, out=shown)
+    assert '"measured-miss"' in shown.getvalue() and "waiting: 1" in shown.getvalue() and "publication: pending" in shown.getvalue()
+    sent, writes, asked = list(driver.sent), list(booking_writes(driver)), len(driver.asked)
+
+    driver.github.down = False
+    assert cli.main(["publish", "--resume", run_id, "--runs", str(driver.runs)], connect=driver) == 0
+    assert cli.main(["publish", "--resume", run_id, "--runs", str(driver.runs)], connect=driver) == 0
+
+    assert len(comments(driver)) == 1 and "measured-miss" in comments(driver)[0]
+    # Delivery alone: no booking, no inference, the pool not even read.
+    assert driver.sent == sent and booking_writes(driver) == writes and len(driver.asked) == asked
+    shown = io.StringIO()
+    controller.status(driver.runs, run_id, out=shown)
+    assert "waiting: 0" in shown.getvalue() and '"measured-miss"' in shown.getvalue()
+
+
+# --- Cancellation and the exit codes ---
+
+
+def test_a_cancel_request_stops_the_batch_and_releases_the_booking(driver: Driver) -> None:
+    driver.script = Script(cancel_at=3)
+
+    assert run(driver) == controller.Exit.INCOMPLETE
+
+    run_id = only_run(driver)
+    assert driver.sent == [0, 1, 2, 3]
+    assert [one["status"] for one in state(driver, run_id)["attempts"]][-1] == "interrupted"
+    booked, stop = booking_writes(driver)
+    assert stop.set_by == booked.set_by and stored(driver.pool) == stop
+    (body,) = comments(driver)
+    assert ": interrupted" in body and "Reason: `operator-cancelled`" in body and "`released`" in body
+
+    # A resume is a new invocation: the earlier request does not cancel it.
+    driver.script = Script()
+    assert run(driver, "--resume", run_id) == controller.Exit.PASS
+    assert driver.sent[4:] == [0, *range(3, len(PLAN.cells))]
+
+
+@pytest.mark.parametrize(
+    ("bundle", "code"),
+    [("pass", controller.Exit.PASS), ("miss", controller.Exit.MEASURED_MISS), ("few", controller.Exit.INCOMPLETE)],
+    ids=["meets the floors", "measured miss", "inconclusive evidence"],
+)
+def test_the_exit_code_is_the_verdict(driver: Driver, bundle: str, code: controller.Exit) -> None:
+    driver.script = Script(bundle=bundle)
+
+    assert run(driver) == code
+
+    assert len(comments(driver)) == 1
+    shown = io.StringIO()
+    controller.status(driver.runs, only_run(driver), out=shown)
+    assert f"exit: {int(code)}" in shown.getvalue() and "publication: delivered" in shown.getvalue()
+
+
+def test_an_incomplete_run_exits_2_and_a_window_too_short_books_nothing(driver: Driver) -> None:
+    # The window holds the first cells only: the rest wait for another booking.
+    assert run(driver, minutes=60) == controller.Exit.INCOMPLETE
+
+    assert 0 < len(driver.sent) < len(PLAN.cells)
+    (body,) = comments(driver)
+    assert "Reason: `window-exhausted`" in body and ": interrupted" in body
+
+
+def test_an_issue_backed_comparison_is_posted_once(driver: Driver, bundles: dict[str, Path]) -> None:
+    assert run(driver) == controller.Exit.PASS
+    reference = only_run(driver)
+    issue = str(state(driver, reference)["issue_number"])
+    driver.script = Script(bundle="miss")
+    assert run(driver, issue=issue) == controller.Exit.MEASURED_MISS
+    (candidate,) = {path.name for path in driver.runs.iterdir()} - {reference}
+    compare = ["compare", "--issue", issue, reference, candidate, "--runs", str(driver.runs)]
+
+    assert cli.main(compare, connect=driver) == 0
+    assert cli.main(compare, connect=driver) == 0
+
+    assert len(driver.github.issues) == 1
+    found = [one for one in comments(driver) if one.startswith("### Comparison")]
+    assert len(found) == 1 and f"candidate `{candidate}` against reference `{reference}`" in found[0]
+    assert len(comments(driver)) == 3

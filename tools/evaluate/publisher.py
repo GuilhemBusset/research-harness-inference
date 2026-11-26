@@ -33,8 +33,9 @@ sent: it is ruled out and saved again with the login before anything is sent.
 
 **Comments in the journal.** `publish_run` queues the run's terminal comment and
 `publish_comparison` the final comment of each pair the run is the candidate of, each a `DELIVER`
-intent that holds the rendered body and its marker before anything is posted. A second comment for
-the same run, or the same pair, is refused (`Refusal.ALREADY_QUEUED`). They are delivered one at a time, in the order they were
+intent that holds the rendered body and its marker before anything is posted. A run resumed in a
+later booking posts one comment for each invocation. A second comment for the same invocation of a
+run, or the same pair, is refused (`Refusal.ALREADY_QUEUED`). They are delivered one at a time, in the order they were
 queued, so a comparison ready while its run's comment is still in doubt is saved whole and posted
 after it. A delivery that GitHub does not answer keeps its intent pending: the bundle stays where it
 is, and the result counts it as waiting, apart from the run's verdicts.
@@ -716,12 +717,14 @@ class Publisher:
 
     # --- Comments ---
 
-    def publish_run(self, journal: Journal, result: RunResult) -> Outbox:
-        """Queues the run's terminal comment, then delivers what the journal holds."""
+    def publish_run(self, journal: Journal, result: RunResult, *, invocation: int = 0) -> Outbox:
+        """Queues the run's terminal comment, then delivers what the journal holds. A run resumed
+        in a later booking ends each `invocation` with a comment of its own: the first is 0, and
+        a second comment for the same invocation is refused."""
         body = render_run(result)
-        if result.run_id != journal.run_id:
+        if result.run_id != journal.run_id or type(invocation) is not int or not 0 <= invocation <= _MAX_COUNT:
             raise _reject()
-        return self._queue(journal, Kind.RUN, body, None)
+        return self._queue(journal, Kind.RUN, body, invocation or None)
 
     def publish_comparison(self, journal: Journal, comparison: Comparison) -> Outbox:
         """Queues the pair's final comment in the candidate's journal, after its run's."""
@@ -730,8 +733,9 @@ class Publisher:
             raise _reject()
         return self._queue(journal, Kind.COMPARISON, body, comparison.reference_run)
 
-    def _queue(self, journal: Journal, kind: Kind, body: str, reference: str | None) -> Outbox:
-        """Queues one comment of each run, and one of each pair it is the candidate of."""
+    def _queue(self, journal: Journal, kind: Kind, body: str, reference: str | int | None) -> Outbox:
+        """Queues one comment of each invocation of a run, and one of each pair it is the
+        candidate of."""
         for one in journal.intents:
             if one.action is Action.DELIVER and one.status is not IntentStatus.RULED_OUT:
                 payload = one.payload
