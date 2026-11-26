@@ -1,6 +1,6 @@
 # Evaluation scorecard
 
-Summary digest: `sha256:16e74fddd9592c3d20e0ace05e2d8953b18f93f9a95567d97bb7da03f6b7ba55`
+Summary digest: `sha256:0ca4b9c16389f840e772b7f4826fc062eda9e027d7006bc49664c888631ecbcb`
 
 Run `sha256:af56506c217fe7e4224846c66c7ea9e6a68c98c529a13a5df2c0506e49d9d298`, workload `sha256:7f62a46abda53cb7df50d9088621ae380cdbd208616fe2ccf5c18dd0fd69b2ba`, treatment `sha256:ee1b33aaf2e3f77f617a0ad0b079867172d3e63f5aadc98190352b2560f55170`.
 Suite course-v1, profile qualify, class size 2.
@@ -44,9 +44,9 @@ Host cost is an estimate at 3.36 USD a host-hour (example rate).
 
 | Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s (by host) | Cost / M output USD (estimate) |
 |---|---|---|---|---|---|---|---|---|---|
-| 0 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 (0: 4, 1: 4) | 233.3 |
-| 1 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 (0: 4, 1: 4) | 233.3 |
-| 2 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 0 | pass | – | 3900 (164/100) | 20 / 20 (166/100) | 0 / 166 (observed floor) | 0 (0–0.02262) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 1 | pass | – | 3900 (164/100) | 20 / 20 (166/100) | 0 / 166 (observed floor) | 0 (0–0.02262) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 2 | pass | – | 3900 (164/100) | 20 / 20 (166/100) | 0 / 166 (observed floor) | 0 (0–0.02262) | 0 | 8 (0: 4, 1: 4) | 233.3 |
 
 Across repetitions: p95 TTFT 3900 to 3900 ms, p10 speed 20 to 20 tok/s, failed share 0 to 0.
 
@@ -54,9 +54,9 @@ Across repetitions: p95 TTFT 3900 to 3900 ms, p10 speed 20 to 20 tok/s, failed s
 
 | Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s (by host) | Cost / M output USD (estimate) |
 |---|---|---|---|---|---|---|---|---|---|
-| 0 | pass | – | 1500 (104/100) | 20 / 20 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 (0: 4, 1: 4) | 233.3 |
-| 1 | measured_miss | – | 1500 (104/100) | 20 / 5 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 (0: 4, 1: 4) | 233.3 |
-| 2 | pass | – | 1500 (104/100) | 20 / 20 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 0 | pass | – | 1500 (396/100) | 20 / 20 (400/100) | 0 / 400 (observed floor) | 0 (0–0.009512) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 1 | measured_miss | – | 1500 (372/100) | 20 / 5 (376/100) | 0 / 376 (observed floor) | 0 (0–0.01011) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 2 | pass | – | 1500 (396/100) | 20 / 20 (400/100) | 0 / 400 (observed floor) | 0 (0–0.009512) | 0 | 8 (0: 4, 1: 4) | 233.3 |
 
 Across repetitions: p95 TTFT 1500 to 1500 ms, p10 speed 5 to 20 tok/s, failed share 0 to 0.
 
@@ -64,12 +64,12 @@ Across repetitions: p95 TTFT 1500 to 1500 ms, p10 speed 5 to 20 tok/s, failed sh
 
 | Shape | Agent slots | Rep | Class size | Verdict | p95 TTFT ms | p50 / p10 tok/s | Failed share |
 |---|---|---|---|---|---|---|---|
-| hands_on | 2 | 0 | yes | pass | 3900 (102) | 20 / 20 (104) | 0 |
-| hands_on | 2 | 1 | yes | pass | 3900 (102) | 20 / 20 (104) | 0 |
-| hands_on | 2 | 2 | yes | pass | 3900 (102) | 20 / 20 (104) | 0 |
-| several_agents | 4 | 0 | yes | pass | 1500 (104) | 20 / 20 (108) | 0 |
-| several_agents | 4 | 1 | yes | measured_miss | 1500 (104) | 20 / 5 (108) | 0 |
-| several_agents | 4 | 2 | yes | pass | 1500 (104) | 20 / 20 (108) | 0 |
+| hands_on | 2 | 0 | yes | pass | 3900 (164) | 20 / 20 (166) | 0 |
+| hands_on | 2 | 1 | yes | pass | 3900 (164) | 20 / 20 (166) | 0 |
+| hands_on | 2 | 2 | yes | pass | 3900 (164) | 20 / 20 (166) | 0 |
+| several_agents | 4 | 0 | yes | pass | 1500 (396) | 20 / 20 (400) | 0 |
+| several_agents | 4 | 1 | yes | measured_miss | 1500 (372) | 20 / 5 (376) | 0 |
+| several_agents | 4 | 2 | yes | pass | 1500 (396) | 20 / 20 (400) | 0 |
 
 ## Class load behind the live tasks
 
@@ -139,20 +139,20 @@ Weighted success at class_load: hands_on 0.9889, several_agents 1; combined 0.99
 
 | Shape | Measure | Replay | Live tasks |
 |---|---|---|---|
-| hands_on | input_tokens | 45500 / 66000 (n=312) | 7000 / 8000 (n=252) |
-| hands_on | output_tokens | 21 / 21 (n=312) | 61 / 61 (n=252) |
-| hands_on | cached_share | 0.4302 / 0.7692 (n=312) | 0.25 / 0.5 (n=252) |
-| hands_on | tool_delay_ms | 6000 / 8000 (n=306) | 4190 / 4190 (n=126) |
-| hands_on | turns_per_task | 52 / 52 (n=6) | 4 / 4 (n=126) |
+| hands_on | input_tokens | 61000 / 94000 (n=498) | 7000 / 8000 (n=252) |
+| hands_on | output_tokens | 21 / 21 (n=498) | 61 / 61 (n=252) |
+| hands_on | cached_share | 0.3226 / 0.6897 (n=498) | 0.25 / 0.5 (n=252) |
+| hands_on | tool_delay_ms | 6000 / 8000 (n=492) | 4190 / 4190 (n=126) |
+| hands_on | turns_per_task | 83 / 83 (n=6) | 4 / 4 (n=126) |
 | hands_on | fan_out | 1 / 1 (n=6) | 1 / 1 (n=126) |
 | hands_on | route messages | 1 | 0.2857 |
 | hands_on | route responses | 0 | 0.2857 |
 | hands_on | route chat_completions | 0 | 0.4286 |
-| several_agents | input_tokens | 33000 / 44000 (n=324) | 6000 / 8000 (n=108) |
-| several_agents | output_tokens | 21 / 21 (n=324) | 61 / 61 (n=108) |
-| several_agents | cached_share | 0.5882 / 0.8696 (n=324) | 0 / 0.5 (n=108) |
-| several_agents | tool_delay_ms | 6000 / 8000 (n=312) | 4190 / 4190 (n=36) |
-| several_agents | turns_per_task | 27 / 27 (n=12) | 6 / 6 (n=36) |
+| several_agents | input_tokens | 68500 / 108000 (n=1176) | 6000 / 8000 (n=108) |
+| several_agents | output_tokens | 21 / 21 (n=1176) | 61 / 61 (n=108) |
+| several_agents | cached_share | 0.2878 / 0.6667 (n=1176) | 0 / 0.5 (n=108) |
+| several_agents | tool_delay_ms | 6000 / 8000 (n=1164) | 4190 / 4190 (n=36) |
+| several_agents | turns_per_task | 100 / 100 (n=12) | 6 / 6 (n=36) |
 | several_agents | fan_out | 2 / 2 (n=6) | 2 / 2 (n=36) |
 | several_agents | route messages | 1 | 1 |
 | several_agents | route responses | 0 | 0 |

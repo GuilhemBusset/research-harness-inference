@@ -650,24 +650,27 @@ def _seats_shown(plan: planning.Plan, planned: planning.PlannedCell, attempt: At
 def _seats_together(
     plan: planning.Plan, attempt: Attempt, background: Sequence[RequestRecord], slots: Mapping[int, int]
 ) -> bool:
-    """Whether every seat of a replayed cell held its conversations at once through the steady
-    samples: the plan starts every slot together, so from the first send of the cell, give or take
-    as long as a schedule may pause (`_longest_pause_ms`), until the last steady send, each seat
-    holds its slots side by side (`_background_gap`). Seats that each ran in turn never were a class
-    at once, however each ran alone."""
+    """Whether every seat of a replayed cell held its conversations at once through the whole
+    admissions window the cell recorded, which must be as long as the plan's: from the cell's start,
+    once the seat's last slot was scheduled to arrive and give or take as long as a schedule may
+    pause (`_longest_pause_ms`), until admissions closed, each seat holds its slots side by side
+    (`_background_gap`). Seats that each ran in turn never were a class at once, however each ran
+    alone, and a replay that began late or stopped early left the class idle while it was read."""
     record = attempt.record
-    steady = [one.sent_ms for one in background if record.started_ms <= one.sent_ms <= record.admissions_ended_ms]
-    if not steady:
+    planned = plan.cells[record.cell]
+    if record.admissions_ended_ms - record.started_ms < planned.admissions_ms:
         return False
     pause = _longest_pause_ms(plan)
-    begin = min(one.eligible_ms for one in background) + pause
-    window = [(begin, max(steady))]
-    if begin >= window[0][1]:
-        return False
-    return all(
-        _background_gap([one for one in background if one.student == seat], window, pause, slots[seat]) is None
-        for seat in slots
-    )
+    per = plan.spec.conversations[planned.identity.shape]
+    for seat, held in slots.items():
+        arrivals = [planned.arrivals_ms[slot] for slot in range(seat * per, seat * per + held)]
+        begin = record.started_ms + max(arrivals, default=0) + pause
+        window = [(begin, float(record.admissions_ended_ms))]
+        if begin >= record.admissions_ended_ms:
+            return False
+        if _background_gap([one for one in background if one.student == seat], window, pause, held) is not None:
+            return False
+    return True
 
 
 def _capacity(reading: Reading) -> dict[str, Any]:
@@ -1039,13 +1042,26 @@ def _background_gap(
 def _trials_overlap(trials: Sequence[TrialRecord], live: Sequence[RequestRecord]) -> bool:
     """Whether two trials of a live cell ran at once: the seat runs one task at a time, so a trial
     begins once the one before it, each run of it and every request of it, has ended. The requests
-    of one trial may run side by side."""
-    spans: dict[int, tuple[int, int]] = {}
-    edges = [(trial.trial, trial.started_ms, trial.ended_ms) for trial in trials]
-    edges += [(one.trial, one.sent_ms, one.ended_ms) for one in live if one.trial is not None]
-    for trial, start, end in edges:
-        before = spans.get(trial, (start, end))
-        spans[trial] = (min(before[0], start), max(before[1], end))
+    of one run may run side by side. Each run of a trial is its own span: a request belongs to the
+    last run of its trial that had started when it was sent (or the first run, sent before any),
+    so that a retry after another trial is no overlap with it."""
+    runs: dict[int, list[TrialRecord]] = {}
+    for trial in sorted(trials, key=lambda one: (one.started_ms, one.execution)):
+        runs.setdefault(trial.trial, []).append(trial)
+    # A run by its execution; the requests of a trial with no run recorded, by their trial.
+    spans: dict[tuple[str, int], tuple[int, int]] = {
+        ("run", trial.execution): (trial.started_ms, trial.ended_ms) for trial in trials
+    }
+    for one in live:
+        if one.trial is None:
+            continue
+        if one.trial in runs:
+            started = [run for run in runs[one.trial] if run.started_ms <= one.sent_ms]
+            key = ("run", (started[-1] if started else runs[one.trial][0]).execution)
+        else:
+            key = ("trial", one.trial)
+        before = spans.get(key, (one.sent_ms, one.ended_ms))
+        spans[key] = (min(before[0], one.sent_ms), max(before[1], one.ended_ms))
     return any(after[0] < before[1] for before, after in pairwise(sorted(spans.values())))
 
 

@@ -92,7 +92,7 @@ class Variant:
     requested_launch: str | None = launch("step-8192")
     hands_on_ttft_ms: int = 3000
     slow_several_agents_repetition: int | None = 1
-    later_turns: int = 102
+    later_turns: int | None = None  # every turn admissions allow
     fails: frozenset[tuple[str, str, str, int]] = frozenset(
         {("class_load", "optimization.t01.i02", "opencode", 1)}
         | {("low_load", f"debugging.t01.i0{n}", "codex", 0) for n in (1, 2, 3)}
@@ -151,14 +151,15 @@ def tally(rows: Sequence[RequestRecord]) -> SendTally:
 
 def replay(cell: plan.PlannedCell, variant: Variant) -> list[RequestRecord]:
     """The replayed conversations of a class-size cell: each slot one conversation, turn after
-    turn, a tool pause of 5 to 8 s between them."""
+    turn, a tool pause of 5 to 8 s between them, until admissions close or, for a variant that
+    sets its later turns, until the slots have sent that many."""
     identity = cell.identity
     per_student = 1 if identity.shape.value == "hands_on" else 2
-    turns = -(-variant.later_turns // identity.agent_slots)
+    turns = None if variant.later_turns is None else -(-variant.later_turns // identity.agent_slots)
     rows: list[RequestRecord] = []
     for slot in range(identity.agent_slots):
-        eligible = START + 1000 + slot * 100
-        for turn in range(turns + 1):
+        eligible, turn = START + 1000 + slot * 100, 0
+        while (eligible <= ADMITTED) if turns is None else (turn <= turns):
             sent = eligible + 5
             hands_on = identity.shape.value == "hands_on"
             ttft = variant.hands_on_ttft_ms + 100 * (turn % 10) if hands_on and turn else 1500
@@ -182,13 +183,15 @@ def replay(cell: plan.PlannedCell, variant: Variant) -> list[RequestRecord]:
                     last_output_ms=last,
                     ended_ms=last + 10,
                     outcome=RequestOutcome.COMPLETED,
-                    finish_reason=FinishReason.TOOL_USE if turn < turns else FinishReason.STOP,
+                    finish_reason=FinishReason.TOOL_USE,
                     usage=Usage(
                         input_tokens=20_000 + 1000 * turn, cached_input_tokens=20_000 if turn else 0, output_tokens=21
                     ),
                 )
             )
-            eligible = last + 10 + 5000 + 1000 * (turn % 4)
+            eligible, turn = last + 10 + 5000 + 1000 * (turn % 4), turn + 1
+        # The conversation's last turn ends it.
+        rows[-1] = replace(rows[-1], finish_reason=FinishReason.STOP)
     return rows
 
 
@@ -466,10 +469,10 @@ def test_the_scorecard_shows_capacity_and_quality_by_shape_harness_and_load_and_
     )
     repetition = summary["capacity"]["hands_on"]["repetitions"][0]
     assert (repetition["later_turns"], repetition["later_turns_min"], repetition["failed"], repetition["attempts"]) == (
-        102,
+        164,
         100,
         0,
-        104,
+        166,
     )
     assert repetition["failed_observed_floor"] and repetition["failed_wilson_high"] > 0
     assert [host["output_tokens_per_s"] for host in repetition["engine_output_tokens_per_s_by_host"]] == [4.0, 4.0]
@@ -715,6 +718,54 @@ def test_seats_measured_one_after_another_are_no_class(reference: Path, tmp_path
     assert json.loads(scorecard(candidate).summary)["capacity"]["hands_on"]["seats_shown"] == [False] * 3
     hands_on = compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]
     assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["capacity"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        # Every seat idle for the first 270 s of admissions, its replay moved later.
+        lambda rows: tuple(shift(row, 270_000) for row in rows),
+        # Every seat idle for the last 300 s of admissions, its replay stopped early.
+        lambda rows: tuple(row for row in rows if row.sent_ms <= ADMITTED - 300_000),
+    ],
+    ids=["late", "early"],
+)
+def test_a_class_replay_idle_through_part_of_its_admissions_cannot_qualify(
+    reference: Path, tmp_path: Path, change: Callable[[tuple[RequestRecord, ...]], Sequence[RequestRecord]]
+):
+    def changed(cell: plan.PlannedCell, rows: tuple[RequestRecord, ...]) -> Sequence[RequestRecord]:
+        floor = Role.CLASS_FLOOR in cell.roles and cell.identity.shape.value == "hands_on"
+        return change(rows) if floor else rows
+
+    assert compared(reference, FIXTURE)["recommendation"]["shapes"]["hands_on"]["host_count"] == 2
+    candidate = requests_changed(FIXTURE, tmp_path / "candidate", changed)
+    assert json.loads(scorecard(candidate).summary)["capacity"]["hands_on"]["seats_shown"] == [False] * 3
+    hands_on = compared(reference, candidate)["recommendation"]["shapes"]["hands_on"]
+    assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["capacity"] == "unknown"
+
+
+def test_a_trial_run_again_after_the_next_one_ended_overlaps_nothing(tmp_path: Path):
+    """The first run of a trial interrupted, and the trial run again, with a request of its own,
+    once the next trial ended: each run is its own span on the seat."""
+
+    def retried(live: Live) -> Live:
+        rows, trials, record = live
+        first, second, *rest = trials
+        interrupted = replace(
+            first, outcome=TrialOutcome.INVALID, failure=None, invalid=contracts.InvalidReason.INTERRUPTED, grade=None
+        )
+        start = second.ended_ms + 300
+        execution = max(one.execution for one in trials) + 1
+        retry = replace(first, execution=execution, replaces=first.execution, started_ms=start, ended_ms=start + 400)
+        sent = next(row for row in rows if row.trial == first.trial)
+        times = dict(eligible_ms=start + 50, sent_ms=start + 50, first_output_ms=start + 100)
+        times |= dict(first_answer_ms=start + 100, last_output_ms=start + 340, ended_ms=start + 350)
+        again = replace(sent, request=max(row.request for row in rows) + 1, **times)
+        return (*rows, again), (interrupted, second, *rest, retry), record
+
+    candidate = class_load_changed(FIXTURE, tmp_path / "candidate", retried)
+    evidence = json.loads(scorecard(candidate).summary)["class_load_evidence"]["hands_on"]
+    assert evidence and all((row["status"], row["gap"]) == ("met", None) for row in evidence)
 
 
 @pytest.mark.parametrize(("phase", "load"), [(Phase.LIVE_LOW_LOAD, "low_load"), (Phase.LIVE_CLASS_LOAD, "class_load")])
