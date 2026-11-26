@@ -192,6 +192,9 @@ instances = [
 ]
 
 # Grounded research: the facts, their units, the source IDs, and the cited page or table.
+# Its instances, its source packet, its search tool and its grader are tools/evaluate/course/research/,
+# whose `fixture_digest` and `grader_digest` compute the digests below;
+# tools/evaluate/tests/test_research.py holds the two together.
 [[tasks]]
 id = "research.t01"
 core = true
@@ -200,9 +203,9 @@ background = "several_agents"
 features = ["local_search", "pdf_reading"]
 harnesses = ["claude_code"]
 instances = [
-    { id = "research.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "research.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
-    { id = "research.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "research.t01.i01", fixture_digest = "sha256:d2fc78f5105e68446857f94f8c7bd65349a502d4c58423090fe3335efe2c2959", grader_digest = "sha256:c022c76cb31761bde7524dc66955f7a431e564b0aa1ef14bd94995869175ffcc" },
+    { id = "research.t01.i02", fixture_digest = "sha256:f6819ae6bbe4807c16cea7329849e4f68ac89ea903a16833fcd2f825b149d9a3", grader_digest = "sha256:17bf29dcd7b14a76a0fcbb6bc42be019b985dc5f05e0f56ec4995ff2fe738eba" },
+    { id = "research.t01.i03", fixture_digest = "sha256:77f06619114d3aa0c11db6d4049b13d86af34ad5d71df44bf193f5f4bd64fc6e", grader_digest = "sha256:44275db6d77a97eccfda0fa931aa7bfdc0f52edd8e2026843558eb86ed9758f5" },
 ]
 
 # Not part of the workload: what a booking is sized with. The design fixes none of these. With

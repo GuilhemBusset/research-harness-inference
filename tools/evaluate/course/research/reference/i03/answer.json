@@ -1,0 +1,37 @@
+{
+  "evidence": [
+    {
+      "fact": "conductivity.wood_fibre.dry",
+      "value": 0.038,
+      "unit": "W/(m·K)",
+      "source": "S1",
+      "page": 2,
+      "table": "1"
+    },
+    {
+      "fact": "density.wood_fibre",
+      "value": 160,
+      "unit": "kg/m³",
+      "source": "S2",
+      "table": "1"
+    }
+  ],
+  "conclusion": {
+    "fact": "mass_per_area.wood_fibre.dry",
+    "value": 18.24,
+    "unit": "kg/m²",
+    "citations": [
+      {
+        "fact": "conductivity.wood_fibre.dry",
+        "source": "S1",
+        "page": 2,
+        "table": "1"
+      },
+      {
+        "fact": "density.wood_fibre",
+        "source": "S2",
+        "table": "1"
+      }
+    ]
+  }
+}

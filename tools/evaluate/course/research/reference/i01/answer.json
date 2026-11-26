@@ -1,0 +1,37 @@
+{
+  "evidence": [
+    {
+      "fact": "conductivity.cork.dry",
+      "value": 0.04,
+      "unit": "W/(m·K)",
+      "source": "S1",
+      "page": 2,
+      "table": "1"
+    },
+    {
+      "fact": "density.cork",
+      "value": 110,
+      "unit": "kg/m³",
+      "source": "S2",
+      "table": "1"
+    }
+  ],
+  "conclusion": {
+    "fact": "mass_per_area.cork.dry",
+    "value": 11.0,
+    "unit": "kg/m²",
+    "citations": [
+      {
+        "fact": "conductivity.cork.dry",
+        "source": "S1",
+        "page": 2,
+        "table": "1"
+      },
+      {
+        "fact": "density.cork",
+        "source": "S2",
+        "table": "1"
+      }
+    ]
+  }
+}
