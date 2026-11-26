@@ -38,4 +38,9 @@ their seat's canary student, independently of the other seats, for the cell's ad
 bounded drain, with a record of every request and of what the driver planned and observed. It
 sends the traces of `evaluate.traces` and reads their streams with `evaluate.streams`, so it needs
 the same paths.
+
+`evaluate.journal` is the driver's private journal of one run, under the ignored `.cache/eval/`:
+the run's ID, its issue number, what it was about to book or deliver, and each attempt of a cell
+with its observations, held by one owner at a time. A restart reads from it what to reconcile and
+which whole cells are left to run. It needs the standard library only.
 """
