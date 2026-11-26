@@ -633,6 +633,9 @@ class _Invocation:
         # Whether this invocation booked, reconciled or measured anything: a run it found finished
         # posts no second comment.
         self.acted = False
+        # Whether a booking journal of the run could not be read: the run's cleanup then stays
+        # unconfirmed, whatever became of its other bookings.
+        self.unread = False
         self.refused = False
         self._access: booking.Access | None = None
         self._shown = -1
@@ -902,12 +905,13 @@ class _Invocation:
         left damaged or unreadable): nothing then confirms what became of that booking."""
         try:
             return booking.Journal.load(self._booking_file(intent))
-        except (OSError, ValueError, KeyError, TypeError):
+        except Exception:  # noqa: BLE001 - whatever a damaged record raises, nothing confirms the booking
             return None
 
     def _unreadable(self, intent: journals.Intent) -> None:
-        """A booking whose journal cannot be read: its cleanup is unconfirmed, and its own end bounds it."""
-        self.acted, self.cleanup = True, booking.Cleanup.UNCONFIRMED
+        """A booking whose journal cannot be read: its cleanup is unconfirmed, and its own end
+        bounds it. Nothing was done to it, so a retry that finds it the same comments nothing new."""
+        self.unread, self.cleanup = True, booking.Cleanup.UNCONFIRMED
         self.say(f"cleanup: booking {intent.payload['file']} unreadable, {self.cleanup.value}")
         self.status(cleanup=self.cleanup.value)
 
@@ -975,7 +979,7 @@ class _Invocation:
                     found = booking.Cleanup.UNCONFIRMED
                 self.acted, self.cleanup = True, found
                 self.say(f"cleanup: booking {intent.payload['file']} {found.value}")
-                self.status(cleanup=found.value)
+                self.status(cleanup=self._run_cleanup().value)
             if intent.status is IntentStatus.PENDING and (saved.mode is None or saved.cleanup in _SETTLED):
                 journal.confirm(intent.ordinal, {"cleanup": saved.cleanup or booking.Cleanup.NOT_OWNED})
 
@@ -1271,8 +1275,10 @@ class _Invocation:
 
     def _run_cleanup(self) -> booking.Cleanup:
         """What the comment and the status say of the cleanup: this invocation's, or, when it
-        booked and reconciled nothing, what became of the run's last booking: unconfirmed when
-        its journal cannot be read."""
+        booked and reconciled nothing, what became of the run's last booking; unconfirmed while
+        any booking journal of the run cannot be read."""
+        if self.unread:
+            return booking.Cleanup.UNCONFIRMED
         if self.acted or self.journal is None:
             return self.cleanup
         books = [one for one in self.journal.intents if one.action is Action.BOOK and one.status is not IntentStatus.RULED_OUT]
