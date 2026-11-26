@@ -189,12 +189,11 @@ def with_an_idle_setup(instance_id: str) -> dict[str, Any]:
 @pytest.mark.parametrize("instance_id", INSTANCE_IDS)
 def test_a_feasible_plan_with_a_wrong_optimum_is_rejected_on_the_objective(tmp_path: Path, instance_id: str) -> None:
     costlier = with_an_idle_setup(instance_id)
-    # The cheapest plan, said to cost what it does not: its table holds the cost of its weeks.
+    # The cheapest plan, said to cost what it does not, and its table agreeing with what it says.
     misstated = reference_plan(instance_id) | {"cost": optimization.reference_optimum(instance_id) - 1}
-    true_table = (optimization.reference_artifacts(instance_id) / "plan.tex").read_text(encoding="utf-8")
 
     assert failed(optimization.grade(instance_id, produced(tmp_path / "costlier", costlier))) == {Property.OBJECTIVE}
-    report = optimization.grade(instance_id, produced(tmp_path / "misstated", misstated, true_table))
+    report = optimization.grade(instance_id, produced(tmp_path / "misstated", misstated))
     assert failed(report) == {Property.OBJECTIVE}
 
 
@@ -342,16 +341,18 @@ def test_a_number_of_the_table_may_differ_by_the_table_tolerance_and_no_more(tmp
     assert failed(grader.grade(TWIN, TWIN_OPTIMUM, produced(tmp_path / "beyond", plan, beyond))) == {Property.TABLE}
 
 
-def test_the_table_may_hold_the_cost_the_plan_states_or_the_cost_of_its_weeks(tmp_path: Path) -> None:
+def test_the_table_shows_the_cost_the_plan_states_within_the_table_tolerance(tmp_path: Path) -> None:
     # A solver's cost: within the cost tolerance of what the weeks add up to, beyond the table's.
     plan = reference_plan(EXEMPLAR)
-    plan["cost"] += 0.008
+    plan["cost"] += 0.010
+    weeks_cost = plan["cost"] - 0.010
 
-    as_stated = optimization.grade(EXEMPLAR, produced(tmp_path / "stated", plan, table(plan, plan["cost"])))
-    rounded = optimization.grade(EXEMPLAR, produced(tmp_path / "rounded", plan, table(plan, round(plan["cost"]))))
+    as_stated = optimization.grade(EXEMPLAR, produced(tmp_path / "stated", plan, table(plan, plan["cost"] - 0.004)))
+    # Within the tolerance of what the weeks add up to, and not of what plan.json states.
+    off = optimization.grade(EXEMPLAR, produced(tmp_path / "off", plan, table(plan, f"{weeks_cost - 0.004:.3f}")))
 
     assert as_stated.accepted, as_stated.faults
-    assert rounded.accepted, rounded.faults
+    assert failed(off) == {Property.TABLE}
 
 
 def test_a_table_in_another_notation_is_accepted(tmp_path: Path) -> None:
@@ -359,8 +360,10 @@ def test_a_table_in_another_notation_is_accepted(tmp_path: Path) -> None:
     made = plan["production"]
     # Each way a row ends, the third with a comment against it.
     ends = [r"\\", r"\tabularnewline", r"\\% week 3", r"\\[2pt]", r"\\*", r"\\"]
+    # The first week's number braced, after a rule that takes no argument.
+    weeks = [f"\\hline {{{t + 1}}}" if t == 0 else str(t + 1) for t in range(6)]
     rows = [
-        f"{t + 1} & {made['saddle'][t]} & $ {made['frame'][t]} $ & {made['wheel'][t]}.0 {ends[t]}" for t in range(6)
+        f"{weeks[t]} & {made['saddle'][t]} & $ {made['frame'][t]} $ & {made['wheel'][t]}.0 {ends[t]}" for t in range(6)
     ]
     # Other columns, rules, type and separators than the reference writes, and a heading above.
     latex = "\n".join(

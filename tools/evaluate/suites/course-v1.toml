@@ -180,9 +180,9 @@ background = "hands_on"
 features = []
 harnesses = ["claude_code", "codex", "opencode", "pi", "sdk_tool_loop"]
 instances = [
-    { id = "optimization.t01.i01", fixture_digest = "sha256:91374db9c172313f05b9a364645a9e4d2d2d76e429b2a3c07d3731aa705e4d3c", grader_digest = "sha256:f1962d8531adbbb5aea68f4c6e3b267e99a65f79f10781529a280a59d17bfe3c" },
-    { id = "optimization.t01.i02", fixture_digest = "sha256:e9aec4d13545dd6961ab3d3dc1eae6a4eeee7853a6e2445bf24471c49775d93d", grader_digest = "sha256:0a4b14697df7582b11024310058fbbc8c8cd9d8a5a676c3ffbba099e1768631e" },
-    { id = "optimization.t01.i03", fixture_digest = "sha256:bdfcf1fe7b70b6d6ac4492a249f463e1d15e93924d64fcf319b1cef81530a721", grader_digest = "sha256:a3f534c721374d1db34c10a49e7af3bcb7b3ec621b8cd171e057b334939fbb8a" },
+    { id = "optimization.t01.i01", fixture_digest = "sha256:91374db9c172313f05b9a364645a9e4d2d2d76e429b2a3c07d3731aa705e4d3c", grader_digest = "sha256:9bb3acedecd2d968c6091c5305c21c4c465590dc45545ac4976491444d420c38" },
+    { id = "optimization.t01.i02", fixture_digest = "sha256:e9aec4d13545dd6961ab3d3dc1eae6a4eeee7853a6e2445bf24471c49775d93d", grader_digest = "sha256:f677621ee4c05a7e9d837adb028694280c745bbbee17c8f6465409606371a495" },
+    { id = "optimization.t01.i03", fixture_digest = "sha256:bdfcf1fe7b70b6d6ac4492a249f463e1d15e93924d64fcf319b1cef81530a721", grader_digest = "sha256:59cf5aefdefe5540546ccb3816b7ac20bd1b92eb95bec8be1ac08c65cd259860" },
 ]
 
 # Grounded research: the facts, their units, the source IDs, and the cited page or table.

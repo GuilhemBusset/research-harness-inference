@@ -10,7 +10,7 @@ answers the five properties of `PROPERTIES`, in that order, each on its own:
 - *objective*: the cost the plan states is what its weeks add up to, and that is the reference
   optimum of the instance;
 - *table*: the table holds, for every week, the units of each product the plan makes, in its
-  last row the cost of the plan, and no other number.
+  last row the cost the plan states, and no other number.
 
 It runs nothing a run submitted, imports no model and no solver, and compares a plan with the
 instance and with the optimum, never with the reference plan: any optimal plan is accepted, and so
@@ -264,11 +264,21 @@ _THOUSANDS = re.compile(r"(?<=\d)(?:\\,|\{,\}|,)(?=\d{3}(?!\d))")
 # So is a minus sign before it, however it is written: -12, $-$12, \textminus 12.
 _MINUS = re.compile(r"−|\\textminus(?:\{\})?")
 _SIGNED = re.compile(r"(-(?:[\s${}]|\\[()])*)?(?<![\w.])(\d+(?:\.\d+)?)(?![\w.])")
-# A rule, a space or a colour, with what it is given (\cline{2-4}), is no cell's content.
-_RULE = re.compile(
-    r"\\(?:hline|toprule|midrule|bottomrule|cline|cmidrule|addlinespace|specialrule|rule|vspace|hspace|noalign"
-    r"|rowcolor|cellcolor)\*?(?:\s*(?:\[[^\]]*\]|\([^)]*\)|" + _GROUP + r"))*"
-)
+# A rule, a space or a colour, with what it is given (\cline{2-4}), is no cell's content. Each
+# command takes the arguments it is defined with and no more: the {1} after \hline is a cell's.
+_OPTIONAL = r"(?:\s*\[[^\]]*\])?"
+_ARGUMENT = r"\s*" + _GROUP
+_RULE_ARGUMENTS = {
+    r"hline": "",
+    r"toprule|midrule|bottomrule|addlinespace": _OPTIONAL,
+    r"cline|hhline|noalign": _ARGUMENT,
+    r"cmidrule": _OPTIONAL + r"(?:\s*\([^)]*\))?" + _ARGUMENT,
+    r"specialrule": _ARGUMENT * 3,
+    r"rule": _OPTIONAL + _ARGUMENT * 2,
+    r"vspace\*?|hspace\*?": _ARGUMENT,
+    r"rowcolor|cellcolor": _OPTIONAL + _ARGUMENT,
+}
+_RULE = re.compile("|".join(rf"\\(?:{names})(?![A-Za-z]){arguments}" for names, arguments in _RULE_ARGUMENTS.items()))
 _ROW_END = re.compile(r"(?:\\\\\*?|\\(?:tabularnewline|cr)(?![A-Za-z]))(?:\s*\[[^\]]*\])?")
 _CELL_END = re.compile(r"(?<!\\)&")
 _MULTICOLUMN = re.compile(r"\\multicolumn\s*\{\s*(\d+)\s*\}\s*" + _GROUP)
@@ -379,8 +389,7 @@ def _table_faults(table: _Table, plan: Plan, instance: Instance) -> list[str]:
                 faults.append(
                     f"week {week}: the table says {units} of {p}, and the plan {plan.production[p][week - 1]:g}"
                 )
-    # The cost of a plan is the one it states or the one its weeks add up to: the objective holds
-    # the two to each other, and a table may hold either.
-    if table.total is not None and not any(_agree(table.total, cost) for cost in (plan.cost, cost_of(plan, instance))):
+    # The table shows the cost `plan.json` states: the objective holds that one to the weeks.
+    if table.total is not None and not _agree(table.total, plan.cost):
         faults.append(f"the last row of the table says the plan costs {table.total}, and the plan {plan.cost:g}")
     return faults
