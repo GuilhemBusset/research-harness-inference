@@ -84,6 +84,16 @@ row keeps the stage it was abandoned in. The boot is over when the agent starts,
 it. A row that cannot be written changes nothing else: the launch goes on. The time a write takes
 is its stage's.
 
+**What the engine was started with.** The release parameter says what a pool should run, and it
+can change while an engine runs. What an engine does run with is on the host alone: the arguments
+of its container, as docker holds them (`Host.engine_container`). `started_engine` gives the
+container that runs, by its ID, with the public fingerprint of those arguments
+(`rhi_common.launch_settings`), which is `UNAVAILABLE` when they are not ones the contract knows.
+`settings_fingerprint` is that fingerprint alone, and `UNAVAILABLE` too when the host gives no
+container. Neither reads a release: the parameter and the record on disk cannot change what they
+say of a running engine. Neither says that the engine serves: a container runs while its engine
+still loads (`rhi_lifecycle.serving` says when a fingerprint is reported).
+
 Every action on the host goes through `rhi_lifecycle.host`. Nothing here repeats what AWS, docker
 or the engine answered.
 """
@@ -104,6 +114,7 @@ from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
+from rhi_common import launch_settings
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import release, stages
 from rhi_lifecycle.host import Host, HostError
@@ -274,6 +285,35 @@ def identity(served: release.Release) -> tuple[str, str]:
     # The digest is what follows the repository in the image's reference.
     digest = served.engine_image.rpartition("@")[2]
     return digest, NO_MODEL if served.model_revision is None else served.model_revision
+
+
+@dataclass(frozen=True)
+class Started:
+    """An engine's container that runs: the ID docker gave it, which is that start's alone, and
+    the fingerprint of the settings it was started with, `launch_settings.UNAVAILABLE` when its
+    flags are not ones the contract knows."""
+
+    container: str
+    fingerprint: str
+
+
+def started_engine(host: Host, timeout: float | None = None) -> Started | None:
+    """The engine's container that runs on `host` now, or None: the host cannot be asked or has
+    not answered within `timeout` seconds, no engine's container runs there, or its unit recorded
+    no flags."""
+    try:
+        container = host.engine_container(timeout)
+    except HostError:
+        return None
+    return None if container is None else Started(container.id, launch_settings.fingerprint(container.arguments))
+
+
+def settings_fingerprint(host: Host, timeout: float | None = None) -> str:
+    """The fingerprint of the settings the engine that runs on `host` was started with, or
+    `launch_settings.UNAVAILABLE`: the host gives no container of the engine, or flags that are
+    not ones the contract knows."""
+    started = started_engine(host, timeout)
+    return launch_settings.UNAVAILABLE if started is None else started.fingerprint
 
 
 @dataclass(frozen=True)

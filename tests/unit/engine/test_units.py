@@ -23,6 +23,7 @@ from typing import NamedTuple
 import pytest
 import yaml
 
+from rhi_lifecycle import host as agent_host
 from rhi_lifecycle import metrics, release
 from rhi_mock_engine import app
 
@@ -60,7 +61,7 @@ RELEASE_IMAGE = "$RHI_ENGINE_IMAGE"
 # The options of `docker run` that take a value, and those that take none. Any other fails a test.
 VALUED = {
     "--name", "--network", "--pid", "--user", "--env", "--env-file", "--volume", "--workdir", "--entrypoint",
-    "--runtime", "--gpus",
+    "--runtime", "--gpus", "--label",
 }  # fmt: skip
 FLAGS = {"--rm", "--interactive", "--privileged"}
 # Where the engine's start command places the options of a drop-in, and where it reads its flags.
@@ -409,10 +410,39 @@ def test_the_engine_is_given_the_releases_flags_after_the_images_command(host: H
     assert not (host.state / "run.json").exists()
 
 
+def test_the_agent_reads_back_the_flags_of_the_container_the_unit_started(host: Host, tmp_path: Path) -> None:
+    # A pool's flags hold a value of the deployment, the model bucket's name, and may hold a name
+    # that starts with a hyphen.
+    flags = [
+        f"s3://rhi-models-123456789012-{REGION}/coursework/{'c' * 40}/",
+        "--served-model-name=-coursework",
+        "--max-num-batched-tokens",
+        "4096",
+    ]
+    host.flags.write_text("".join(flag + "\n" for flag in flags), encoding="utf-8")
+    # A drop-in that names the label does not set it: the unit's own comes last.
+    started = host.started({"RHI_ENGINE_OPTIONS": f"--label {agent_host.FLAGS_LABEL}=1"})
+    assert started.options["--label"][-1] == f"{agent_host.FLAGS_LABEL}={len(flags)}"
+
+    # Docker's record of that container: its ID, that it runs, each label with the last value it
+    # was given, and its arguments, which are what follows the image. The agent's host module asks
+    # docker for the four.
+    labels = dict(label.split("=", 1) for label in started.options["--label"])
+    docker = tmp_path / "nsenter"
+    docker.write_text('#!/bin/sh\ncat "$0.answer"\n', encoding="utf-8")
+    docker.chmod(0o755)
+    record = ["d" * 64, True, labels, started.command]
+    (tmp_path / "nsenter.answer").write_text(json.dumps(record), encoding="utf-8")
+    running = agent_host.Host(object(), nsenter=str(docker)).engine_container()
+    assert running is not None
+    assert running.arguments == tuple(flags)
+
+
 def test_the_engine_starts_as_before_without_a_drop_in_and_with_the_options_of_one(host: Host) -> None:
     alone = host.started()
-    # The options the unit names, and the image's command.
-    assert alone.options == container(TEXTS["rhi-engine"]).options
+    # The options the unit names, and the image's command. The label's value is made at the start:
+    # the number of the release's flags, here none.
+    assert alone.options == {**container(TEXTS["rhi-engine"]).options, "--label": [f"{agent_host.FLAGS_LABEL}=0"]}
     assert (alone.image, alone.command[2:]) == (IMAGE, ["rhi-engine", "engine", "serve"])
 
     # A drop-in sets one variable. The start shell reads its words: quotes group, and a variable
