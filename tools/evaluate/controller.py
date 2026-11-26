@@ -897,6 +897,20 @@ class _Invocation:
         assert self.journal is not None
         return self.journal.directory / str(intent.payload["file"])
 
+    def _load_booking(self, intent: journals.Intent) -> booking.Journal | None:
+        """The booking journal `intent` names, or `None` when it cannot be read (a file the driver
+        left damaged or unreadable): nothing then confirms what became of that booking."""
+        try:
+            return booking.Journal.load(self._booking_file(intent))
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _unreadable(self, intent: journals.Intent) -> None:
+        """A booking whose journal cannot be read: its cleanup is unconfirmed, and its own end bounds it."""
+        self.acted, self.cleanup = True, booking.Cleanup.UNCONFIRMED
+        self.say(f"cleanup: booking {intent.payload['file']} unreadable, {self.cleanup.value}")
+        self.status(cleanup=self.cleanup.value)
+
     def _until(self) -> int | None:
         return None if self.deadline is None else int(self.deadline)
 
@@ -909,7 +923,10 @@ class _Invocation:
         journal = self.journal
         books = [one for one in journal.intents if one.action is Action.BOOK and one.status is not IntentStatus.RULED_OUT]
         for intent in books:
-            saved = booking.Journal.load(self._booking_file(intent))
+            saved = self._load_booking(intent)
+            if saved is None:
+                self._unreadable(intent)
+                raise ControllerError(Refusal.BOOKING_UNRESOLVED)
             if saved.mode is None or (saved.cleanup is not None and saved.cleanup in _SETTLED):
                 if intent.status is IntentStatus.PENDING:
                     journal.confirm(intent.ordinal, {"cleanup": saved.cleanup or booking.Cleanup.NOT_OWNED})
@@ -946,7 +963,10 @@ class _Invocation:
         for intent in journal.intents:
             if intent.action is not Action.BOOK or intent.status is IntentStatus.RULED_OUT:
                 continue
-            saved = booking.Journal.load(self._booking_file(intent))
+            saved = self._load_booking(intent)
+            if saved is None:
+                self._unreadable(intent)
+                continue
             if saved.mode is not None and (saved.cleanup is None or saved.cleanup not in _SETTLED):
                 self._cancel_delivered = True
                 try:
@@ -1049,8 +1069,9 @@ class _Invocation:
                 self.cleanup = booking.Cleanup.UNCONFIRMED
         else:
             self.settle_bookings()
-        self.status(cleanup=self.cleanup.value)
-        self.say(f"cleanup: {self.cleanup.value}")
+        cleanup = self._run_cleanup()
+        self.status(cleanup=cleanup.value)
+        self.say(f"cleanup: {cleanup.value}")
 
     def rate(self, observed: Settings) -> tuple[float, str]:
         """The host price of the report: the operator's, else the deployed pool's price of the
@@ -1122,7 +1143,7 @@ class _Invocation:
             if self.cancelled() and journal.issue_number is None:
                 # A driver's run cancelled before its issue: nothing is created, booked or sent.
                 return self.stop_short(journal, f"{Reason.OPERATOR_CANCELLED.value}, nothing was booked")
-            self.status(run_id=journal.run_id, step="issue", cleanup=self.cleanup.value)
+            self.status(run_id=journal.run_id, step="issue", cleanup=self._run_cleanup().value)
             try:
                 number = self.publisher.open_experiment(journal, self.experiment(journal), request.issue)
             except PublishError as refused:
@@ -1249,13 +1270,18 @@ class _Invocation:
         return Ending.INTERRUPTED
 
     def _run_cleanup(self) -> booking.Cleanup:
-        """What the comment says of the cleanup: this invocation's, or, when it booked and
-        reconciled nothing, what became of the run's last booking."""
+        """What the comment and the status say of the cleanup: this invocation's, or, when it
+        booked and reconciled nothing, what became of the run's last booking: unconfirmed when
+        its journal cannot be read."""
         if self.acted or self.journal is None:
             return self.cleanup
         books = [one for one in self.journal.intents if one.action is Action.BOOK and one.status is not IntentStatus.RULED_OUT]
-        found = booking.Journal.load(self._booking_file(books[-1])).cleanup if books else None
-        return found or self.cleanup
+        if not books:
+            return self.cleanup
+        saved = self._load_booking(books[-1])
+        if saved is None:
+            return booking.Cleanup.UNCONFIRMED
+        return saved.cleanup or self.cleanup
 
     def publish(
         self, journal: Journal, ending: Ending, made: tuple[Scorecard, report.Bundle, report.Derived, Path] | None
