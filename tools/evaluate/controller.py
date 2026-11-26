@@ -20,7 +20,8 @@ skill's driver (docs/design/agent-session-evaluation.md, "How the operator runs 
    designated session with `--session existing`. `acquire` waits for the hosts itself, and its
    outcome is used as it is: a refusal keeps its reason (`pool-already-booked`,
    `capacity-unavailable`, ...). The invocation has one deadline, set at its start: `--for` from
-   then, or the designated session's end if that is earlier. The wait for capacity and the batch
+   then, or the designated session's end if that is earlier. A managed booking is written for the
+   whole minutes left before it, so that the pool's record expires by it. The wait for capacity and the batch
    both end by it, and the cells chosen keep the planner's allowance for that wait out of the
    window (`plan.schedule`), so the batch `plan` printed runs when the hosts come within it.
 3. **Measuring.** `Runtime.measure` runs the selected cells (`phases.run` in the live runtime)
@@ -50,7 +51,9 @@ skill's driver (docs/design/agent-session-evaluation.md, "How the operator runs 
 **Restart.** A run is resumed by its ID, or by its issue and the same request. Before anything is
 booked, every booking the journal intended and has not seen settled is reconciled against the
 selected pool (`booking.Capacity.reconcile`): one that is still the exact booking is waited on and
-used, one whose write or stop is in doubt is released, one an operator changed is left to them.
+used when a cell is left to measure, and released when none is (a run whose every cell was
+checkpointed sends nothing again); one whose write or stop is in doubt is released, one an
+operator changed is left to them.
 A booking that stays in doubt stops the invocation before it books again. An invocation that
 cannot go on (a preflight, GitHub or the issue refused) releases every booking its run holds.
 
@@ -654,8 +657,14 @@ class _Invocation:
 
     def preflight(self) -> list[str]:
         """The checks that fail. The runtime's own come first: one that cannot measure at all
-        stops the preflight before the pool or GitHub is read."""
-        failed = [str(one) for one in self.runtime.preflight(self.plan)]
+        stops the preflight before the pool or GitHub is read, and so does one whose own checks
+        raise: that is a measurement that cannot be prepared, never an invocation that ends before
+        a restart has released what its run holds."""
+        try:
+            failed = [str(one) for one in self.runtime.preflight(self.plan)]
+        except Exception as error:  # noqa: BLE001 - whatever the runtime's checks raised, nothing can be measured
+            self.say(f"preflight: {type(error).__name__}")
+            return [Check.MEASUREMENT]
         if Check.MEASUREMENT in failed:
             return failed
         try:
@@ -787,10 +796,11 @@ class _Invocation:
     def _until(self) -> int | None:
         return None if self.deadline is None else int(self.deadline)
 
-    def reconcile(self, selection: booking.Selection) -> booking.Outcome | None:
+    def reconcile(self, selection: booking.Selection, *, work: bool) -> booking.Outcome | None:
         """Every booking the journal intended and has not seen settled, against the pool's record:
-        the exact booking still held is waited on again and used, one in doubt is released, one an
-        operator changed is theirs. `None` when no booking of the run is held any more."""
+        the exact booking still held is waited on again and used when there is `work` left for it,
+        and released otherwise, as one in doubt is; one an operator changed is theirs. `None` when
+        no booking of the run is held any more."""
         assert self.journal is not None
         journal = self.journal
         books = [one for one in journal.intents if one.action is Action.BOOK and one.status is not IntentStatus.RULED_OUT]
@@ -804,7 +814,7 @@ class _Invocation:
             capacity = booking.Capacity(selection, self.access, saved, until=self._until())
             found = capacity.reconcile()
             self.say(f"reconciled: booking {intent.payload['file']} {found.value}")
-            if found is booking.Cleanup.HELD and intent is books[-1]:
+            if found is booking.Cleanup.HELD and intent is books[-1] and work:
                 self.capacity = capacity
                 outcome = capacity.wait()
                 if intent.status is IntentStatus.PENDING:
@@ -848,10 +858,16 @@ class _Invocation:
     def book(self, selection: booking.Selection, window_ms: int) -> booking.Outcome:
         """The booking, intended in the run journal (which refuses it before the issue), then
         made and waited for by `booking.Capacity.acquire`, whose outcome is kept as it is. The wait
-        ends with the invocation's deadline."""
+        ends with the invocation's deadline, and so does a managed booking: its whole minutes are
+        those left before the deadline when it is written, rounded down, so that the record the
+        pool keeps (which ends the booking if the driver dies) never outlives what `--for`
+        authorized, whatever the preflight and the issue took."""
         assert self.journal is not None
         journal = self.journal
-        minutes = None if self.request.existing else math.ceil(window_ms / MINUTE_MS)
+        minutes = None
+        if not self.request.existing:
+            left_ms = window_ms if self.deadline is None else (self.deadline - self.access.clock()) * 1000
+            minutes = max(0, math.floor(left_ms / MINUTE_MS))
         count = sum(one.action is Action.BOOK for one in journal.intents)
         name = f"booking-{count}.json"
         intent = journal.intend(Action.BOOK, {"file": name, "minutes": minutes, "instances": selection.instances})
@@ -997,6 +1013,8 @@ class _Invocation:
                 return self.stop_short(journal, f"{refused.reason.value}, nothing was booked")
             except ControllerError as refused:
                 return self.stop_short(journal, f"{refused.reason}, nothing was booked")
+            except Exception as error:  # noqa: BLE001 - a driver fault before the booking still releases what the run holds
+                return self.stop_short(journal, f"driver-error: {type(error).__name__}, nothing was booked")
             url = issue_url(self.github.repository, number)
             self.say(f"issue: {url}")
             self.status(issue=url)
@@ -1056,7 +1074,7 @@ class _Invocation:
             window = self.window_ms(now)
             self.deadline = now + window / 1000
             selection, cells, deferred = self.selection(window)
-            outcome = self.reconcile(selection)
+            outcome = self.reconcile(selection, work=bool(cells))
             if outcome is None and (cells or self.measured() < len(self.plan.cells)):
                 if not cells:
                     self.say(f"refused: {booking.Reason.WINDOW_TOO_SHORT.value} for the next cell")
@@ -1504,19 +1522,24 @@ def write_bundle(journal: Journal, directory: Path) -> bool:
     measures on a run clock of its own (its `origin_s`); its times are laid on one timeline, the
     millisecond after the booking before it ends, so that the bundle keeps the order and the
     measured durations of every cell, and none of the time between bookings: a week away is no
-    week of evidence. False with no evidence."""
+    week of evidence. False with no evidence; `report.ReportError` (`unreadable-bundle`) when the
+    evidence of a checkpointed attempt cannot be read, so that no report omits a measured cell."""
     manifest_file = journal.directory / phases.MANIFEST
     if not manifest_file.exists():
         return False
     manifest = loads(manifest_file.read_text(encoding="utf-8"), Manifest)
     bookings: list[tuple[float, list[tuple[journals.Attempt, dict[str, Any], tuple[Document, ...]]]]] = []
     for attempt in journal.attempts:
-        extra = _read_json(journal.directory / EVIDENCE / f"attempt-{attempt.ordinal}.json")
-        if attempt.status is not AttemptStatus.COMPLETE or attempt.record is None or extra is None:
+        if attempt.status is not AttemptStatus.COMPLETE or attempt.record is None:
             continue
         if attempt.record.valid_for_qualification and attempt.replaced_by is not None:
             # Superseded, as each booking's warm-up supersedes the one before: a cell is read once.
             continue
+        extra = _read_json(journal.directory / EVIDENCE / f"attempt-{attempt.ordinal}.json")
+        if extra is None:
+            # A checkpointed cell whose evidence cannot be read: a bundle without it would claim
+            # a result for cells it does not hold.
+            raise report.ReportError(report.Refusal.UNREADABLE_BUNDLE)
         origin = float(extra.get("origin_s") or 0.0)
         if not bookings or bookings[-1][0] != origin:
             bookings.append((origin, []))
@@ -1584,15 +1607,17 @@ class LiveRuntime:
         return self._instruments
 
     def access(self) -> booking.Access:
-        """The deployment's sessions, from the driver's session alone: a restart whose
-        instruments cannot be resolved still reconciles and stops what its run booked. The probes
+        """The pools' sessions, from the driver's session alone (`evaluate.live.pool_sessions`: the
+        pools stack and `session_max_hours`, nothing of the students or the rest of the
+        configuration): a restart whose instruments cannot be resolved still reconciles and stops
+        what its run booked. The probes
         are the scope's pool's, and answer not ready while its instruments are not resolved."""
         if self._access is None:
-            from rhi_admin import main as admin
+            from evaluate import live
 
             try:
-                sessions = admin.connect(self._aws_session()).sessions()
-            except _UNREAD as error:
+                sessions = live.pool_sessions(self._aws_session())
+            except (*_UNREAD, KeyError, TypeError, ValueError) as error:
                 raise ControllerError(Check.DEPLOYMENT) from error
 
             def gateway_ready() -> bool:
@@ -1638,7 +1663,8 @@ class LiveRuntime:
             versions = phases.installed_versions(held.artifacts.trial_image)
             if any(versions.get(pin.harness) != pin.version for pin in plan.workload.harnesses):
                 failed.append(Check.HARNESS_VERSIONS)
-        except phases.PhaseError:
+        except (phases.PhaseError, OSError, subprocess.SubprocessError):
+            # The image could not say, or did not answer in time.
             failed.append(Check.HARNESS_VERSIONS)
         try:
             phases.cohort(plan, held.canaries)

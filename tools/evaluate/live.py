@@ -4,8 +4,9 @@ this host (docs/design/agent-session-evaluation.md, "How the operator runs it").
 
 `resolve` reads, for the scope's pool and nothing else:
 
-- the pool's deployed settings, from the scaler's function (`rhi_admin.pools.deployed`): its
-  engine and the instance type it runs first;
+- the pool's deployed settings, from the scaler's function of the pools stack
+  (`rhi_admin.main.pool_access`, `rhi_admin.pools.deployed`): its engine and the instance type it
+  runs first;
 - the pool's current release, from its release parameter (`/rhi/pools/<pool>/release`, as
   `rhi.pools.group.release_parameter` names it):
   the engine image's digest, the model revision and the engine's flags, whose launch fingerprint
@@ -17,6 +18,9 @@ this host (docs/design/agent-session-evaluation.md, "How the operator runs it").
 - the trial image, prepared and verified on this host (`evaluate.image.prepare`), the harness
   workers it runs (`evaluate.workers.Workers`, disposed of with the invocation), the course's task
   files and graders.
+
+The booking reaches the pools through `pool_sessions`: the pools stack and `session_max_hours`
+alone. Neither it nor `resolve` looks up the students' tables or reads the whole configuration.
 
 The release every selected host must serve is the release parameter's image digest and model
 revision; `releases` gives what each host's lifecycle agent reports of the same two in its latest
@@ -51,8 +55,10 @@ from botocore.exceptions import BotoCoreError, ClientError
 import common
 from evaluate import image, phases, replay, telemetry, trials, workers
 from evaluate.contracts import Family, InstanceType, PathCategory, Run, Settings
+from rhi import config
 from rhi_admin import main as admin_main
 from rhi_admin import pools as admin_pools
+from rhi_admin import session as admin_session
 from rhi_admin.roster import AdminError
 from rhi_admin.spikes import spike_alias
 from rhi_common import launch_settings, spike_keys
@@ -93,6 +99,29 @@ def _output(session: Any, stack: str, key: str) -> str | None:
     answer = session.client("cloudformation").describe_stacks(StackName=stack)
     outputs = answer["Stacks"][0].get("Outputs", [])
     return next((one["OutputValue"] for one in outputs if one.get("OutputKey") == key), None)
+
+
+def pool_sessions(session: Any) -> admin_session.Sessions:
+    """The pools' sessions as the booking reads and writes them, from the session: the pools
+    (`rhi_admin.main.pool_access`) and the one configuration key the booking needs,
+    `session_max_hours`, read by its own name (its default when the stage does not set it). No
+    student table is looked up and no other configuration is read. The time zone and the default
+    pool serve the admin's own commands, never an evaluation, which names its pool."""
+    name = config.SSM_PREFIX + "session_max_hours"
+    try:
+        text = session.client("ssm").get_parameter(Name=name)["Parameter"]["Value"]
+    except ClientError as error:
+        if error.response.get("Error", {}).get("Code") != "ParameterNotFound":
+            raise
+        hours = config.DEFAULTS["session_max_hours"]
+    else:
+        key = config.KEYS["session_max_hours"]
+        hours = key.parse(key.from_text(text))
+    if type(hours) is not int:
+        raise TypeError("session_max_hours")
+    return admin_session.Sessions(
+        pools=admin_main.pool_access(session), time_zone="UTC", session_max_hours=hours, default_pool=None
+    )
 
 
 def release_of(image_digest: str, model_revision: str | None) -> str:
@@ -186,12 +215,12 @@ def resolve(
     from evaluate.controller import Check, Instruments
 
     try:
-        admin = admin_main.connect(session)
+        pools = admin_main.pool_access(session)
     except _UNREAD as error:
-        # No client of the driver's session can be made: no region, no credentials' source.
+        # No client of the driver's session can be made, or the pools stack cannot be read.
         raise Unresolved(Check.DEPLOYMENT) from error
     try:
-        pool = admin_pools.deployed(admin.pools()).get(scope.pool)
+        pool = admin_pools.deployed(pools).get(scope.pool)
     except _UNREAD as error:
         raise Unresolved(Check.POOL_LIMITS) from error
     if pool is None:
@@ -208,7 +237,7 @@ def resolve(
     if not endpoint or endpoint == NO_ENDPOINT or not workspace_url:
         raise Unresolved(Check.BINDING)
     try:
-        keys = spike_keys.read(admin.secrets).students
+        keys = spike_keys.read(session.client("secretsmanager")).students
     except _UNREAD as error:
         raise Unresolved(Check.CANARIES) from error
     reader = common.Workspace(workspace_url, session.region_name, session.get_credentials())

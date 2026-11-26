@@ -17,12 +17,13 @@ import io
 import itertools
 import json
 import math
+import subprocess
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -502,6 +503,24 @@ def test_a_worker_error_releases_the_booking_and_a_resume_keeps_every_measured_c
     assert driver.events.count("stop") == 2
 
 
+def test_a_checkpointed_cell_whose_evidence_cannot_be_read_is_no_completed_result(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    read = Path.read_text
+
+    def unreadable(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path.parent.name == controller.EVIDENCE and path.name == "attempt-1.json":
+            raise OSError
+        return read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    assert run(driver) == controller.Exit.INCOMPLETE
+
+    (body,) = comments(driver)
+    assert ": failed" in body and "Reason: `invalid-evidence`" in body and "`released`" in body
+
+
 def test_a_report_that_cannot_be_written_ends_the_run_failed_with_its_comment(
     driver: Driver, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -580,7 +599,7 @@ def test_a_restart_whose_measurement_cannot_be_prepared_still_stops_the_booking_
             run(driver)
     (booked,) = booking_writes(driver)
     sessions = Runtime(driver, controller.Scope(POOL, REPO)).access().sessions
-    monkeypatch.setattr(lookups.admin_main, "connect", lambda *_args: SimpleNamespace(sessions=lambda: sessions))
+    monkeypatch.setattr(lookups, "pool_sessions", lambda *_args: sessions)
     monkeypatch.setattr(publisher, "HttpTransport", lambda _token: driver.github)
 
     def no_trial_image(*_args: object) -> Any:
@@ -598,6 +617,58 @@ def test_a_restart_whose_measurement_cannot_be_prepared_still_stops_the_booking_
 
     last = stored(driver.pool)
     assert last is not None and last != booked and last.set_by == booked.set_by and driver.sent == []
+
+
+def timed_out(*_args: object) -> Any:
+    raise subprocess.TimeoutExpired("docker", 120)
+
+
+@pytest.mark.parametrize("check", ["live harness check", "runtime's own check"])
+def test_a_restart_whose_preflight_check_raises_still_stops_the_booking_it_holds(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch, check: str
+) -> None:
+    def died(*_args: object) -> None:
+        raise Died
+
+    driver.pool.after_put = died
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver)
+    (booked,) = booking_writes(driver)
+    if check == "live harness check":
+        instruments = held(artifacts=SimpleNamespace(trial_image=timed_out))
+        monkeypatch.setattr(Runtime, "preflight", lambda _self, plan: live(instruments).preflight(plan))
+    else:
+        monkeypatch.setattr(Runtime, "preflight", timed_out)
+
+    assert run(driver, "--resume", only_run(driver)) == controller.Exit.INCOMPLETE
+
+    stop = stored(driver.pool)
+    assert stop is not None and stop.set_by == booked.set_by and stop.ends_at <= driver.pool.now
+    assert driver.sent == []
+
+
+def test_a_restart_after_the_last_checkpoint_releases_and_comments_without_sending_again(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def died(*_args: object) -> None:
+        raise Died
+
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver)
+    sent = list(driver.sent)
+    assert sent == list(range(len(PLAN.cells)))
+
+    assert run(driver, "--resume", only_run(driver)) == controller.Exit.PASS
+
+    assert driver.sent == sent  # no inference again, the warm-up included
+    stop = stored(driver.pool)
+    assert stop is not None and stop.ends_at <= driver.pool.now
+    (body,) = comments(driver)
+    assert ": completed" in body and "`released`" in body
 
 
 def test_a_session_the_driver_cannot_make_is_a_preflight_refusal_not_a_miss(
@@ -620,11 +691,13 @@ def test_a_session_the_driver_cannot_make_is_a_preflight_refusal_not_a_miss(
     assert code == controller.Exit.INCOMPLETE and controller.Check.DEPLOYMENT.value in out.getvalue()
 
 
-def test_time_spent_before_the_booking_counts_against_the_window(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_time_spent_before_the_booking_counts_against_the_window_and_the_booking_ends_by_it(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
     start, post = driver.pool.clock(), driver.github.post_issue
 
     def slow(login: str, body: str) -> int:
-        driver.pool.sleep(8)
+        driver.pool.sleep(35)
         return post(login, body)
 
     deadlines: list[float] = []
@@ -639,7 +712,10 @@ def test_time_spent_before_the_booking_counts_against_the_window(driver: Driver,
     run(driver, minutes=60)
 
     (minutes,) = [one["payload"]["minutes"] for one in state(driver, only_run(driver))["intents"] if one["action"] == "book"]
-    assert deadlines and max(deadlines) <= start + 3600 and minutes == 60  # 59m52s left, booked whole minutes
+    assert deadlines and max(deadlines) <= start + 3600 and minutes == 59  # 59m25s left, booked whole minutes
+    # The record the pool keeps, which ends the booking if the driver dies, expires by the deadline.
+    booked = booking_writes(driver)[0]
+    assert booked.ends_at <= start + 3600
 
 
 def test_capacity_is_read_from_the_selected_pool_alone(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -977,6 +1053,42 @@ def test_a_terminal_run_resolves_the_deployment_from_the_driver_s_session(
         cli.main([*request, "--issue", "new", "--repository", REPO, "--runs", str(tmp_path)])
 
 
+def test_the_live_driver_reaches_the_pools_without_the_students_tables_or_the_whole_configuration() -> None:
+    from botocore.exceptions import ClientError
+
+    from rhi_admin import main as admin
+
+    session = MagicMock()
+    client = session.client.return_value
+    looked_up: list[str] = []
+
+    def resource(*, StackName: str, LogicalResourceId: str) -> Any:
+        looked_up.append(StackName)
+        return {"StackResourceDetail": {"PhysicalResourceId": "fixture"}}
+
+    def parameter(*, Name: str) -> Any:
+        if Name == "/rhi/config/session_max_hours":
+            return {"Parameter": {"Value": "48"}}
+        raise ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetParameter")
+
+    denied = ClientError({"Error": {"Code": "AccessDeniedException"}}, "Denied")
+    client.describe_stack_resource.side_effect = resource
+    client.get_parameter.side_effect = parameter
+    client.get_parameters_by_path.side_effect = denied
+    client.get_parameters.side_effect = denied
+    client.describe_stacks.side_effect = denied
+    client.get_function_configuration.return_value = {
+        "Environment": {"Variables": {"RHI_SCALER_SETTINGS": json.dumps({"pools": {}})}}
+    }
+    runtime = controller.LiveRuntime(controller.Scope(POOL, REPO, 1), instruments=None, token="fixture", session=lambda: session)
+
+    assert runtime.access().sessions.session_max_hours == 48
+    assert runtime.preflight(PLAN) == [controller.Check.BINDING]  # the pool is not deployed
+
+    assert looked_up and set(looked_up) == {admin.POOLS_STACK_NAME}
+    assert not client.get_parameters_by_path.called
+
+
 def checkpoints(bundle: Path) -> list[contracts.Checkpoint]:
     """The checkpoints a bundle holds, in order: the phase tests' plan is no suite's, which the
     report would read them against."""
@@ -1045,7 +1157,7 @@ def test_a_host_serves_the_release_of_its_latest_scrape(monkeypatch: pytest.Monk
     parameter = SimpleNamespace(get_parameter=lambda **_kwargs: {"Parameter": {"Value": release}})
     session = SimpleNamespace(region_name="test", get_credentials=lambda: None, client=lambda _service: parameter)
     keys = tuple(generate_key() for _ in range(PLAN.canary_identities))
-    monkeypatch.setattr(lookups.admin_main, "connect", lambda _session: SimpleNamespace(pools=lambda: None, secrets=None))
+    monkeypatch.setattr(lookups.admin_main, "pool_access", lambda _session: None)
     monkeypatch.setattr(lookups.admin_pools, "deployed", lambda _pools: {POOL: SimpleNamespace(instance_types=["g7e.2xlarge"], engine="vllm")})
     monkeypatch.setattr(lookups, "_output", lambda *_args: "https://example.com")
     monkeypatch.setattr(lookups.spike_keys, "read", lambda _secrets: SimpleNamespace(students=keys))

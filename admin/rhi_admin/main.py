@@ -125,6 +125,27 @@ def physical_id(cloudformation: Any, logical_id: str, stack: str = STACK_NAME) -
     return answer["StackResourceDetail"]["PhysicalResourceId"]
 
 
+def pool_access(session: Any) -> admin_pools.Pools:
+    """The deployed pools alone, reached with the session: the pool-state table and the scaler's
+    function of the pools stack. No other stack is looked up and no configuration is read."""
+    cloudformation = session.client("cloudformation")
+    sts = session.client("sts")
+    table = session.resource("dynamodb").Table(physical_id(cloudformation, POOL_STATE_LOGICAL_ID, POOLS_STACK_NAME))
+    try:
+        scaler = physical_id(cloudformation, SCALER_FUNCTION_LOGICAL_ID, POOLS_STACK_NAME)
+    except ClientError as error:
+        # The stack is there, since its table was found: it holds no scaler, as a parked stage's.
+        if error.response.get("Error", {}).get("Code") != "ValidationError":
+            raise
+        scaler = None
+    return admin_pools.Pools(
+        table=table,
+        functions=session.client("lambda"),
+        scaler=scaler,
+        caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
+    )
+
+
 def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request.urlopen) -> Admin:
     """The deployed tables and secrets, reached with the caller's own credentials and region.
 
@@ -145,21 +166,7 @@ def connect(session: Any = None, *, urlopen: Callable[..., Any] = urllib.request
         return configuration().course_end
 
     def pools() -> admin_pools.Pools:
-        sts = session.client("sts")
-        table = dynamodb.Table(physical_id(cloudformation, POOL_STATE_LOGICAL_ID, POOLS_STACK_NAME))
-        try:
-            scaler = physical_id(cloudformation, SCALER_FUNCTION_LOGICAL_ID, POOLS_STACK_NAME)
-        except ClientError as error:
-            # The stack is there, since its table was found: it holds no scaler, as a parked stage's.
-            if error.response.get("Error", {}).get("Code") != "ValidationError":
-                raise
-            scaler = None
-        return admin_pools.Pools(
-            table=table,
-            functions=session.client("lambda"),
-            scaler=scaler,
-            caller=lambda: admin_pools.identity_name(sts.get_caller_identity()["Arn"]),
-        )
+        return pool_access(session)
 
     def sessions() -> admin_session.Sessions:
         read = configuration()
