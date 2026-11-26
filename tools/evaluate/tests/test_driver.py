@@ -273,6 +273,30 @@ def test_a_run_in_the_operator_s_session_resumes_in_that_session_untouched_after
     assert lab.stored(fake.pool) == operator and host.counts() == (1, 1, 0)
 
 
+@pytest.mark.parametrize("expired", [True, False], ids=["expired-then-booked-again", "replaced"])
+def test_a_run_admitted_in_the_operator_s_session_never_measures_in_another_after_a_restart(
+    host: Host, expired: bool
+) -> None:
+    fake = host.services.fake
+    first = lab.held_by_operator(fake)
+
+    def die(_run_id: str) -> None:
+        raise Died
+
+    host.start(on_admitted=die)
+    sid = submission()
+    with pytest.raises(served.Unanswered):
+        host.call(op="submit", submission=sid, run={**RUN, "session": "existing", "window_ms": None})
+    fake.pool.sleep(first.ends_at - fake.pool.now + 60 if expired else 60)
+    replacement = lab.held_by_operator(fake)  # the same pool and hosts, booked again by hand
+    assert replacement != first
+
+    host.restart()
+    assert host.settled(sid)["exit"] != controller.Exit.PASS
+    assert fake.sent == [] and lab.stored(fake.pool) == replacement
+    assert fake.events.count("book") == 0
+
+
 def test_a_driver_closed_while_its_run_measures_keeps_the_runs_until_it_ends_and_its_result_stands(
     host: Host,
 ) -> None:
@@ -488,6 +512,24 @@ def test_an_experiment_issue_that_is_not_there_or_records_another_workload_is_no
     answer = host.call(op="submit", submission=submission(), run={**RUN, "issue": number, "input_seed": 41})
     assert answer["refused"] == served.Refusal.NOT_ADMITTED.value and "run_id" not in answer
     assert len(host.admitted()) == 1 and host.counts() == (1, 1, 1)
+
+
+@pytest.mark.parametrize("issue", ["new", 1], ids=["new-issue", "selected-issue"])
+def test_a_repository_github_does_not_have_for_the_driver_is_not_admitted(
+    host: Host, monkeypatch: pytest.MonkeyPatch, issue: str | int
+) -> None:
+    github = host.services.fake.github
+    routed = github._route
+
+    def absent(method: str, path: str, body: Any) -> tuple[int, Any]:
+        return (404, None) if path.startswith("/repos/") else routed(method, path, body)
+
+    monkeypatch.setattr(github, "_route", absent)
+    host.start()
+    answer = host.call(op="submit", submission=submission(), run={**RUN, "issue": issue})
+    assert answer["refused"] == served.Refusal.NOT_ADMITTED.value and "run_id" not in answer
+    assert controller.Check.DESTINATION.value in answer["detail"]
+    assert host.admitted() == [] and host.counts() == (0, 0, 0)
 
 
 @pytest.mark.parametrize("operator_hosts", [None, 1], ids=["no-session", "another-host-count"])

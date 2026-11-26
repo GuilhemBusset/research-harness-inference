@@ -35,8 +35,8 @@ anything in. A refused request reaches no service and writes nothing.
 **Admission.** A valid `submit` is then checked against the deployment, as `controller.admit`
 checks it, which only reads and starts nothing on this host: the selected pool deployed with room
 for the hosts and the minutes (its `max_instances` and `session_max_hours`), the experiment's
-destination answering as the driver (a selected issue read from GitHub: it must exist, be the
-driver's and record the request's workload), the designated session with `--session existing`
+destination answering as the driver (its repository there and open for issues; a selected issue
+read from GitHub: it must exist, be the driver's and record the request's workload), the designated session with `--session existing`
 (on the pool, of the selected hosts, with time left), and a writable journal root. A request that
 fails is refused with the failed checks and nothing of it is kept. The runtime's own checks, which
 may prepare the trial image and start its containers, are the run's preflight, after step 2. One
@@ -44,7 +44,8 @@ that passes is admitted, in this order, before anything outside the driver is to
 
 1. The submission's record is saved under `<runs>/submissions/`, created whole and never
    replaced: the submission ID, the digest of its fields, the whole typed request, the run ID
-   chosen for it, and the time it was admitted on the runtime's clock.
+   chosen for it, the time it was admitted on the runtime's clock and, with `--session
+   existing`, the operator's session as admission read it (its hosts, its times, its writer).
 2. The run's journal is created under that run ID (`controller.create_run`).
 3. The run is dispatched: `controller.execute` resumes it by its ID, so the issue, then the
    booking, come after both. The answer carries the run ID and the status.
@@ -63,7 +64,8 @@ submission's record: a run with no exit recorded is created if its creation was 
 resumed by its ID. Its `--for` still counts from its admission (`Request.started_s`), and it makes
 one managed booking at most (`Request.bookings`): a resumed run that finds its booking released
 books no other, and one whose booking was intended but never set out to be written makes it. A
-run in a designated session resumes in that same session, untouched. A driver keeps its root
+run in a designated session resumes in the session its admission read, untouched, and within that
+session's end: one that expired or was replaced since is never measured in. A driver keeps its root
 until its last run has ended, however it was closed, so the next driver never takes a journal
 one of its runs still writes. A cancel is kept beside the submission's record, so it holds through
 a run's preflight and through a restart.
@@ -97,6 +99,7 @@ from typing import TYPE_CHECKING, Any
 from evaluate import controller, publisher
 from evaluate import plan as planning
 from evaluate.contracts import Profile
+from rhi_common.records import Session
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -394,8 +397,10 @@ def _read(path: Path) -> dict[str, Any] | None:
 
 def request_of(record: Mapping[str, Any], fallback_rate: tuple[float, str]) -> controller.Request:
     """The controller's request for a submission's record: its run resumed by the ID it was
-    admitted under, `--for` counted from its admission, one booking at most."""
+    admitted under, `--for` counted from its admission, one booking at most, and a designated
+    session the one read at its admission."""
     run = record["run"]
+    designated = record.get("designated")
     return controller.Request(
         suite=run["suite"],
         profile=Profile(run["profile"]),
@@ -415,6 +420,7 @@ def request_of(record: Mapping[str, Any], fallback_rate: tuple[float, str]) -> c
         fallback_rate=fallback_rate,
         started_s=record["started_s"],
         bookings=1,
+        designated=None if designated is None else Session.from_item(designated),
     )
 
 
@@ -679,13 +685,15 @@ class Driver:
                     resume=False,
                     bookings=None,
                 )
-                started = controller.admit(admission, connect=self.connect, root=self.root)
+                admitted = controller.admit(admission, connect=self.connect, root=self.root)
+                designated = admitted.designated
                 record = {
                     "submission": message.submission,
                     "digest": wanted,
                     "run": message.run,
                     "run_id": secrets.token_hex(8),
-                    "started_s": started,
+                    "started_s": admitted.started_s,
+                    "designated": None if designated is None else dict(designated.to_item()),
                 }
                 if not _write_new(path, record):
                     record = _read(path)

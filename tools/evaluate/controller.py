@@ -237,7 +237,9 @@ class Request:
     which `--for` counts instead of from this invocation's start; and `bookings`, the most managed
     bookings whose write it may ever set out, so that a resumed invocation that finds its booking
     released books no other. With `bookings` given, a designated session is the one the run
-    designated first, whenever it resumes."""
+    designated first, whenever it resumes: `designated`, the operator's session as the driver read
+    it at admission, when it was saved then. A run resumes in that session alone and within its
+    end: one that expired or was replaced since is never measured in."""
 
     suite: str
     profile: Profile
@@ -257,6 +259,7 @@ class Request:
     fallback_rate: tuple[float, str] = (1.0, "example")
     started_s: float | None = None
     bookings: int | None = None
+    designated: Session | None = None
 
     def saved(self) -> dict[str, Any]:
         """What a resume must request again to continue the run: the workload and the scope."""
@@ -636,6 +639,8 @@ class _Invocation:
         # Set once the cancel request has stopped a wait, and while the booking is released: the
         # cleanup's own retries are never cut short by it.
         self._cancel_delivered = False
+        # The operator's session `designable` last found could be designated.
+        self.designable_session: Session | None = None
 
     # --- Output ---
 
@@ -693,9 +698,12 @@ class _Invocation:
 
     def first_designated(self) -> Session | None:
         """The operator's session a driver's run first designated: the one a resumed run of it
-        measures in again, and no other (`book`)."""
+        measures in again, and no other (`book`): the one saved at its admission, else the one its
+        first booking journal designated."""
         if self.request.bookings is None or not self.request.existing:
             return None
+        if self.request.designated is not None:
+            return self.request.designated
         return next((one.designated for one in self._bookings() if one.designated is not None), None)
 
     def measured(self) -> int:
@@ -728,7 +736,8 @@ class _Invocation:
     def deployment_checks(self) -> list[str]:
         """The preflight's checks that only read, and start nothing on this host: a writable
         journal root, the selected pool's deployed limits, and the destination answering as the
-        driver. What a driver checks at admission (`admit`), before the runtime's own checks."""
+        driver: its repository there, open for the experiment's issue. What a driver checks at
+        admission (`admit`), before the runtime's own checks."""
         failed: list[str] = []
         try:
             self.root.mkdir(parents=True, exist_ok=True)
@@ -746,6 +755,8 @@ class _Invocation:
             failed.append(Check.POOL_LIMITS)
         try:
             self.github.login()
+            if not self.github.hosts_issues():
+                failed.append(Check.DESTINATION)
         except (publisher.Unanswered, publisher.Rejected):
             failed.append(Check.DESTINATION)
         return failed
@@ -838,17 +849,20 @@ class _Invocation:
     def window_ms(self, now: float) -> int:
         """The time this invocation may still hold from `now`: what is left of `--for`, counted
         from the invocation's start (its preflight and its issue took some), or of the designated
-        session if that is less."""
+        session if that is less: the one the run designated first, when it did, whatever the pool
+        holds now."""
         request = self.request
         left_for = None if request.window_ms is None else max(0, request.window_ms - round((now - self.started) * 1000))
         if not request.existing:
             assert left_for is not None
             return left_for
         sessions = self.access.sessions
-        try:
-            session = pool_booking.read(sessions.pools.table, request.pool)
-        except _UNREAD:
-            session = None
+        session = self.first_designated()
+        if session is None:
+            try:
+                session = pool_booking.read(sessions.pools.table, request.pool)
+            except _UNREAD:
+                session = None
         left = 0 if session is None else int((rules.end(session, session_max_hours=sessions.session_max_hours) - now) * 1000)
         return left if left_for is None else min(left, left_for)
 
@@ -856,8 +870,10 @@ class _Invocation:
         """Why the pool's session cannot be designated for this invocation, read as
         `booking.Capacity.acquire` would designate it, and with nothing written: `None` when it is
         on the pool, books the selected hosts, and leaves, from its start or now, at least the
-        warm-up and the cleanup before its end, or before `--for` when that comes first."""
+        warm-up and the cleanup before its end, or before `--for` when that comes first. The
+        session read is kept in `self.designable_session` when it can be designated."""
         request, plan = self.request, self.plan
+        self.designable_session = None
         try:
             sessions = self.access.sessions
             now = self.access.clock()
@@ -874,6 +890,7 @@ class _Invocation:
         least_ms = plan.reserved_ms(plan.cells[0]) + plan.spec.estimates.cleanup_ms
         if (end - max(now, actual.starts_at)) * 1000 < least_ms:
             return booking.Reason.WINDOW_TOO_SHORT
+        self.designable_session = actual
         return None
 
     def _booking_file(self, intent: journals.Intent) -> Path:
@@ -1353,7 +1370,17 @@ def _planned(request: Request) -> Plan:
         raise ControllerError(refused.reason.value) from refused
 
 
-def admit(request: Request, *, connect: Connect, root: Path = journals.DEFAULT_ROOT) -> float:
+@dataclass(frozen=True)
+class Admission:
+    """What a driver keeps of an admission: the runtime's clock then, from which the run's
+    `--for` counts (`Request.started_s`), and, with `--session existing`, the operator's session
+    as it was read (`Request.designated`)."""
+
+    started_s: float
+    designated: Session | None = None
+
+
+def admit(request: Request, *, connect: Connect, root: Path = journals.DEFAULT_ROOT) -> Admission:
     """What a driver checks before it admits a request (`evaluate.driver`), with reads alone:
     nothing is created, booked or sent, and nothing is started on this host (the runtime's own
     checks, which may prepare the trial image and start its containers, are the run's preflight,
@@ -1362,9 +1389,8 @@ def admit(request: Request, *, connect: Connect, root: Path = journals.DEFAULT_R
     `max_instances` and `session_max_hours` against the hosts and `--for`, the destination); a
     selected experiment issue read from GitHub, which must exist, be the driver's and record the
     request's workload; and, with `--session existing`, the designated session, which must be on
-    the pool, of the selected hosts, with time left for a batch. Returns the runtime's clock, from
-    which the admitted run's `--for` counts (`Request.started_s`); a refusal is a
-    `ControllerError`."""
+    the pool, of the selected hosts, with time left for a batch. Returns the `Admission`; a
+    refusal is a `ControllerError`."""
     plan = _planned(request)
     scope = Scope(request.pool, request.repository, request.instances)
     with connect(scope) as runtime:
@@ -1387,7 +1413,7 @@ def admit(request: Request, *, connect: Connect, root: Path = journals.DEFAULT_R
             declined = invocation.designable()
             if declined is not None:
                 raise ControllerError(declined.value)
-        return invocation.started
+        return Admission(invocation.started, invocation.designable_session)
 
 
 def create_run(root: Path, request: Request, run_id: str) -> None:
