@@ -49,7 +49,10 @@ GitHub has confirmed the issue. A run that ends without that confirmation stops 
 `submit` has already returned a run ID, and `inspect --submission <submission-id>` then shows no
 `issue`, `running: false` and `exit: 2`. These fields do not say why, and you never guess a cause:
 
-- `cancel_requested: true`: the run was cancelled before its issue was confirmed.
+- `cancel_requested: true`: cancellation was requested. The request may have come after the run
+  had already ended for another reason, a failed preflight for one, so it does not say why the run
+  ended. Say the run ended because of the cancellation only when the run's own record,
+  `scripts/evaluate.sh status <run-id>`, confirms that cause.
 - `publication: pending`: a write awaits GitHub's confirmation. GitHub may have created the issue
   and lost its answer, or refused the write: the driver cannot tell them apart, and neither can
   you. `scripts/evaluate.sh publish --resume <run-id>` delivers it, finds an issue GitHub did
@@ -111,8 +114,10 @@ or `--issue <number>`, and optionally `--suite`, `--question`, `--target`, `--in
      the request), and never opens a second issue. After that, `inspect` shows the issue. If it
      still reports the publication pending, the operator checks the driver token's access to the
      repository's issues and runs it again;
-   - otherwise nothing awaits delivery. If `cancel_requested` is `true`, the run was cancelled;
-     if not, point the operator to `scripts/evaluate.sh status <run-id>` in their terminal.
+   - otherwise nothing awaits delivery. If `cancel_requested` is `true`, report that cancellation
+     was requested, not that it ended the run. Either way, point the operator to
+     `scripts/evaluate.sh status <run-id>` in their terminal: the run's own record is what shows
+     why it ended, and only when it confirms the cancellation as the cause do you report it so.
 3. Report to the operator:
    - the experiment issue's URL. It is where the run's terminal comment will be;
    - the run ID and the submission ID;
