@@ -53,18 +53,30 @@ as a retry. One failed attempt is retried by one request: a second request with 
 the same time or after an answer, is a new request and takes its own turn.
 
 **What is measured and what is charged** are read apart, each by a reader of `evaluate.streams`.
-The measurement is the answer as it reached the trial: a chunk counts once it was written to the
-trial, so an answer whose last event the trial did not receive is a failed attempt, closed by the
-client. The charge is read from what the gateway sent, and settles the allowance exactly once:
+The measurement is the answer as it reached the trial, read as what the request asked for: a
+request that asked for a stream is completed by its route's last event and by nothing else, and a
+JSON document completes only a request that asked for no stream, once every byte of the length it
+declared was written to the trial. A chunk counts once it was written to the trial, so an answer
+whose last event the trial did not receive is a failed attempt, closed by the client. The charge is
+read from what the gateway sent, as the kind of answer the gateway said it was, and settles the
+allowance exactly once:
 
-- nothing, when the gateway refused the request with a status or it never left the forwarder;
+- nothing, when the request never left the forwarder, or the gateway refused it with a status it
+  gives before it asks an engine (`_before_dispatch`: any status under 500, and 503);
 - the output tokens the answer reported, when the gateway sent it whole and it reported them;
 - its whole allowance otherwise: an answer that reported no usage, one cut short by the endpoint,
-  by the client or by the supervisor. What it generated is not known and is at most the allowance,
-  so the count is never guessed low. Its usage stays recorded as missing.
+  by the client or by the supervisor, and a refusal the gateway can give once an engine has the
+  request (502, 504, as when the time limit comes while the answer is read). What it generated is
+  not known and is at most the allowance, so the count is never guessed low, and a request sent
+  again is never given tokens the first may have spent. Its usage stays recorded as missing.
 
 An endpoint that reports more than the allowance it was given is charged what it reports, and a
 total past the cap is `token_limit`.
+
+**A trial that closes a request** before its answer is whole ends it: once the gateway may hold
+the request, the gateway's side is closed, as a client that gives up does, and the allowance is
+charged. Before that, while the gateway is still being reached, the request is ended at once, is
+not sent, and gives its whole allowance back.
 
 **The supervisor** (`Supervisor`) runs the trial's process and watches the budget. On a limit, an
 interruption or the process's end it closes admission, which fails a trial whose deadline has
@@ -473,9 +485,17 @@ def _directed(route: Route, held: Mapping[str, Any], pool: str, tokens: int) -> 
     return _encoded({**held, "model": pool, **limits})
 
 
+def _before_dispatch(status: int | None) -> bool:
+    """Whether a status is one the gateway refuses a request with before any engine has it: its
+    refusals of a key, a body or a route, its limit of concurrent requests and its three reasons
+    for having no machine to ask (503). Any other refusal can come once an engine generates: 502
+    and 504 are also what the gateway says of an answer it lost or ran out of time to read."""
+    return status is not None and (status < 500 or status == HTTPStatus.SERVICE_UNAVAILABLE)
+
+
 def _charge(generated: Attempt, allowance: int, *, reached: bool) -> int:
     """What a request is charged, from the answer as the gateway sent it (the module's text)."""
-    if not reached or generated.outcome is RequestOutcome.HTTP_REFUSAL:
+    if not reached or (generated.outcome is RequestOutcome.HTTP_REFUSAL and _before_dispatch(generated.status)):
         return 0
     reported = None if generated.usage is None else generated.usage.output_tokens
     if generated.outcome is RequestOutcome.COMPLETED and reported is not None:
@@ -504,6 +524,8 @@ class _Sent:
     digest: bytes
     retry: int
     side_call: bool
+    stream: bool
+    """The request asked for a stream of events: the measurement reads its answer as one."""
     received_ms: int
 
 
@@ -720,6 +742,7 @@ class Forwarder:
                     digest=digest,
                     retry=retry,
                     side_call=side_call,
+                    stream=held.get("stream") is True,
                     received_ms=received,
                 )
         try:
@@ -744,7 +767,8 @@ class Forwarder:
                 now = self.budget.clock()
                 cut = exchange.closed_by_client or exchange.cancelled
                 attempt = sent.delivered.end(now, transport_error=exchange.broke and not cut)
-                charged = _charge(sent.generated.end(now), sent.reservation.tokens, reached=exchange.reached)
+                generated = sent.generated.end(now, transport_error=exchange.broke)
+                charged = _charge(generated, sent.reservation.tokens, reached=exchange.reached)
                 self.budget.settle(sent.reservation, charged)
                 if attempt.failed:
                     self._failed.setdefault(sent.digest, []).append((sent.retry + 1, not sent.side_call and not cut))
@@ -812,15 +836,16 @@ class Forwarder:
         to_client = False
         upstream, sent = exchange.upstream, exchange.sent
         try:
+            # The trial is watched from before the gateway is reached: reaching it can take long.
+            threading.Thread(target=self._watch, args=(exchange, done), daemon=True).start()
             upstream.connect()
             with self._changed:
                 exchange.gateway = upstream.sock
-                if exchange.cancelled:
-                    # Cut before it was connected: it is not sent.
+                if exchange.cancelled or exchange.ended:
+                    # Cut, or closed by the trial, before it was connected: it is not sent.
                     raise ConnectionAbortedError
                 # From here the gateway may hold the request, whenever the exchange is cut.
                 exchange.reached = True
-            threading.Thread(target=self._watch, args=(exchange, done), daemon=True).start()
             path = self._parts.path.rstrip("/") + handler.path
             try:
                 upstream.request(handler.command, path, body, self._headers(handler, len(body)))
@@ -830,24 +855,28 @@ class Forwarder:
                     exchange.reached = False
                 raise
             answer = upstream.getresponse()
-            stream = (answer.getheader("Content-Type") or "").lower().startswith("text/event-stream")
+            # The bytes the answer declared, `None` for one that declared none.
+            declared = answer.length
             if sent is not None:
+                # The charge reads the answer as what the gateway says it is.
+                stream = (answer.getheader("Content-Type") or "").lower().startswith("text/event-stream")
                 with self._changed:
-                    sent.generated.answered(answer.status, stream=stream)
+                    sent.generated.answered(answer.status, stream=stream, length=declared)
             to_client = True
             handler.send_response(answer.status)
             for name, value in answer.getheaders():
                 if name.lower() not in _HOP_BY_HOP:
                     handler.send_header(name, value)
-            if answer.length is not None:
+            if declared is not None:
                 # The length the gateway declared, so that the trial too sees an answer cut short.
-                handler.send_header("Content-Length", str(answer.length))
+                handler.send_header("Content-Length", str(declared))
             handler.send_header("Connection", "close")
             handler.end_headers()
             handler.wfile.flush()
             if sent is not None:
+                # The measurement reads it as what the request asked for.
                 with self._changed:
-                    sent.delivered.answered(answer.status, stream=stream)
+                    sent.delivered.answered(answer.status, stream=sent.stream, length=declared)
             while True:
                 to_client = False
                 chunk = answer.read1(65536)
@@ -863,6 +892,9 @@ class Forwarder:
                 if sent is not None:
                     with self._changed:
                         sent.delivered.feed(chunk, now)
+            if answer.length:
+                # The body ended short of the length it declared: the gateway's side broke.
+                raise http.client.IncompleteRead(b"", answer.length)
         except (OSError, http.client.HTTPException, ValueError, AttributeError):
             # `AttributeError`: a connection shut under a read is left without its socket.
             if to_client:
@@ -873,13 +905,19 @@ class Forwarder:
             done.set()
 
     def _watch(self, exchange: _Exchange, done: threading.Event) -> None:
-        """Notes when the trial closes the exchange before its end, and closes the gateway's side
-        then, as a client that gives up does."""
+        """Notes when the trial closes the exchange before its end. Once the gateway may hold the
+        request, its side is closed then, as a client that gives up does. Before that the exchange
+        is ended here, without waiting for the gateway to be reached, and is not sent."""
         while not done.wait(0.05):
             if _gone(exchange.client):
-                if not done.is_set() and not exchange.cancelled:
+                with self._changed:
+                    if done.is_set() or exchange.cancelled or exchange.ended:
+                        return
                     exchange.closed_by_client = True
-                    exchange.shut(client=False)
+                    if exchange.reached:
+                        exchange.shut(client=False)
+                    else:
+                        self._end(exchange)
                 return
 
 

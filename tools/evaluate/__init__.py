@@ -19,4 +19,8 @@ generator's readers, so it needs `services/gateway` and `spikes` on the path as 
 that streams the three routes to one gateway and one pool with the student's key, the budget that
 holds the whole agent tree to the plan's wall time, turns and generated tokens, and the supervisor
 that stops a trial at a limit. It reads each attempt with `evaluate.streams`.
+
+`evaluate.traces` freezes the conversations a replay sends, from a seed and the course fixture
+under `fixtures/replay/`, before any of them is sent: the requests and pauses of each, in the form
+the load generator's recorded-session reader reads. It needs `spikes` on the path too.
 """

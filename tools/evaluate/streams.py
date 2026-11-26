@@ -41,11 +41,15 @@ time and no usage is taken from what follows it. The status stays on the attempt
 outcome, `None` when none arrived, so an error inside a 200 shows both.
 
 **An answer that is not a stream.** A harness that asks for no stream is answered with one JSON
-document, and the driver says so with the status (`answered(status, stream=False)`). Such an answer
-is `completed` when the document came whole, `error_event` when it is a report of failure, and
-`truncated_stream` or `transport_error` when it did not come whole. Its usage is the document's. It
+document, and the driver says so with the status (`answered(status, stream=False)`), with the
+length the answer declared when it declared one. Such an answer is `completed` when the document
+came whole, `error_event` when it is a report of failure, and `truncated_stream` or
+`transport_error` when it did not come whole. It came whole when it reads as one document, every
+byte of its declared length arrived and the transport did not fail: a body that stops short of its
+length is not whole, even when what came of it reads as a document. Its usage is the document's. It
 has no time of output: nothing of it is an answer before all of it is. A 2xx read as a stream that
-is not one has no last event and reads as truncated.
+is not one has no last event and reads as truncated: the driver reads an answer as what the request
+asked for, a stream or a document, whatever the answer says it is.
 
 **Times** are the driver's, in milliseconds on the run's clock, under the names of
 `contracts.RequestRecord`. A chunk has one time, and every event it completes has that time: events
@@ -200,6 +204,9 @@ class StreamReader:
         self._status: int | None = None
         # The bytes of an answer that is not a stream, until its end; `None` for a stream.
         self._whole: bytearray | None = None
+        # Of such an answer, the bytes it declared, if it declared them, and the bytes that came.
+        self._length: int | None = None
+        self._received = 0
         self._events = SseReader()
         self._usage: dict[str, Any] = {}
         self._first: int | None = None
@@ -209,17 +216,19 @@ class StreamReader:
         self._outcome: RequestOutcome | None = None
         self._attempt: Attempt | None = None
 
-    def answered(self, status: int, *, stream: bool = True) -> None:
+    def answered(self, status: int, *, stream: bool = True, length: int | None = None) -> None:
         """The answer's status has arrived. Its body is a stream of events, or, when `stream` is
-        false, one JSON document."""
+        false, one JSON document, of `length` bytes when the answer declared its length."""
         self._status = status
         self._whole = None if stream else bytearray()
+        self._length = None if stream else length
 
     def feed(self, chunk: bytes, now_ms: int) -> None:
         """Takes the next bytes of the body, received at `now_ms`."""
         if self._status is None or not 200 <= self._status < 300:
             return
         if self._whole is not None:
+            self._received += len(chunk)
             if len(self._whole) <= WHOLE_ANSWER_BYTES:
                 self._whole += chunk
             return
@@ -253,12 +262,15 @@ class StreamReader:
         if self._attempt is not None:
             return self._attempt
         if self._whole is not None and len(self._whole) <= WHOLE_ANSWER_BYTES:
-            # The document is whole when it reads as one: cut anywhere, it does not.
             document = _object(self._whole.decode("utf-8", "replace"))
+            # The document came whole when it reads as one and all of its body arrived: one that
+            # stops short of the length it declared can still read as a document.
+            short = transport_error or (self._length is not None and self._received != self._length)
             if document is not None:
                 merge_usage(self._usage, usage_in(document))
-                failed = _fails(document.get("type"), document)
-                self._outcome = RequestOutcome.ERROR_EVENT if failed else RequestOutcome.COMPLETED
+                if not short:
+                    failed = _fails(document.get("type"), document)
+                    self._outcome = RequestOutcome.ERROR_EVENT if failed else RequestOutcome.COMPLETED
         if self._status is not None and not 200 <= self._status < 300:
             outcome = RequestOutcome.HTTP_REFUSAL
         elif self._outcome is not None:

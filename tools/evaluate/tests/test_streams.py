@@ -470,9 +470,9 @@ def test_an_answer_that_is_not_a_stream_is_completed_when_its_document_came_whol
     document = json.dumps({"id": "made-up", "error": None, "usage": WHOLE_USAGE[route]}).encode()
     refused = json.dumps({"type": "error", "error": {"message": ERROR_TEXT}}).encode()
 
-    def read(*chunks: bytes, broken: bool = False) -> Attempt:
+    def read(*chunks: bytes, broken: bool = False, length: int | None = None) -> Attempt:
         reader = Attempts().send(route, 0)
-        reader.answered(200, stream=False)
+        reader.answered(200, stream=False, length=length)
         for at, chunk in enumerate(chunks):
             reader.feed(chunk, at)
         return reader.end(10, transport_error=broken)
@@ -486,4 +486,8 @@ def test_an_answer_that_is_not_a_stream_is_completed_when_its_document_came_whol
     assert (output_times(whole), whole.eligible) == ((None, None, None), False)
     assert read(document[:-1]).outcome is RequestOutcome.TRUNCATED_STREAM
     assert read(document[:-1], broken=True).outcome is RequestOutcome.TRANSPORT_ERROR
+    # A body that reads as a document and stops short of its declared length did not come whole.
+    assert read(document, length=len(document)).outcome is RequestOutcome.COMPLETED
+    assert read(document, length=len(document) + 1).outcome is RequestOutcome.TRUNCATED_STREAM
+    assert read(document, broken=True).outcome is RequestOutcome.TRANSPORT_ERROR
     assert read(refused).outcome is RequestOutcome.ERROR_EVENT
