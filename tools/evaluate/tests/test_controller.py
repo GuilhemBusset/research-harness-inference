@@ -582,6 +582,91 @@ def test_a_restart_that_cannot_reach_github_still_releases_the_booking_the_run_h
     last = stored(driver.pool)
     assert last is not None and last != booked and last.set_by == booked.set_by and last.ends_at <= driver.pool.now
     assert driver.sent == [] and driver.github.writes() == [("POST", f"/repos/{REPO}/issues")]
+    assert 'cleanup: "released"' in shown_status(driver, only_run(driver)).splitlines()
+
+
+def _damage(path: Path, damage: str) -> None:
+    if damage == "unparsable":
+        path.write_text("{not json")
+    else:
+        saved = json.loads(path.read_text())
+        path.write_text(json.dumps({**saved, "intended": []}))
+
+
+@pytest.mark.parametrize("damage", ["unparsable", "malformed-session"])
+def test_a_restart_whose_booking_journal_cannot_be_read_comments_the_failed_run_with_its_cleanup_unconfirmed(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    def died(*_args: object) -> None:
+        raise Died
+
+    driver.pool.after_put = died
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver)
+    run_id, writes = only_run(driver), list(booking_writes(driver))
+    _damage(driver.runs / run_id / "booking-0.json", damage)
+
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+
+    (body,) = comments(driver)
+    assert ": failed" in body and "`unconfirmed`" in body and "driver-error" not in body
+    assert booking_writes(driver) == writes and driver.sent == []
+    assert 'cleanup: "unconfirmed"' in shown_status(driver, run_id).splitlines()
+
+
+def test_an_unreadable_earlier_booking_keeps_the_cleanup_unconfirmed_while_the_held_one_is_released(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver.script = Script(fail_at=3)
+    assert run(driver) == controller.Exit.INCOMPLETE
+    run_id = only_run(driver)
+
+    def died(*_args: object) -> None:
+        raise Died
+
+    driver.pool.after_put = died
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver, "--resume", run_id)
+    booked = stored(driver.pool)
+    (driver.runs / run_id / "booking-0.json").write_text("{not json")
+
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+
+    last = stored(driver.pool)
+    assert booked is not None and last is not None and last != booked and last.set_by == booked.set_by
+    assert "`unconfirmed`" in comments(driver)[-1]
+    assert 'cleanup: "unconfirmed"' in shown_status(driver, run_id).splitlines()
+
+
+def test_a_failed_run_whose_cleanup_became_unconfirmed_comments_the_new_cleanup(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver.pool.hosts = 1
+    assert run(driver) == controller.Exit.INCOMPLETE
+    run_id = only_run(driver)
+    assert "`released`" in comments(driver)[-1]
+
+    def died(*_args: object) -> None:
+        raise Died
+
+    driver.pool.after_put = died
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver, "--resume", run_id)
+    (driver.runs / run_id / "booking-1.json").write_text("{not json")
+
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+
+    said = [body for body in comments(driver) if "`unconfirmed`" in body]
+    assert len(said) == 1 and said[0] == comments(driver)[-1]
+    assert 'cleanup: "unconfirmed"' in shown_status(driver, run_id).splitlines()
 
 
 def test_a_restart_whose_measurement_cannot_be_prepared_still_stops_the_booking_it_holds(
@@ -885,6 +970,18 @@ def test_a_finished_run_resumed_again_does_no_work_and_posts_nothing(driver: Dri
     assert run(driver, "--resume", only_run(driver)) == controller.Exit.PASS
 
     assert (comments(driver), booking_writes(driver), driver.sent) == before
+
+
+@pytest.mark.parametrize("github", ["answering", "down"])
+def test_resuming_a_finished_run_keeps_the_cleanup_it_recorded(driver: Driver, github: str) -> None:
+    assert run(driver) == controller.Exit.PASS
+    run_id, writes = only_run(driver), list(booking_writes(driver))
+    driver.github.down = github == "down"
+
+    run(driver, "--resume", run_id)
+
+    assert booking_writes(driver) == writes
+    assert 'cleanup: "released"' in shown_status(driver, run_id).splitlines()
 
 
 def test_a_publication_failure_leaves_the_verdict_and_publish_resume_delivers_once_without_the_pool(

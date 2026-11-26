@@ -634,10 +634,12 @@ def _lag(requests: Sequence[RequestRecord]) -> float | None:
 
 
 def _admitted(requests: Sequence[RequestRecord], record: CellRecord) -> list[RequestRecord]:
-    """The requests sent at or before the close of admissions. The drain lets them finish; a request
-    sent in it, a later turn of an admitted conversation or the opening of a new one, is accounted
-    for and gives no sample."""
-    return [one for one in requests if one.sent_ms <= record.admissions_ended_ms]
+    """The requests admitted before the close of admissions: first eligible before it and sent at or
+    before it. The drain lets them finish; a request sent in it, a later turn of an admitted
+    conversation or the opening of a new one, is accounted for and gives no sample. So does a
+    request first eligible at the close: the scheduler stops admitting when its clock reaches it."""
+    close = record.admissions_ended_ms
+    return [one for one in requests if one.eligible_ms < close and one.sent_ms <= close]
 
 
 def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_per_host_hour: float) -> CellReading:
@@ -645,6 +647,7 @@ def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_p
     requests: list[RequestRecord] = []
     read: list[RequestRecord] = []
     sampled: list[RequestRecord] = []
+    drained = 0
     engine = None
     lag = None
     reasons: tuple[Reason, ...] = ()
@@ -658,6 +661,7 @@ def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_p
         # Warm-up traffic in a steady cell is accounted for, and is not steady state.
         read = [one for one in requests if not (planned.steady_state and one.traffic is Traffic.WARM_UP)]
         sampled = _admitted(read, record)
+        drained = sum(one.sent_ms > record.admissions_ended_ms for one in read)
         # The steady sends are the driver's steady-state lag; every send is held to the tolerance too.
         lag = _lag(read)
         engine = _engine(evidence, read, plan, usd_per_host_hour)
@@ -680,7 +684,7 @@ def _cell(planned: PlannedCell, evidence: CellEvidence | None, plan: Plan, usd_p
         floors=floors,
         observed_misses=observed_misses,
         warm_up_requests=len(requests) - len(read),
-        sent_in_drain_requests=len(read) - len(sampled),
+        sent_in_drain_requests=drained,
         ttft_samples_min=ttft_min,
         stream_samples_min=stream_min,
         driver_lag_p95_ms=lag,
