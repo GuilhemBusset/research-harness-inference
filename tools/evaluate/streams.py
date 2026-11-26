@@ -355,6 +355,8 @@ class StreamReader:
         else:
             outcome = RequestOutcome.TRUNCATED_STREAM
         usage = _reported(self._route, self._usage)
+        # A chunk of usage that `[DONE]` never followed was not shown to be the last.
+        self._counted = self._counted and not self._closing
         self._attempt = Attempt(
             route=self._route,
             retry=self._retry,
