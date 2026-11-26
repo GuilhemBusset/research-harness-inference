@@ -35,6 +35,7 @@ RUNBOOKS = [
     "park-and-unpark.md",
     "image-and-engine-upgrade.md",
     "course-end.md",
+    "agent-session-evaluation.md",
 ]
 SECTIONS = ["when", "check", "act", "verify"]
 SHELLS = {"sh", "bash", "shell", "console"}  # a fence's info string, or none, that marks commands
