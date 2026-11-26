@@ -35,7 +35,8 @@ workspace of its own on this host. `Workers.start` makes it from a `Spec`:
   has no way out at all.
 - *Bounded output.* What a command prints is kept up to the output cap (the transcript), and the
   output folder cannot hold more than the cap. `collect` reads the folder back as one archive,
-  bounded again, and unpacks its files and folders into the workspace.
+  bounded again, and unpacks its files and folders into the workspace; it reads another folder,
+  such as the working folder a task writes its files in, when it is named.
 
 **The lifecycle** is `Workers`, a context manager that owns every worker of a run:
 
@@ -227,13 +228,13 @@ while True:
         time.sleep(0.1)
 """
 
-# The output folder as one archive on standard output.
-_PACK = f"""\
+# A folder of the worker, its one argument, as one archive on standard output.
+_PACK = """\
 import sys
 import tarfile
 
 with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
-    archive.add({OUTPUT!r}, arcname=".")
+    archive.add(sys.argv[1], arcname=".")
 """
 
 
@@ -644,19 +645,20 @@ class Worker:
             self.stop()
         return Ran(done.exit_code, done.exit_code is None, done.truncated, self.transcript)
 
-    def collect(self) -> Path:
-        """What the worker left in its output folder, unpacked into a new folder of the workspace:
-        files and folders only. OverCap when it does not fit the output cap."""
+    def collect(self, folder: str = OUTPUT) -> Path:
+        """What the worker left in `folder`, its output folder unless another is named (the
+        working folder, where a task writes its files), unpacked into a new folder of the
+        workspace: files and folders only. OverCap when it does not fit the output cap."""
         archive = self.workspace / "output.tar"
-        folder = self.workspace / "output"
+        unpacked = self.workspace / "output"
         archive.unlink(missing_ok=True)
-        if folder.exists():
-            shutil.rmtree(folder)
+        if unpacked.exists():
+            shutil.rmtree(unpacked)
         # A file takes at least a block of the folder and a header of the archive: an archive of
         # a folder within its cap is well below twice the cap, unless it is made of empty entries.
         limit = 2 * self.spec.limits.output_bytes + _MEBIBYTE
         done = self._runtime.stream(
-            ["exec", self.name, *_PYTHON, _PACK], sink=archive, limit=limit, seconds=COLLECT_SECONDS
+            ["exec", self.name, *_PYTHON, _PACK, folder], sink=archive, limit=limit, seconds=COLLECT_SECONDS
         )
         try:
             if done.truncated:
@@ -664,18 +666,18 @@ class Worker:
             if done.exit_code != 0:
                 head = archive.read_bytes()[:2000].decode("utf-8", "replace")
                 raise WorkerFault(f"the output of {self.name} could not be read ({done.exit_code}):\n{head}")
-            folder.mkdir()
+            unpacked.mkdir()
             try:
                 with tarfile.open(archive) as packed:
                     members = [member for member in packed if member.isfile() or member.isdir()]
                     if sum(member.size for member in members) > self.spec.limits.output_bytes:
                         raise OverCap(f"the output of {self.name} does not fit its cap")
-                    packed.extractall(folder, members=members, filter="data")
+                    packed.extractall(unpacked, members=members, filter="data")
             except tarfile.TarError as error:
                 raise WorkerFault(f"the output of {self.name} is not an archive") from error
         finally:
             archive.unlink(missing_ok=True)
-        return folder
+        return unpacked
 
     def stop(self) -> None:
         """Ends the worker: its container is removed by force, which kills every process in it,

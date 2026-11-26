@@ -5,7 +5,8 @@ and the grader").
 `run` takes the live cells of a `plan.Plan` in the plan's order and, in each, its planned trials
 one after the other. Each attempt is a fresh agent on its harness (`Harnesses.attempt`), graded
 after it ended by the independent grader of its task's family (`Grader`), outside the trial: the
-grader reads what the attempt left and never runs in its worker.
+grader reads what the attempt left and never runs in its worker. The program a debugging attempt
+submitted is run again by its grader, in a fresh worker of its own (`Work.execute`).
 
 **One live seat.** The live trial is always student 0, with the cohort's first key: the seat a
 live cell reserves (`replay.reserved_seats`). Its background is `replay.run_cell` on the same cell,
@@ -15,16 +16,20 @@ cell's shape (one conversation a seat in hands-on, two in several-agents). A low
 replay slot and sends nothing beside its trial. With one seat the plan has only low-load cells, each
 carrying both loads (`plan.expand`): each of them is run once here, and its trials count for both.
 
-**The background outlasts each trial.** The cell starts before its first attempt (`run_cell`'s
-`started`, its record's start), keeps sending while each attempt runs, and is told the live work
-has finished only once the cell's last attempt has ended and been graded; it then drains and is
-awaited. Each trial therefore lies inside its cell's record, which `quality.read` requires: a cell
-is measured by one record. Whatever ends the run, an error or the cancellation of its task, the
-background is cancelled and awaited before `run` returns or raises: no background request is left.
+**Each attempt has its background.** The background of an attempt starts before it (`run_cell`'s
+`started`), keeps sending while the attempt runs, and is told the live work has finished only once
+the attempt has ended; it then drains and is awaited, before the attempt is graded and before the
+next one starts: no request of one attempt's background is open in the next. A cell's record
+(`Background.record`) spans the backgrounds of its attempts, so that each trial lies inside it, as
+`quality.read` requires. A background that breaks (its driver raises) stops the attempt it loads at
+once: the attempt is invalid, `driver_error`, and its cell incomplete; so is an attempt whose task
+could not be prepared. Whatever ends the run, an error or the cancellation of its task, the
+background is cancelled and awaited before `run` returns or raises.
 
 **Cancellation.** `cancel` stops everything at once: the background sends nothing more and cuts its
 streams (`Stops.cancel`), the attempt under way is told to stop and is recorded invalid,
-`interrupted`, and no further attempt is started. Cancelling the task that runs `run` does the same.
+`interrupted`, and no further attempt is started. Cancelling the task that runs `run` does the same,
+and it returns only once the attempt's worker is disposed of.
 
 **What an attempt counts as** is the contract's (`forwarding.Evidence.trial_record`):
 
@@ -39,17 +44,20 @@ streams (`Stops.cancel`), the attempt under way is told to stop and is recorded 
 Every attempt is kept (`Executed`), with what the contract's record holds (outcome and reason,
 turns across the agent tree, retries, usage, and the attempt's start and end on the run's clock:
 its whole duration, tool waits included) and what it does not: the loads it counts for, its peak
-fan-out and its side calls. The **fan-out** is the most requests of the live seat that were in
-flight at the gateway at once during the attempt (`peak_fan_out`), read from the forwarder's
-measurements; the delegation the harness reported is kept beside it for the grader, and is no
-count of concurrency.
+fan-out, its side calls and its background. The **fan-out** is the most requests of the live seat
+that were in flight at the gateway at once during the attempt (`peak_fan_out`), read from the
+forwarder's measurements; the delegation the harness reported is kept beside it for the grader,
+and is no count of concurrency.
 
 **Release.** An attempt's worker, its forwarder and its workspace belong to the attempt
 (`Harnesses.attempt` is a context manager): they are released when the attempt has been graded,
 before the next one starts, also when grading or the run fails. `WorkerHarnesses` is the harness
 runner of a real run: a fresh worker (`workers.Workers.start`) and a forwarder of its own
 (`forwarding.Forwarder`, the plan's limits) for each attempt, the harness driven by its
-`adapters.Adapter`, and the attempt's ending read by `Ending.evidence`.
+`adapters.Adapter`, the attempt's ending read by `Ending.evidence`, and what the task wrote
+collected from where it writes it (`Task.artifacts`). The plan's wall time governs the whole
+attempt, the worker's start and its tool waits included: once it has passed, the worker is stopped
+wherever it is and the attempt has timed out.
 
 What is recorded is ordinals, times on the run's clock, counts and labels: no key, no host.
 """
@@ -58,40 +66,61 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import shutil
 import tempfile
+import threading
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from common import percentile
 from evaluate import replay, workers
 from evaluate.adapters import Adapter
-from evaluate.contracts import LIVE_PHASES, CellStatus, Family, Grade, InvalidReason, TrialIdentity, TrialOutcome
-from evaluate.course import analysis, optimization, research
+from evaluate.contracts import (
+    LIVE_PHASES,
+    CellRecord,
+    CellStatus,
+    Family,
+    Grade,
+    InvalidFlag,
+    InvalidReason,
+    TrialIdentity,
+    TrialOutcome,
+    TrialRecord,
+)
+from evaluate.course import analysis, optimization, research, revision
 from evaluate.forwarding import CANCEL_S, Budget, Forwarder
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Mapping, Sequence
+    from collections.abc import AsyncGenerator, Awaitable, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
 
     from evaluate.adapters import Delegation
-    from evaluate.contracts import HarnessAssignment, TrialRecord
+    from evaluate.contracts import HarnessAssignment, RequestRecord
     from evaluate.forwarding import Evidence
     from evaluate.plan import Plan, PlannedCell, Role
 
 # The student a live trial runs as: the seat `replay.reserved_seats` keeps, the first.
 LIVE_STUDENT = 0
 
+type Execute = Callable[[Path, Sequence[str]], Path | None]
+"""Runs one command in a fresh worker, with no way out, given the files of a folder, and gives
+what it left in its output folder; `None` when the command did not end within the worker's wall
+time or left more than its cap. WorkerFault when the worker could not run it."""
+
 
 @dataclass(frozen=True)
 class Work:
     """What an attempt left for its grader: the trial's evidence (`forwarding.Evidence`), the
-    folder of what it produced, and the delegation its harness reported, if it read one."""
+    folder of what it produced, the delegation its harness reported, if it read one, and how a
+    program it submitted is run again, where the runner can."""
 
     evidence: Evidence
     artifacts: Path
     delegation: Delegation | None = None
+    execute: Execute | None = None
 
 
 class Harnesses(Protocol):
@@ -112,13 +141,16 @@ grade, and the attempt is invalid."""
 def peak_fan_out(evidence: Evidence) -> int:
     """The most of the trial's requests that were in flight at the gateway at once: those that the
     forwarder sent on, each from its dispatch to its end. A request that ends when the next starts
-    does not overlap it."""
-    edges = sorted(
-        [(one.attempt.sent_ms, 1) for one in evidence.requests]
-        + [(one.attempt.ended_ms, -1) for one in evidence.requests]
-    )
+    does not overlap it; one whose end the clock does not tell from its dispatch was in flight."""
+    edges = []
+    for one in evidence.requests:
+        sent, ended = one.attempt.sent_ms, one.attempt.ended_ms
+        edges.append((sent, 1, 1))
+        # At one instant, what ended before it is let go first, then what starts, then what
+        # started and ended within it.
+        edges.append((ended, 0, -1) if ended > sent else (sent, 2, -1))
     peak = held = 0
-    for _at, change in edges:
+    for _at, _order, change in sorted(edges):
         held += change
         peak = max(peak, held)
     return peak
@@ -126,13 +158,15 @@ def peak_fan_out(evidence: Evidence) -> int:
 
 @dataclass(frozen=True)
 class Executed:
-    """One attempt as it was recorded: the contract's record, and what the record does not hold."""
+    """One attempt as it was recorded: the contract's record, and what the record does not hold.
+    `background` is the replay that loaded it; `None` when its driver broke, or never started."""
 
     record: TrialRecord
     loads: tuple[Role, ...]
     peak_fan_out: int
     side_calls: int
     delegation: Delegation | None
+    background: replay.CellRun | None
 
     @property
     def duration_ms(self) -> int:
@@ -146,12 +180,62 @@ class Executed:
 
 
 @dataclass(frozen=True)
+class Background:
+    """A live cell's background over its attempts: each attempt's replay, every request they sent
+    in order, and the cell's one record, which spans them (`None` when none ran)."""
+
+    runs: tuple[replay.CellRun, ...]
+    requests: tuple[RequestRecord, ...]
+    record: CellRecord | None
+
+
+def _cell_record(cell: int, runs: Sequence[replay.CellRun], *, whole: bool) -> CellRecord | None:
+    """The record of a cell whose attempts each had a run: from the first's start to the last's
+    end, its conversations summed, its flags joined and its driver's lag read over every request.
+    Incomplete unless `whole`: every planned attempt ran, each with its background."""
+    if not runs:
+        return None
+    records = [one.record for one in runs]
+    lags = [request.sent_ms - request.eligible_ms for one in runs for request in one.requests]
+    lag = percentile(lags, 95) if lags else None
+    flags = {flag for record in records for flag in record.invalid_flags}
+    if lag is not None and lag > runs[0].summary.lag_tolerance_ms:
+        flags.add(InvalidFlag.DRIVER_SATURATION)
+    complete = whole and all(record.status is CellStatus.COMPLETE for record in records)
+    return CellRecord(
+        cell=cell,
+        started_ms=records[0].started_ms,
+        admissions_ended_ms=records[-1].admissions_ended_ms,
+        ended_ms=records[-1].ended_ms,
+        status=CellStatus.COMPLETE if complete else CellStatus.INCOMPLETE,
+        invalid_flags=tuple(sorted(flags)),
+        conversations_planned=sum(record.conversations_planned for record in records),
+        conversations_started=sum(record.conversations_started for record in records),
+        conversations_completed=sum(record.conversations_completed for record in records),
+        conversations_abandoned=sum(record.conversations_abandoned for record in records),
+        hosts_observed=None,
+        driver_lag_p95_ms=lag,
+    )
+
+
+@dataclass(frozen=True)
 class CellRan:
-    """A live cell: its background (`replay.CellRun`, with nothing sent at low load) and its attempts."""
+    """A live cell: its attempts, in order, each with its background."""
 
     cell: PlannedCell
-    background: replay.CellRun
     trials: tuple[Executed, ...]
+
+    @property
+    def whole(self) -> bool:
+        """Whether every planned attempt ran, each loaded by its background to its end."""
+        ran = len(self.trials) == len(self.cell.trials)
+        return ran and all(one.background is not None for one in self.trials)
+
+    @property
+    def background(self) -> Background:
+        runs = tuple(one.background for one in self.trials if one.background is not None)
+        requests = tuple(request for one in runs for request in one.requests)
+        return Background(runs, requests, _cell_record(self.cell.identity.cell, runs, whole=self.whole))
 
     @property
     def background_students(self) -> frozenset[int]:
@@ -160,11 +244,12 @@ class CellRan:
 
     @property
     def complete(self) -> bool:
-        """Whether every planned trial of the cell has an attempt that counts, and the cell was not
-        stopped: an invalid attempt leaves it incomplete until it is replaced."""
+        """Whether every planned trial of the cell has an attempt that counts, each with its whole
+        background: an invalid attempt leaves it incomplete until it is replaced."""
         counted = {one.record.trial for one in self.trials if one.record.counts_as_attempt}
-        stopped = self.background.record.status is CellStatus.INCOMPLETE
-        return not stopped and counted == set(self.cell.trials)
+        record = self.background.record
+        loaded = record is not None and record.status is CellStatus.COMPLETE
+        return loaded and counted == set(self.cell.trials)
 
 
 @dataclass(frozen=True)
@@ -207,6 +292,32 @@ def live_cells(plan: Plan) -> tuple[int, ...]:
     return tuple(cell.identity.cell for cell in plan.cells if cell.identity.phase in LIVE_PHASES)
 
 
+async def _settled[Result](awaitable: Awaitable[Result]) -> Result:
+    """Awaits `awaitable` to its end, also when the task waiting for it is cancelled meanwhile: the
+    cancellation is raised once it has ended."""
+    future = asyncio.ensure_future(awaitable)
+    interrupted = False
+    while not future.done():
+        try:
+            await asyncio.wait({future})
+        except asyncio.CancelledError:
+            interrupted = True
+    if interrupted:
+        raise asyncio.CancelledError
+    return future.result()
+
+
+async def _first(*awaitables: Awaitable[object]) -> None:
+    """Waits until one of them has ended; the others that are left are cancelled and awaited."""
+    futures = [asyncio.ensure_future(one) for one in awaitables]
+    try:
+        await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for one in futures:
+            one.cancel()
+        await _settled(asyncio.gather(*futures, return_exceptions=True))
+
+
 class _Runner:
     def __init__(
         self,
@@ -225,48 +336,70 @@ class _Runner:
 
     async def cell(self, cell: int) -> CellRan:
         planned = self.plan.cells[cell]
-        finished, started = asyncio.Event(), asyncio.Event()
-        stops = replay.Stops(finished=finished, cancel=self.cancel)
+        executed: list[Executed] = []
+        for trial in planned.trials:
+            if self.cancel.is_set():
+                break
+            executed.append(await self.attempt(planned, self.plan.workload.trials[trial]))
+        return CellRan(planned, tuple(executed))
+
+    async def attempt(self, cell: PlannedCell, trial: TrialIdentity) -> Executed:
+        """One attempt in its own background: started before it, sending until it has ended,
+        drained before it is graded."""
+        finished, started, stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
         background = asyncio.ensure_future(
             replay.run_cell(
                 self.plan,
-                cell,
+                cell.identity.cell,
                 self.gateway,
                 self.keys,
-                stops=stops,
+                stops=replay.Stops(finished=finished, cancel=self.cancel),
                 first_request=self.request,
                 evidence=self.evidence,
                 started=started,
             )
         )
-        executed: list[Executed] = []
+        # The attempt stops at once when the run is cancelled or its background ends before it.
+        watch = asyncio.ensure_future(self._watch(background, stop))
         try:
-            waiting = asyncio.ensure_future(started.wait())
-            try:
-                await asyncio.wait({waiting, background}, return_when=asyncio.FIRST_COMPLETED)
-            finally:
-                waiting.cancel()
+            await _first(started.wait(), asyncio.shield(background))
             if not started.is_set():
-                # The cell was refused before it started: its error is raised.
-                background.result()
-            for trial in planned.trials:
-                if self.cancel.is_set():
-                    break
-                executed.append(await self.attempt(self.plan.workload.trials[trial]))
-            # Only now does the background learn that the live work has ended.
-            finished.set()
-            ran = await background
+                return self._unstarted(trial)
+            return await self._attempted(trial, background, finished, stop)
         finally:
+            watch.cancel()
             background.cancel()
-            await asyncio.gather(background, return_exceptions=True)
-        self.request += len(ran.requests)
-        return CellRan(planned, ran, tuple(executed))
+            await _settled(asyncio.gather(watch, background, return_exceptions=True))
 
-    async def attempt(self, trial: TrialIdentity) -> Executed:
-        async with self.harnesses.attempt(trial, self.keys[LIVE_STUDENT], self.cancel) as work:
+    async def _watch(self, background: asyncio.Future[replay.CellRun], stop: asyncio.Event) -> None:
+        await _first(asyncio.shield(background), self.cancel.wait())
+        stop.set()
+
+    async def _attempted(
+        self,
+        trial: TrialIdentity,
+        background: asyncio.Future[replay.CellRun],
+        finished: asyncio.Event,
+        stop: asyncio.Event,
+    ) -> Executed:
+        async with self.harnesses.attempt(trial, self.keys[LIVE_STUDENT], stop) as work:
+            # The trial has ended: only now does its background learn it, and drain.
+            finished.set()
+            ran: replay.CellRun | None = None
+            try:
+                ran = await background
+            except Exception:  # noqa: BLE001 - a background that broke makes the attempt it loaded invalid
+                ran = None
             evidence = work.evidence
-            if self.cancel.is_set() and evidence.invalid is None:
-                evidence = replace(evidence, invalid=InvalidReason.INTERRUPTED)
+            reason = (
+                InvalidReason.DRIVER_ERROR
+                if ran is None
+                else InvalidReason.INTERRUPTED
+                if self.cancel.is_set()
+                else None
+            )
+            if reason is not None and evidence.invalid is None:
+                evidence = replace(evidence, invalid=reason)
             grade = None
             if evidence.may_pass:
                 try:
@@ -277,13 +410,37 @@ class _Runner:
                 execution=self.execution, trial=trial.trial, student=LIVE_STUDENT, grade=grade
             )
         self.execution += 1
+        if ran is not None:
+            self.request += len(ran.requests)
         return Executed(
             record=record,
             loads=self.plan.loads_of(trial),
             peak_fan_out=peak_fan_out(evidence),
             side_calls=evidence.side_calls,
             delegation=work.delegation,
+            background=ran,
         )
+
+    def _unstarted(self, trial: TrialIdentity) -> Executed:
+        """An attempt whose background broke before it started: no harness was run."""
+        now = self.gateway.clock.now_ms()
+        record = TrialRecord(
+            execution=self.execution,
+            trial=trial.trial,
+            replaces=None,
+            student=LIVE_STUDENT,
+            started_ms=now,
+            ended_ms=now,
+            outcome=TrialOutcome.INVALID,
+            failure=None,
+            invalid=InvalidReason.INTERRUPTED if self.cancel.is_set() else InvalidReason.DRIVER_ERROR,
+            grade=None,
+            model_turns=0,
+            retries=0,
+            usage=None,
+        )
+        self.execution += 1
+        return Executed(record, self.plan.loads_of(trial), 0, 0, None, None)
 
 
 async def run(
@@ -335,24 +492,51 @@ async def run(
 
 # --- The graders of the course ---------------------------------------------------------------
 
+# Where the debugging grader puts the cases beside the submitted program, in a fresh worker.
+GRADING_CASES = "grading-cases"
+
+
+def _graded(properties: tuple[bool, ...]) -> Grade:
+    return Grade(properties=properties, within_limits=True)
+
+
+def _debugging(trial: TrialIdentity, work: Work) -> Grade:
+    """The submitted program, run on each sealed case of its instance in a fresh worker, and what
+    it wrote there graded against the cases (`course.revision`)."""
+    if work.execute is None:
+        raise RuntimeError("the submitted program is run in a fresh worker, and the runner gave none")
+    with tempfile.TemporaryDirectory() as scratch:
+        submitted, outputs = Path(scratch) / "submitted", Path(scratch) / "outputs"
+        shutil.copytree(work.artifacts, submitted, symlinks=True)
+        cases = submitted / GRADING_CASES
+        if cases.is_dir() and not cases.is_symlink():
+            shutil.rmtree(cases)
+        else:
+            cases.unlink(missing_ok=True)
+        outputs.mkdir()
+        for name in revision.write_inputs(trial.instance_id, cases):
+            command = revision.command(f"{GRADING_CASES}/{name}.json", f"{workers.OUTPUT}/{name}.json")
+            produced = work.execute(submitted, command)
+            written = None if produced is None else produced / f"{name}.json"
+            if written is not None and written.is_file() and not written.is_symlink():
+                shutil.copyfile(written, outputs / f"{name}.json")
+        return _graded(revision.grade(trial.instance_id, outputs).properties)
+
 
 def course_graders() -> dict[Family, Grader]:
-    """The course's graders that read what an attempt left in its output folder: optimization,
-    parallel analysis (with the delegation its harness reported) and grounded research. A grade is
-    asked for only of an attempt within its limits. The debugging family's grader reads what its
-    submitted program writes when it is run again in a fresh worker, which its caller does."""
-
-    def graded(properties: tuple[bool, ...]) -> Grade:
-        return Grade(properties=properties, within_limits=True)
-
+    """The course's graders, one for each family: optimization, parallel analysis (with the
+    delegation its harness reported) and grounded research read what an attempt wrote; debugging
+    runs the program it submitted on its cases, in a fresh worker (`Work.execute`), and reads what
+    that wrote. A grade is asked for only of an attempt within its limits."""
     return {
-        Family.OPTIMIZATION: lambda trial, work: graded(
+        Family.OPTIMIZATION: lambda trial, work: _graded(
             optimization.grade(trial.instance_id, work.artifacts).properties
         ),
-        Family.ANALYSIS: lambda trial, work: graded(
+        Family.DEBUGGING: _debugging,
+        Family.ANALYSIS: lambda trial, work: _graded(
             analysis.grade(trial.instance_id, work.artifacts, work.delegation).properties
         ),
-        Family.RESEARCH: lambda trial, work: graded(research.grade(trial.instance_id, work.artifacts).properties),
+        Family.RESEARCH: lambda trial, work: _graded(research.grade(trial.instance_id, work.artifacts).properties),
     }
 
 
@@ -366,7 +550,7 @@ class TrialWorker(Protocol):
 
     def run(self, command: Sequence[str]) -> workers.Ran: ...
 
-    def collect(self) -> Path: ...
+    def collect(self, folder: str = workers.OUTPUT) -> Path: ...
 
     def stop(self) -> None: ...
 
@@ -376,18 +560,53 @@ class TrialWorker(Protocol):
 @dataclass(frozen=True)
 class Task:
     """What a trial is given: the folder of its task's files, its prompts in order (the first, then
-    each follow-up), and its local tools by name."""
+    each follow-up), its local tools by name, and the folder of the worker its task writes its
+    files in, which its grader reads: the working folder, where every task of the course writes."""
 
     inputs: Path
     prompts: tuple[str, ...]
     tools: Mapping[str, Path] = field(default_factory=dict)
+    artifacts: str = workers.WORK
+
+
+class _Held:
+    """The workers of one attempt, and whether it is being stopped: a worker that is started once
+    it is is stopped at once, and runs nothing."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._workers: list[TrialWorker] = []
+        self.stopping = False
+
+    def take(self, worker: TrialWorker) -> bool:
+        """Records a started worker; whether it may run anything."""
+        with self._lock:
+            self._workers.append(worker)
+            return not self.stopping
+
+    def stop(self, forwarder: Forwarder) -> None:
+        """Stops the attempt: its way out is closed and every worker of it ended."""
+        forwarder.abort()
+        with self._lock:
+            self.stopping = True
+            started = list(self._workers)
+        for worker in started:
+            with contextlib.suppress(workers.WorkerFault):
+                worker.stop()
+
+    def discard(self) -> list[str]:
+        """Disposes of every worker of the attempt; what is left."""
+        with self._lock:
+            started = list(self._workers)
+        return [thing for worker in started for thing in worker.discard()]
 
 
 class WorkerHarnesses:
     """The harnesses of a real run. Each attempt has a fresh worker (`start`, such as
     `workers.Workers.start`) of `image` under `limits`, and a forwarder of its own to the gateway
     at `upstream`, on the pool `pool`, holding the student's key and the plan's limits on `clock`,
-    the run's. `tasks` gives what a trial is given."""
+    the run's: the machine's (`replay.RunClock`), which the attempt's deadline is waited on. `tasks`
+    gives what a trial is given."""
 
     def __init__(
         self,
@@ -415,46 +634,50 @@ class WorkerHarnesses:
 
     @contextlib.asynccontextmanager
     async def attempt(self, trial: TrialIdentity, key: str, cancel: asyncio.Event) -> AsyncGenerator[Work]:
-        assignment, task = self.assignment(trial), self.tasks(trial)
         budget = Budget(self.plan.workload.limits, self.clock)
         forwarder = Forwarder(self.upstream, pool=self.pool, key=key, harness=trial.harness, budget=budget)
-        held: list[TrialWorker] = []
+        held = _Held()
+        ran: asyncio.Future[Work] | None = None
         with forwarder, tempfile.TemporaryDirectory() as nothing:
-            ran = asyncio.ensure_future(asyncio.to_thread(self._run, assignment, task, forwarder, held, Path(nothing)))
-            stopped = asyncio.ensure_future(cancel.wait())
             try:
-                await asyncio.wait({ran, stopped}, return_when=asyncio.FIRST_COMPLETED)
-                if not ran.done():
-                    await self._stop(forwarder, held)
-                yield await asyncio.shield(ran)
+                try:
+                    assignment, task = self.assignment(trial), self.tasks(trial)
+                except Exception:  # noqa: BLE001 - a task that cannot be prepared is the driver's error
+                    forwarder.abort()
+                    work = Work(forwarder.evidence(invalid=InvalidReason.DRIVER_ERROR), Path(nothing))
+                else:
+                    ran = asyncio.ensure_future(
+                        asyncio.to_thread(self._run, assignment, task, forwarder, held, Path(nothing))
+                    )
+                    await _first(asyncio.shield(ran), cancel.wait(), self._deadline(budget))
+                    if not ran.done():
+                        await _settled(asyncio.to_thread(held.stop, forwarder))
+                    work = await _settled(ran)
+                yield replace(work, execute=lambda inputs, command: self._execute(held, inputs, command))
             finally:
-                stopped.cancel()
-                if not ran.done():
-                    await self._stop(forwarder, held)
-                    await asyncio.wait({ran})
-                left = [thing for worker in held for thing in await asyncio.to_thread(worker.discard)]
+                if ran is not None and not ran.done():
+                    await _settled(asyncio.to_thread(held.stop, forwarder))
+                    await _settled(asyncio.wait({ran}))
+                left = await _settled(asyncio.to_thread(held.discard))
                 if left:
                     error = workers.Undisposed("an attempt left something behind")
                     for thing in left:
                         error.add_note(f"not removed: {thing}")
                     raise error
 
-    @staticmethod
-    async def _stop(forwarder: Forwarder, held: Sequence[TrialWorker]) -> None:
-        """Stops an attempt under way: its way out is closed and its worker ended."""
-        forwarder.abort()
-        for worker in held:
-            with contextlib.suppress(workers.WorkerFault):
-                await asyncio.to_thread(worker.stop)
+    async def _deadline(self, budget: Budget) -> None:
+        """Until the trial's wall time has passed on the run's clock."""
+        while (left := budget.deadline_ms - self.clock()) > 0:
+            await asyncio.sleep((left + 1) / 1000)
 
-    def _run(
-        self,
-        assignment: HarnessAssignment,
-        task: Task,
-        forwarder: Forwarder,
-        held: list[TrialWorker],
-        nothing: Path,
-    ) -> Work:
+    def _stopped(self, forwarder: Forwarder) -> Evidence:
+        """The evidence of an attempt stopped before its harness ran: timed out when its wall time
+        had passed, interrupted otherwise."""
+        forwarder.abort()
+        timed_out = forwarder.budget.failure is not None
+        return forwarder.evidence(invalid=None if timed_out else InvalidReason.INTERRUPTED)
+
+    def _run(self, assignment: HarnessAssignment, task: Task, forwarder: Forwarder, held: _Held, nothing: Path) -> Work:
         """One attempt, in a thread: the worker, the harness's prompts, then what it produced."""
         address = urllib.parse.urlsplit(forwarder.url)
         spec = workers.Spec(
@@ -469,17 +692,24 @@ class WorkerHarnesses:
         except (workers.WorkerFault, workers.Refused, OSError):
             forwarder.abort()
             return Work(forwarder.evidence(invalid=InvalidReason.DRIVER_ERROR), nothing)
-        held.append(worker)
+        if not held.take(worker):
+            # Stopped while it was starting: it is ended, and the harness never launched.
+            with contextlib.suppress(workers.WorkerFault):
+                worker.stop()
+            return Work(self._stopped(forwarder), nothing)
         adapter = Adapter(assignment, model=self.pool, tools=tuple(task.tools))
         trial = adapter.trial(worker, task.prompts, turns=lambda: forwarder.budget.model_turns)
         # The trial is over: nothing more is admitted, and what is in flight is settled.
         forwarder.abort()
         forwarder.drained(CANCEL_S)
         evidence = trial.ending.evidence(forwarder)
+        if held.stopping and evidence.may_pass:
+            # Stopped from outside before it was over: what it left is not graded.
+            evidence = replace(evidence, invalid=InvalidReason.INTERRUPTED)
         artifacts = nothing
         try:
             if evidence.may_pass:
-                artifacts = worker.collect()
+                artifacts = worker.collect(task.artifacts)
             worker.stop()
         except workers.OverCap:
             # What it left does not fit the cap: none of it is kept, and the grader finds nothing.
@@ -487,3 +717,19 @@ class WorkerHarnesses:
         except (workers.WorkerFault, OSError):
             evidence = replace(evidence, invalid=evidence.invalid or InvalidReason.DRIVER_ERROR)
         return Work(evidence, artifacts, trial.delegation)
+
+    def _execute(self, held: _Held, inputs: Path, command: Sequence[str]) -> Path | None:
+        """`Execute` for the grader of this attempt: a fresh worker with no way out, released with
+        the attempt."""
+        worker = self.start(workers.Spec(self.image, inputs, self.limits))
+        if not held.take(worker):
+            raise workers.WorkerFault("the attempt is being stopped")
+        ran = worker.run(command)
+        if ran.timed_out:
+            return None
+        try:
+            return worker.collect()
+        except workers.OverCap:
+            return None
+        finally:
+            worker.stop()

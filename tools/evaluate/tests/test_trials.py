@@ -15,8 +15,13 @@ import heapq
 import itertools
 import json
 import shutil
+import subprocess
+import sys
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -36,14 +41,13 @@ from evaluate.contracts import (
     TrialOutcome,
     Usage,
 )
-from evaluate.course import analysis, optimization, research
+from evaluate.course import analysis, optimization, research, revision
 from evaluate.forwarding import Evidence, Measurement
 from evaluate.streams import Attempt, Attempts
 from rhi_common.keys import generate_key
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Sequence
-    from pathlib import Path
 
     from evaluate.contracts import TrialIdentity
 
@@ -71,6 +75,16 @@ SPEC = replace(
 )
 CLASS = plan.expand(SPEC, Profile.QUALIFY, 8)
 ALONE = plan.expand(SPEC, Profile.QUALIFY, 1)
+# Two trials in each cell, one after the other.
+TWICE = plan.expand(
+    replace(
+        SPEC,
+        profiles=SPEC.profiles
+        | {Profile.QUALIFY: replace(PROFILE, instances_per_task=2, table=PROFILE.table | {"instances_per_task": 2})},
+    ),
+    Profile.QUALIFY,
+    8,
+)
 KEYS = [generate_key() for _ in range(CLASS.canary_identities)]
 START = 7_000
 ANSWER_MS = 1_000
@@ -275,13 +289,23 @@ def run(
     graders: dict[Family, trials.Grader] = GRADERS,
     cancel_at: int | None = None,
     task_cancelled_at: int | None = None,
+    breaks_at: int | None = None,
 ) -> tuple[trials.Run | None, Gateway, Harnesses]:
     """Runs those cells: what the run returned (`None` when its task was cancelled), what the
-    gateway saw and what the harnesses did."""
+    gateway saw and what the harnesses did. With `breaks_at`, the replay's driver raises once the
+    first background request has been open that long."""
     clock = Clock()
     pool = Gateway(clock, KEYS)
     harnesses = Harnesses(clock, tmp_path, acts or {})
-    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock, pool)
+    transport: httpx.AsyncBaseTransport = pool
+    if breaks_at is not None:
+
+        async def broken(request: httpx.Request) -> httpx.Response:
+            await clock.sleep_ms(breaks_at)
+            raise RuntimeError("the replay driver broke")
+
+        transport = httpx.MockTransport(broken)
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock, transport)
 
     async def work() -> trials.Run | None:
         cancel = asyncio.Event()
@@ -325,11 +349,13 @@ def test_a_hands_on_and_a_parallel_task_run_at_both_loads_with_one_live_seat(tmp
     for cell in ran.cells:
         (executed,) = cell.trials
         record = executed.record
-        background = cell.background
+        background = executed.background
+        assert background is not None
         assert record.student == trials.LIVE_STUDENT
-        # The trial lies inside its cell's record.
+        # The trial lies inside its background, and inside its cell's record.
         assert background.record.started_ms <= record.started_ms
         assert record.ended_ms <= background.record.admissions_ended_ms <= background.record.ended_ms
+        assert cell.background.record == background.record
         if cell.cell.identity.phase is Phase.LIVE_LOW_LOAD:
             assert executed.loads == (plan.Role.LOW_LOAD,)
             assert background.requests == ()
@@ -363,6 +389,27 @@ def test_a_hands_on_and_a_parallel_task_run_at_both_loads_with_one_live_seat(tmp
     assert (harnesses.most_open, harnesses.open, harnesses.released) == (1, 0, 4)
     assert list(tmp_path.iterdir()) == []
     assert sum(pool.open.values()) == 0
+
+
+def test_each_attempt_has_its_background_drained_before_the_next_starts(tmp_path: Path) -> None:
+    chosen = cells(TWICE, Family.OPTIMIZATION, Family.RESEARCH, phase=Phase.LIVE_CLASS_LOAD)
+    ran, _pool, _harnesses = run(TWICE, chosen, tmp_path)
+    assert ran is not None
+
+    for cell in ran.cells:
+        first, second = cell.trials
+        assert first.background is not None and second.background is not None
+        # The first attempt's background sent until it ended, and nothing of it is open after.
+        assert max(one.sent_ms for one in first.background.requests) >= first.record.ended_ms - 3 * ANSWER_MS
+        assert all(one.ended_ms <= second.record.started_ms for one in first.background.requests)
+        assert second.background.record.started_ms <= second.record.started_ms
+        assert {one.student for one in second.background.requests} == set(range(1, 8))
+        # The cell's one record spans both attempts.
+        record = cell.background.record
+        assert record is not None and record.valid_for_qualification
+        assert record.started_ms <= first.record.started_ms and second.record.ended_ms <= record.ended_ms
+        assert len(cell.background.requests) == len(first.background.requests) + len(second.background.requests)
+    assert (ran.attempts, ran.incomplete) == (2 * len(chosen), ())
 
 
 def test_with_one_seat_each_trial_runs_once_and_counts_for_both_loads(tmp_path: Path) -> None:
@@ -414,6 +461,20 @@ def test_a_broken_grader_leaves_the_attempt_invalid_and_its_cell_incomplete(tmp_
     assert harnesses.released == 1
 
 
+def test_a_broken_replay_stops_the_attempt_it_loads_and_leaves_it_invalid(tmp_path: Path) -> None:
+    chosen = cells(CLASS, Family.OPTIMIZATION, phase=Phase.LIVE_CLASS_LOAD)
+    ran, _pool, harnesses = run(CLASS, chosen, tmp_path, breaks_at=1_000)
+    assert ran is not None
+
+    (executed,) = ran.executed
+    assert (executed.record.outcome, executed.record.invalid) == (TrialOutcome.INVALID, InvalidReason.DRIVER_ERROR)
+    assert executed.background is None
+    # The live task did not go on alone.
+    assert executed.duration_ms < TRIAL_MS
+    assert (ran.attempts, ran.incomplete) == (0, tuple(chosen))
+    assert (harnesses.open, harnesses.released) == (0, 1)
+
+
 @pytest.mark.parametrize("how", ["event", "task"])
 def test_cancellation_stops_all_background_work_and_releases_the_attempt(how: str, tmp_path: Path) -> None:
     chosen = cells(CLASS, Family.OPTIMIZATION, Family.ANALYSIS, phase=Phase.LIVE_CLASS_LOAD)
@@ -432,11 +493,12 @@ def test_cancellation_stops_all_background_work_and_releases_the_attempt(how: st
     assert list(tmp_path.iterdir()) == []
     if ran is not None:
         (cell,) = ran.cells
-        (record,) = ran.records
+        (executed,) = cell.trials
         assert ran.cancelled
-        assert (record.outcome, record.invalid) == (TrialOutcome.INVALID, InvalidReason.INTERRUPTED)
+        assert (executed.record.outcome, executed.record.invalid) == (TrialOutcome.INVALID, InvalidReason.INTERRUPTED)
         assert ran.incomplete == (cell.cell.identity.cell,)
-        assert cell.background.summary.stopped_by is replay.Stop.CANCELLED
+        assert executed.background is not None
+        assert executed.background.summary.stopped_by is replay.Stop.CANCELLED
 
 
 def test_peak_fan_out_is_requests_in_flight_at_once() -> None:
@@ -446,11 +508,18 @@ def test_peak_fan_out_is_requests_in_flight_at_once() -> None:
     assert peak((0, 10), (10, 20)) == 1
     assert peak((0, 10), (5, 15), (6, 7)) == 3
     assert peak((0, 10), (5, 15), (12, 20)) == 2
+    # A request the clock saw end in the millisecond it was sent was still in flight.
+    assert peak((0, 0)) == 1
+    assert peak((0, 10), (10, 10)) == 1
+    assert peak((0, 10), (5, 5)) == 2
+
+
+# --- The harnesses of a real run -------------------------------------------------------------
 
 
 @dataclass
 class Worker:
-    """A worker double: the harness's command leaves an answer in its output folder."""
+    """A worker double: the harness's command leaves an answer in its working folder."""
 
     workspace: Path
     commands: list[list[str]] = field(default_factory=list)
@@ -462,12 +531,14 @@ class Worker:
 
     def run(self, command: Sequence[str]) -> workers.Ran:
         self.commands.append(list(command))
-        (self.workspace / "output").mkdir(exist_ok=True)
-        (self.workspace / "output" / "answer.txt").write_text("right", encoding="utf-8")
+        (self.workspace / "work").mkdir(exist_ok=True)
+        (self.workspace / "work" / "answer.txt").write_text("right", encoding="utf-8")
         return workers.Ran(0, False, False, self.transcript)
 
-    def collect(self) -> Path:
-        return self.workspace / "output"
+    def collect(self, folder: str = workers.OUTPUT) -> Path:
+        collected = self.workspace / Path(folder).name
+        collected.mkdir(exist_ok=True)
+        return collected
 
     def stop(self) -> None:
         pass
@@ -476,6 +547,37 @@ class Worker:
         shutil.rmtree(self.workspace)
         self.discarded = True
         return []
+
+
+LIMITS = workers.Limits(60, 2**30, 1000, 64, 2**20, 2**20)
+
+
+def worker_harnesses(
+    planned: plan.Plan,
+    start: Callable[[workers.Spec], trials.TrialWorker],
+    tasks: Callable[[TrialIdentity], trials.Task],
+    clock: replay.RunClock,
+    *,
+    image: str = "trial-image",
+    limits: workers.Limits = LIMITS,
+) -> trials.WorkerHarnesses:
+    return trials.WorkerHarnesses(
+        planned,
+        upstream="https://gateway.example.com",
+        pool="coursework",
+        image=image,
+        limits=limits,
+        start=start,
+        tasks=tasks,
+        clock=clock.now_ms,
+    )
+
+
+def one_worker(tmp_path: Path, kind: type[Worker] = Worker) -> Worker:
+    worker = kind(tmp_path / "worker")
+    worker.workspace.mkdir()
+    worker.transcript.touch()
+    return worker
 
 
 def test_each_attempt_runs_its_harness_adapter_in_a_fresh_worker_released_after_grading(tmp_path: Path) -> None:
@@ -497,17 +599,7 @@ def test_each_attempt_runs_its_harness_adapter_in_a_fresh_worker_released_after_
     clock = replay.RunClock()
     inputs = tmp_path / "inputs"
     inputs.mkdir()
-    limits = workers.Limits(60, 2**30, 1000, 64, 2**20, 2**20)
-    harnesses = trials.WorkerHarnesses(
-        ALONE,
-        upstream="https://gateway.example.com",
-        pool="coursework",
-        image="trial-image",
-        limits=limits,
-        start=start,
-        tasks=lambda _trial: trials.Task(inputs, ("Do the task in TASK.md.",)),
-        clock=clock.now_ms,
-    )
+    harnesses = worker_harnesses(ALONE, start, lambda _trial: trials.Task(inputs, ("Do the task in TASK.md.",)), clock)
     gateway = replay.Gateway("https://gateway.example.com", "coursework", clock, Gateway(Clock(), KEYS))
     chosen = cells(ALONE, Family.OPTIMIZATION, Family.ANALYSIS)
     ran = asyncio.run(trials.run(ALONE, gateway, KEYS, harnesses, dict.fromkeys(Family, grade_in_place), cells=chosen))
@@ -526,14 +618,228 @@ def test_each_attempt_runs_its_harness_adapter_in_a_fresh_worker_released_after_
     assert all(worker.discarded and not worker.workspace.exists() for _spec, worker in started)
 
 
-@pytest.mark.parametrize("graded", [Family.OPTIMIZATION, Family.ANALYSIS, Family.RESEARCH])
+def test_what_a_task_writes_in_its_working_folder_reaches_its_grader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from evaluate.tests.test_workers import IMAGE, Runtime
+    from evaluate.tests.test_workers import LIMITS as RUNTIME_LIMITS
+
+    cell = cells(ALONE, Family.OPTIMIZATION)[0]
+    identity = ALONE.workload.trials[ALONE.cells[cell].trials[0]]
+    inputs, root = tmp_path / "inputs", tmp_path / "trial"
+    optimization.materialize(identity.instance_id, inputs)
+    # The worker's folders are folders of this host, and its commands run here, in them.
+    work = root / Path(workers.WORK).name
+    shutil.copytree(inputs, work)
+    (root / Path(workers.OUTPUT).name).mkdir()
+    reference = optimization.reference_artifacts(identity.instance_id)
+    harness = tmp_path / "bin" / "claude"
+    harness.parent.mkdir()
+    harness.write_text(f"#!/bin/sh\ncp '{reference}/plan.json' '{reference}/plan.tex' .\n", encoding="utf-8")
+    harness.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{harness.parent}:{sys.exec_prefix}/bin:/usr/bin:/bin")
+
+    class Here(Runtime):
+        def stream(self, arguments: Sequence[str], *, sink: Path, limit: int, seconds: float) -> workers.Streamed:
+            command = [one.replace("/trial/", f"{root}/") for one in arguments[2:]]
+            with sink.open("ab") as file:
+                done = subprocess.run(command, cwd=work, stdout=file, timeout=seconds, check=False)
+            return workers.Streamed(done.returncode, False)
+
+    clock = replay.RunClock()
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock)
+    with workers.Workers(tmp_path / "scratch", runtime=Here()) as started:
+        harnesses = worker_harnesses(
+            ALONE,
+            started.start,
+            lambda _trial: trials.Task(inputs, ("Solve it.",)),
+            clock,
+            image=IMAGE,
+            limits=RUNTIME_LIMITS,
+        )
+        ran = asyncio.run(trials.run(ALONE, gateway, KEYS, harnesses, trials.course_graders(), cells=[cell]))
+
+    (record,) = ran.records
+    assert record.outcome is TrialOutcome.PASSED
+    assert record.grade is not None and record.grade.accepted
+
+
+def test_a_task_that_cannot_be_prepared_is_an_invalid_attempt(tmp_path: Path) -> None:
+    def tasks(_trial: TrialIdentity) -> trials.Task:
+        raise FileNotFoundError("the task's fixture is missing")
+
+    clock = replay.RunClock()
+    def never(_spec: workers.Spec) -> Worker:
+        raise AssertionError("no worker is started for a task that cannot be prepared")
+
+    harnesses = worker_harnesses(ALONE, never, tasks, clock)
+    chosen = cells(ALONE, Family.OPTIMIZATION)
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock)
+    ran = asyncio.run(trials.run(ALONE, gateway, KEYS, harnesses, GRADERS, cells=chosen))
+
+    assert {record.invalid for record in ran.records} == {InvalidReason.DRIVER_ERROR}
+    assert (ran.attempts, ran.incomplete) == (0, tuple(chosen))
+
+
+def test_the_trial_deadline_stops_a_worker_waiting_on_a_tool(tmp_path: Path) -> None:
+    wall_ms = 1_500
+    planned = plan.expand(replace(SPEC, limits=replace(SPEC.limits, trial_wall_time_ms=wall_ms)), Profile.QUALIFY, 1)
+    stopped = threading.Event()
+
+    class Waiting(Worker):
+        def run(self, command: Sequence[str]) -> workers.Ran:
+            # Its tool waits far past the trial's wall time, unless the worker is ended.
+            ended = stopped.wait(30)
+            return workers.Ran(137 if ended else 0, False, False, self.transcript)
+
+        def stop(self) -> None:
+            stopped.set()
+
+    worker = one_worker(tmp_path, Waiting)
+
+    def start(_spec: workers.Spec) -> Worker:
+        time.sleep(0.5)
+        return worker
+
+    clock = replay.RunClock()
+    harnesses = worker_harnesses(planned, start, lambda _trial: trials.Task(tmp_path, ("Run",)), clock)
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock)
+    chosen = cells(planned, Family.OPTIMIZATION)[:1]
+    ran = asyncio.run(trials.run(planned, gateway, KEYS, harnesses, GRADERS, cells=chosen, evidence=None))
+
+    (executed,) = ran.executed[:1]
+    assert (executed.record.outcome, executed.record.failure) == (TrialOutcome.FAILED, FailureReason.TIMEOUT)
+    assert executed.record.counts_as_attempt
+    # The worker's start counted, and the wait was cut at the trial's wall time.
+    assert wall_ms <= executed.duration_ms < wall_ms + 1_000
+    assert stopped.is_set() and worker.discarded
+
+
+def test_cancelling_while_a_worker_starts_launches_no_harness_in_it(tmp_path: Path) -> None:
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    launched: list[list[str]] = []
+
+    class Stoppable(Worker):
+        def run(self, command: Sequence[str]) -> workers.Ran:
+            launched.append(list(command))
+            return super().run(command)
+
+        def stop(self) -> None:
+            stopped.set()
+
+    worker = one_worker(tmp_path, Stoppable)
+
+    def start(_spec: workers.Spec) -> Worker:
+        entered.set()
+        release.wait(5)
+        return worker
+
+    clock = replay.RunClock()
+    harnesses = worker_harnesses(ALONE, start, lambda _trial: trials.Task(tmp_path, ("Run",)), clock)
+
+    async def exercise() -> None:
+        async def attempt() -> None:
+            async with harnesses.attempt(ALONE.workload.trials[0], KEYS[0], asyncio.Event()):
+                pass
+
+        pending = asyncio.ensure_future(attempt())
+        assert await asyncio.to_thread(entered.wait, 5)
+        pending.cancel()
+        await asyncio.sleep(0.05)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(exercise())
+    assert launched == []
+    assert stopped.is_set() and worker.discarded
+
+
+def test_a_cancelled_run_returns_only_once_its_worker_is_disposed_of(tmp_path: Path) -> None:
+    disposing, release = threading.Event(), threading.Event()
+
+    class Slow(Worker):
+        def discard(self) -> list[str]:
+            disposing.set()
+            release.wait(5)
+            return super().discard()
+
+    worker = one_worker(tmp_path, Slow)
+    clock = replay.RunClock()
+    harnesses = worker_harnesses(ALONE, lambda _spec: worker, lambda _trial: trials.Task(tmp_path, ("Run",)), clock)
+
+    async def exercise() -> None:
+        gateway = replay.Gateway("https://gateway.example.com", "coursework", clock)
+        chosen = cells(ALONE, Family.OPTIMIZATION)[:1]
+        pending = asyncio.ensure_future(trials.run(ALONE, gateway, KEYS, harnesses, GRADERS, cells=chosen))
+        assert await asyncio.to_thread(disposing.wait, 5)
+        pending.cancel()
+        done, _ = await asyncio.wait({pending}, timeout=0.3)
+        assert not done
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert worker.discarded
+
+    asyncio.run(exercise())
+
+
+# --- The graders of the course ---------------------------------------------------------------
+
+
+def run_here(scratch: Path) -> trials.Execute:
+    """`trials.Execute` on this host: a fresh copy of the files, the command run in it with this
+    Python, and what it wrote in its output folder."""
+    runs = itertools.count()
+
+    def execute(inputs: Path, command: Sequence[str]) -> Path | None:
+        folder = scratch / f"run-{next(runs)}"
+        shutil.copytree(inputs, folder / "work")
+        (folder / "output").mkdir()
+        argv = [
+            sys.executable if one == "python" else one.replace(workers.OUTPUT, str(folder / "output"))
+            for one in command
+        ]
+        subprocess.run(argv, cwd=folder / "work", capture_output=True, timeout=60, check=False)
+        return folder / "output"
+
+    return execute
+
+
+def test_the_course_graders_grade_every_family_the_qualification_plans() -> None:
+    planned = plan.expand(COURSE, Profile.QUALIFY, 8)
+    assert {family(trial) for trial in planned.workload.trials} <= trials.course_graders().keys()
+
+
+@pytest.mark.parametrize("graded", list(Family))
 def test_the_course_graders_accept_a_reference_answer_and_reject_a_missing_one(graded: Family, tmp_path: Path) -> None:
     trial = next(one for one in CLASS.workload.trials if family(one) is graded)
-    course = {Family.OPTIMIZATION: optimization, Family.ANALYSIS: analysis, Family.RESEARCH: research}[graded]
     within = evidence(0, TRIAL_MS, Act())
     grader = trials.course_graders()[graded]
     workers_overlapped = Delegation(2, overlapped=True)
+    execute = run_here(tmp_path / "runs")
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    if graded is Family.DEBUGGING:
+        # The repaired program, as the trial left it in its working folder.
+        answer = tmp_path / "submitted"
+        answer.mkdir()
+        shutil.copyfile(revision.reference_solver(trial.instance_id), answer / revision.SOLVER)
+    else:
+        course = {Family.OPTIMIZATION: optimization, Family.ANALYSIS: analysis, Family.RESEARCH: research}[graded]
+        answer = course.reference_artifacts(trial.instance_id)
 
-    reference = trials.Work(within, course.reference_artifacts(trial.instance_id), workers_overlapped)
-    assert grader(trial, reference).accepted
-    assert not grader(trial, trials.Work(within, tmp_path, workers_overlapped)).accepted
+    assert grader(trial, trials.Work(within, answer, workers_overlapped, execute)).accepted
+    assert not grader(trial, trials.Work(within, missing, workers_overlapped, execute)).accepted
+
+
+def test_the_debugging_grader_rejects_the_broken_program_and_needs_a_fresh_worker(tmp_path: Path) -> None:
+    trial = next(one for one in CLASS.workload.trials if family(one) is Family.DEBUGGING)
+    given = tmp_path / "given"
+    revision.materialize(trial.instance_id, given)
+    within = evidence(0, TRIAL_MS, Act())
+    grader = trials.course_graders()[Family.DEBUGGING]
+
+    assert not grader(trial, trials.Work(within, given, None, run_here(tmp_path / "runs"))).accepted
+    with pytest.raises(RuntimeError):
+        grader(trial, trials.Work(within, given))
