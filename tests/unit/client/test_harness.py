@@ -18,9 +18,10 @@ import keyring
 import keyring.backend
 import pytest
 
-from rhi_cli import login, main, store
+from rhi_cli import harness, login, main, store
 
 ENDPOINT = "https://example.com"
+WINDOW = str(harness.AUTO_COMPACT_WINDOW)
 
 CLAUDE_CODE_BEFORE = {"model": "opus", "permissions": {"allow": ["Read"]}, "env": {"EDITOR": "vi"}}
 # Codex's own configuration, which a login never writes, and what a student added to the profile.
@@ -131,12 +132,32 @@ def codex(home: Path) -> dict[str, Any]:
     return tomllib.loads((home / ".codex" / "rhi.config.toml").read_text(encoding="utf-8"))
 
 
-def test_claude_code_is_given_the_helper_and_the_endpoint(home: Path) -> None:
+def test_claude_code_is_given_the_helper_the_endpoint_and_the_compact_window(home: Path) -> None:
     log_in(Endpoint())
     settings = claude_code(home)
     assert settings.pop("apiKeyHelper") == "rhi token"
     assert settings["env"].pop("ANTHROPIC_BASE_URL") == ENDPOINT
+    assert settings["env"].pop("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == WINDOW == "200000"
     assert settings == CLAUDE_CODE_BEFORE
+
+
+def test_a_login_replaces_another_compact_window(home: Path) -> None:
+    path = home / ".claude" / "settings.json"
+    before = {**CLAUDE_CODE_BEFORE, "env": {"EDITOR": "vi", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "500000"}}
+    path.write_text(json.dumps(before), encoding="utf-8")
+    assert str(path) in log_in(Endpoint())
+    settings = claude_code(home)
+    assert settings["env"] == {"EDITOR": "vi", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": WINDOW, "ANTHROPIC_BASE_URL": ENDPOINT}
+
+
+def test_claude_code_settings_that_hold_every_owned_setting_are_not_written(home: Path) -> None:
+    path = home / ".claude" / "settings.json"
+    owned = {"ANTHROPIC_BASE_URL": ENDPOINT, "CLAUDE_CODE_AUTO_COMPACT_WINDOW": WINDOW}
+    # Compact JSON: a rewrite would indent it.
+    text = json.dumps({**CLAUDE_CODE_BEFORE, "apiKeyHelper": "rhi token", "env": {"EDITOR": "vi", **owned}})
+    path.write_text(text, encoding="utf-8")
+    assert harness.configure_claude_code(ENDPOINT) is None
+    assert path.read_text(encoding="utf-8") == text
 
 
 def test_codex_is_given_a_provider_profile_for_the_endpoint(home: Path) -> None:
@@ -160,7 +181,10 @@ def test_both_files_are_made_when_a_harness_has_none(home: Path) -> None:
     (home / ".codex" / "rhi.config.toml").unlink()
     endpoint = Endpoint()
     log_in(endpoint)
-    assert claude_code(home) == {"apiKeyHelper": "rhi token", "env": {"ANTHROPIC_BASE_URL": ENDPOINT}}
+    assert claude_code(home) == {
+        "apiKeyHelper": "rhi token",
+        "env": {"ANTHROPIC_BASE_URL": ENDPOINT, "CLAUDE_CODE_AUTO_COMPACT_WINDOW": WINDOW},
+    }
     profile = codex(home)
     assert (profile["model_provider"], profile["model"]) == ("rhi", endpoint.default)
     assert set(profile) == {"model_provider", "model", "model_providers"}

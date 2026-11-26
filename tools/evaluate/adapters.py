@@ -12,9 +12,10 @@ that start a worker.
 the suite and the trial image pin:
 
 - Claude Code and Codex get exactly what `rhi login` writes (`rhi_cli.harness`): Claude Code its
-  settings file, with the endpoint and `rhi token` as its key helper; Codex its profile `rhi`, on
-  the Responses route, with the pool's model and `rhi token` as its key command. Nothing sets a
-  model, an effort, a thinking budget or a window for Claude Code: it asks for its own names;
+  settings file, with the endpoint, `rhi token` as its key helper and its auto-compact window of
+  200,000 tokens; Codex its profile `rhi`, on the Responses route, with the pool's model and
+  `rhi token` as its key command. Nothing sets a model, an effort or a thinking budget for Claude
+  Code: it asks for its own names;
 - OpenCode and Pi get the provider entry a student writes in the file the student guide names,
   on the Chat Completions route: OpenCode's entry is the one of spike S3, which the pinned
   OpenCode reads, and takes its key from the variable the guide names (`KEY_VARIABLE`); Pi's is
@@ -128,6 +129,9 @@ SUPPORTED = {
 # The name `rhi login` gives the endpoint in a harness's settings, and the command that prints the key.
 PROVIDER = "rhi"
 KEY_COMMAND = ("rhi", "token")
+# The auto-compact window `rhi login` sets for Claude Code, in tokens, a plain number: Claude Code
+# gives its own names their 1M window behind the forwarder and would otherwise compact only near it.
+AUTO_COMPACT_WINDOW = "200000"
 # The variable OpenCode's entry names for the key (the student guide, section 3).
 KEY_VARIABLE = "RHI_API_KEY"
 # Where the home keeps its commands: the first folder of the trial's `PATH`.
@@ -407,7 +411,10 @@ class Adapter:
         files = {"bin/rhi": RHI}
         environment = {"HOME": workers.HOME, "LANG": "C.UTF-8"}
         if self.harness is Harness.CLAUDE_CODE:
-            settings = {"apiKeyHelper": " ".join(KEY_COMMAND), "env": {"ANTHROPIC_BASE_URL": endpoint}}
+            settings = {
+                "apiKeyHelper": " ".join(KEY_COMMAND),
+                "env": {"ANTHROPIC_BASE_URL": endpoint, "CLAUDE_CODE_AUTO_COMPACT_WINDOW": AUTO_COMPACT_WINDOW},
+            }
             files[".claude/settings.json"] = json.dumps(settings, indent=2) + "\n"
             environment |= {"CLAUDE_CONFIG_DIR": f"{workers.HOME}/.claude", "DISABLE_AUTOUPDATER": "1"}
         elif self.harness is Harness.CODEX:
