@@ -14,6 +14,9 @@ import heapq
 import itertools
 import json
 import re
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -21,11 +24,12 @@ import httpx
 import pytest
 
 import common
-from evaluate import booking, capacity, phases, plan, replay, scripted, telemetry, trials
+from evaluate import booking, capacity, phases, plan, quality, replay, scripted, telemetry, trials, workers
 from evaluate.contracts import (
     LIVE_PHASES,
     MAX_COUNT,
     CellStatus,
+    Family,
     Grade,
     HostMetric,
     InstanceType,
@@ -35,6 +39,7 @@ from evaluate.contracts import (
     PathCategory,
     Phase,
     Profile,
+    RequestRecord,
     Route,
     Run,
     Settings,
@@ -44,6 +49,7 @@ from evaluate.contracts import (
     TrialOutcome,
     loads,
 )
+from evaluate.course import research, revision
 from evaluate.forwarding import Evidence, Measurement
 from evaluate.journal import AttemptStatus, Journal
 from evaluate.streams import Attempts
@@ -330,10 +336,38 @@ class Workspace:
         raise AssertionError("the reader takes samples as they were scraped")
 
 
+def run_here(scratch: Path) -> trials.Execute:
+    """`trials.Execute` on this host: the command run with this Python in a copy of the files."""
+    runs = itertools.count()
+
+    def execute(inputs: Path, command: Sequence[str]) -> Path | None:
+        folder = scratch / f"run-{next(runs)}"
+        shutil.copytree(inputs, folder / "work")
+        (folder / "output").mkdir()
+        argv = [
+            sys.executable if one == "python" else one.replace(workers.OUTPUT, str(folder / "output"))
+            for one in command
+        ]
+        subprocess.run(argv, cwd=folder / "work", capture_output=True, timeout=60, check=False)
+        return folder / "output"
+
+    return execute
+
+
+def reference_work(trial: Any, folder: Path) -> tuple[Path, trials.Execute | None]:
+    """What an attempt that solved its instance leaves for the course's grader."""
+    if trials.task_of(PLAN, trial).family is Family.RESEARCH:
+        return research.reference_artifacts(trial.instance_id), None
+    folder.mkdir(parents=True)
+    shutil.copyfile(revision.reference_solver(trial.instance_id), folder / revision.SOLVER)
+    return folder, run_here(folder.parent / f"{folder.name}-runs")
+
+
 @dataclass
 class Harness:
     """A harness that sends its turns through the gateway as the live seat, then works a while
-    unless it is told to stop. `silent` trials send nothing; `on_turn` sees each turn sent."""
+    unless it is told to stop, and leaves its instance's reference answer. `silent` trials send
+    nothing; `on_turn` sees each turn sent."""
 
     clock: Clock
     gateway: Gateway
@@ -343,6 +377,7 @@ class Harness:
     # How long before its dispatch each later turn reached the forwarder, and a tally that lost its completions.
     lag_ms: int = 0
     miscounted: bool = False
+    attempts: itertools.count[int] = field(default_factory=itertools.count)
 
     @contextlib.asynccontextmanager
     async def attempt(self, trial: Any, key: str, cancel: asyncio.Event) -> AsyncGenerator[trials.Work]:
@@ -395,10 +430,12 @@ class Harness:
             tally=replace(attempts.tally(), completed=0) if self.miscounted else attempts.tally(),
             requests=tuple(measured),
         )
-        yield trials.Work(evidence=evidence, artifacts=self.artifacts)
+        artifacts, execute = reference_work(trial, self.artifacts / f"attempt-{next(self.attempts)}")
+        yield trials.Work(evidence=evidence, artifacts=artifacts, execute=execute)
 
 
 def grade_all(trial: Any, _work: trials.Work) -> Grade:
+    """A grader other than the course's: it passes every attempt."""
     return Grade(properties=(True,) * trials.task_of(PLAN, trial).required_properties, within_limits=True)
 
 
@@ -500,7 +537,7 @@ class Bench:
                 source,
                 phases.Artifacts(RUN, trial_image(self.versions)),
                 self.harness,
-                dict.fromkeys(capacity_families(), grade_all) if self.graders is None else self.graders,
+                trials.course_graders() if self.graders is None else self.graders,
                 self.journal,
                 origin_s=ORIGIN_S,
                 cancel=self.cancel,
@@ -655,6 +692,11 @@ def test_a_family_with_no_grader_is_refused_before_anything_is_sent(tmp_path: Pa
     assert Bench(tmp_path, graders={}).refused() is phases.Refusal.ARTIFACT_MISMATCH
 
 
+def test_a_grader_other_than_the_one_the_manifest_identifies_is_refused(tmp_path: Path) -> None:
+    substitute = trials.course_graders() | {Family.RESEARCH: grade_all}
+    assert Bench(tmp_path, graders=substitute).refused() is phases.Refusal.ARTIFACT_MISMATCH
+
+
 def test_a_journal_of_another_workload_keeps_its_manifest_and_is_not_resumed(tmp_path: Path) -> None:
     first = Bench(tmp_path / "first")
     first.run()
@@ -753,6 +795,31 @@ def test_a_release_that_changes_inside_a_window_leaves_that_cell_unqualified(tmp
     cannot_qualify(bench, result, cell)
 
 
+def test_a_launch_fingerprint_that_changes_inside_a_window_leaves_that_cell_unqualified(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+    rows = bench.workspace.series[telemetry.selectors(POOL, VLLM)[telemetry.Source.LAUNCH]]
+    changed: list[float] = []
+
+    def other(at: float) -> bool:
+        return bool(changed) and changed[0] <= at < changed[0] + 30
+
+    # One host reports another launch for 30 seconds, then the requested one again.
+    labels, value, present = rows[0]
+    rows[0] = labels, value, lambda at: present(at) and not other(at)
+    rows.append((labels | {"settings_fingerprint": "ba" * 32}, value, other))
+
+    def change(at: int, _student: int) -> None:
+        if running(bench) == sweep.identity.cell and not changed:
+            changed.append(ORIGIN_S + at / 1000 + 25)
+
+    bench.gateway.on_arrival = change
+    result = bench.run()
+    cell = next(one for one in result.cells if one.cell == sweep)
+    assert cell.record is not None and InvalidFlag.HOST_TURNOVER in cell.record.invalid_flags
+    cannot_qualify(bench, result, cell)
+
+
 def test_a_gateway_that_does_not_count_each_canary_leaves_its_cells_unqualified(tmp_path: Path) -> None:
     bench = Bench(tmp_path)
     bench.workspace.misattributed = True
@@ -769,6 +836,26 @@ def test_a_live_attempt_whose_first_answer_reads_a_cache_leaves_its_cell_unquali
     low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
     bench.gateway.answer = lambda route, cached: _answer(route, 12 if running(bench) == low.identity.cell else cached)
     result = bench.run()
+    cell = next(one for one in result.cells if one.cell == low)
+    assert cell.record is not None and InvalidFlag.MISSING_EVIDENCE in cell.record.invalid_flags
+    cannot_qualify(bench, result, cell)
+
+
+def test_a_later_serial_miss_does_not_certify_a_cached_first_live_answer(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
+    served: list[int] = []
+
+    # The first answer of the cell read a cache; the next, sent as it ended, read none.
+    def answer(route: Route, cached: int) -> list[bytes]:
+        if running(bench) == low.identity.cell:
+            cached = 0 if served else 12
+            served.append(cached)
+        return _answer(route, cached)
+
+    bench.gateway.answer = answer
+    result = bench.run()
+    assert served[:2] == [12, 0]
     cell = next(one for one in result.cells if one.cell == low)
     assert cell.record is not None and InvalidFlag.MISSING_EVIDENCE in cell.record.invalid_flags
     cannot_qualify(bench, result, cell)
@@ -885,6 +972,83 @@ def test_a_cancellation_during_a_live_seat_stops_everything_within_the_drain_and
     cannot_qualify(bench, result, last)
 
 
+def test_a_live_cell_cancelled_once_its_window_is_read_contributes_no_offline_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bench = Bench(tmp_path)
+    low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
+    read = telemetry.read
+
+    def read_then_cancel(*args: Any, **kwargs: Any) -> Any:
+        answers = read(*args, **kwargs)
+        if running(bench) == low.identity.cell:
+            bench.cancel.set()
+        return answers
+
+    monkeypatch.setattr(telemetry, "read", read_then_cancel)
+    result = bench.run()
+    cell = result.cells[-1]
+    assert cell.cell == low and cell.reading is not None and not cell.checkpointed
+    # Its trial passed, and is kept; graded offline, the interrupted cell counts none of it.
+    assert [one.outcome for one in cell.trials] == [TrialOutcome.PASSED]
+    records = quality.Records(result.manifest.workload, result.trials, tuple(one.record for one in result.evidence))
+    graded_quality = quality.read(records, usd_per_host_hour=1)
+    assert sum(one.successes for load in graded_quality.values() for one in load.cells) == 0
+    cannot_qualify(bench, result, cell)
+
+
+def test_a_cancellation_while_the_booking_probe_is_pending_stops_within_the_drain(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+    cancelled_at: list[int] = []
+
+    async def slow() -> booking.Reason | None:
+        # The probe takes 30 s to answer, well beyond the cell's drain.
+        if running(bench) == sweep.identity.cell and not cancelled_at:
+            await bench.clock.sleep_ms(30_000)
+        return None
+
+    def cancel(at: int, _student: int) -> None:
+        if running(bench) == sweep.identity.cell and not cancelled_at:
+            cancelled_at.append(at)
+            bench.cancel.set()
+
+    bench.continuity = slow
+    bench.gateway.on_arrival = cancel
+    result = bench.run()
+    assert result.ended is phases.Ended.CANCELLED and cancelled_at
+    assert not any(at > cancelled_at[0] + sweep.drain_ms for at, _ in bench.gateway.arrived)
+    cannot_qualify(bench, result, result.cells[-1])
+
+
+def test_a_cancellation_as_the_last_booking_probe_answers_interrupts_the_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bench = Bench(tmp_path)
+    sweep = next(one for one in PLAN.cells if one.identity.phase is Phase.CAPACITY_SWEEP)
+    read: list[bool] = []
+    resolve = telemetry.resolve
+
+    def resolved(*args: Any, **kwargs: Any) -> Any:
+        reading = resolve(*args, **kwargs)
+        if running(bench) == sweep.identity.cell:
+            read.append(True)
+        return reading
+
+    async def continuity() -> booking.Reason | None:
+        if read:
+            bench.cancel.set()
+        return None
+
+    monkeypatch.setattr(telemetry, "resolve", resolved)
+    bench.continuity = continuity
+    result = bench.run()
+    assert result.ended is phases.Ended.CANCELLED
+    cell = result.cells[-1]
+    assert cell.cell == sweep and cell.reading is not None
+    cannot_qualify(bench, result, cell)
+
+
 def test_a_cancellation_stops_the_route_warm_up_and_the_wait_for_scrapes(tmp_path: Path) -> None:
     routes = Bench(tmp_path / "routes")
     routes.gateway.on_arrival = lambda _at, _student: routes.cancel.set()
@@ -956,6 +1120,28 @@ def test_requests_that_ended_stay_in_the_journal_when_the_driver_breaks(tmp_path
     assert {getattr(one, "sent_ms", None) for one in saved} >= set(sends[:2])
 
 
+def test_live_requests_stay_in_the_journal_when_the_worker_cleanup_fails(tmp_path: Path) -> None:
+    bench = Bench(tmp_path)
+    attempt = bench.harness.attempt
+    measured: list[int] = []
+
+    @contextlib.asynccontextmanager
+    async def failing_cleanup(trial: Any, key: str, cancel: asyncio.Event) -> AsyncGenerator[trials.Work]:
+        async with attempt(trial, key, cancel) as work:
+            measured.extend(one.attempt.sent_ms for one in work.evidence.requests)
+            yield work
+        raise OSError("worker cleanup failed")
+
+    bench.harness.attempt = failing_cleanup
+    with pytest.raises(OSError, match="cleanup"):
+        bench.run()
+    last = bench.journal.attempts[-1]
+    assert measured and last.status is AttemptStatus.INTERRUPTED
+    saved = bench.journal.observations(last.ordinal)
+    live = {one.sent_ms for one in saved if isinstance(one, RequestRecord) and one.traffic is Traffic.LIVE}
+    assert set(measured) <= live
+
+
 def test_a_resume_in_another_booking_warms_up_again_and_replaces_the_interrupted_trial(tmp_path: Path) -> None:
     first = Bench(tmp_path / "first")
     low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
@@ -983,6 +1169,26 @@ def test_a_resume_in_another_booking_warms_up_again_and_replaces_the_interrupted
     assert again.execution > interrupted.execution and again.replaces == interrupted.execution
     requests = [one.request for cells in (before.cells, after.cells) for cell in cells for one in cell.requests]
     assert len(requests) == len(set(requests))
+
+
+def test_a_resume_on_another_engine_image_reuses_nothing_and_keeps_what_served_the_first(tmp_path: Path) -> None:
+    first = Bench(tmp_path / "first")
+    low = next(one for one in PLAN.cells if one.identity.phase is Phase.LIVE_LOW_LOAD)
+    first.harness.on_turn = lambda trial, _turn: first.cancel.set() if trial in low.trials else None
+    before = first.run()
+    assert any(one.qualifies for one in before.cells[1:])
+
+    second = Bench(tmp_path / "second", resumes=first.journal)
+    second.clock.at = first.clock.at + 60_000
+    other = "sha256:" + "be" * 32
+    rows = second.workspace.series[telemetry.selectors(POOL, VLLM)[telemetry.Source.RELEASE]]
+    rows[:] = [(labels | {"image_digest": other}, value, present) for labels, value, present in rows]
+    after = second.run()
+    assert after.ended is phases.Ended.SERVING_CHANGED
+    (warm_up,) = after.cells
+    assert warm_up.cell.identity.phase is Phase.WARM_UP and not warm_up.checkpointed
+    saved = loads((first.journal.directory / phases.MANIFEST).read_text(), Manifest)
+    assert saved.observed.engine_image_digest == IMAGE == after.manifest.observed.engine_image_digest
 
 
 def test_a_booking_that_changes_interrupts_the_cell_and_starts_no_other(tmp_path: Path) -> None:

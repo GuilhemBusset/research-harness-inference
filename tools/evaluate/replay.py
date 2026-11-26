@@ -387,13 +387,14 @@ def _answered(one: RequestRecord) -> bool:
 def met_fresh(requests: Iterable[RequestRecord]) -> bool | None:
     """Whether served usage shows that a student, whose requests under one prefix these are, met
     it uncached: one of the student's first answers, those of requests sent while no answer had
-    ended, reported a cached input of exactly zero. `None` while no answer has come: a request
+    ended, reported a cached input of exactly zero. A request sent in the millisecond the first
+    answer ended came after it, and is not among them. `None` while no answer has come: a request
     that was refused, or lost or cut before a count or an output, shows nothing either way."""
     answers = [one for one in requests if _answered(one)]
     if not answers:
         return None
     first_end = min(one.ended_ms for one in answers)
-    first = [one.usage for one in answers if one.sent_ms <= first_end]
+    first = [one.usage for one in answers if one.sent_ms < first_end or one.ended_ms == first_end]
     return any(usage is not None and usage.cached_input_tokens == 0 for usage in first)
 
 
