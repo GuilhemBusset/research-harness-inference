@@ -31,6 +31,7 @@ ARGUMENTS = [
     *("--max-model-len", "262144"),
     *("--max-num-seqs", "8"),
     "--kv-cache-metrics",
+    "--enable-prompt-tokens-details",
     *("--kv-cache-dtype", "fp8"),
     "--no-enable-prefix-caching",
     *("--max-num-batched-tokens", "8192"),
@@ -126,6 +127,17 @@ def test_a_setting_that_differs_gives_another_fingerprint(other: list[str]) -> N
 def test_what_is_left_out_changes_nothing(other: list[str]) -> None:
     assert other != ARGUMENTS
     assert fingerprint(other) == fingerprint(ARGUMENTS) != UNAVAILABLE
+
+
+@pytest.mark.parametrize(
+    "release",
+    [without("--enable-prompt-tokens-details"), [MODEL], []],
+    ids=["every-setting", "only-the-model", "no-argument"],
+)
+def test_the_cached_input_in_answers_changes_no_fingerprint(release: list[str]) -> None:
+    # The option changes what the engine reports, wherever it is among the options.
+    for added in ([*release, "--enable-prompt-tokens-details"], ["--enable-prompt-tokens-details", *release]):
+        assert fingerprint(added) == fingerprint(release) != UNAVAILABLE
 
 
 @pytest.mark.parametrize(
