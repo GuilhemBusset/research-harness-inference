@@ -25,6 +25,20 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## The tests' repositories run none of git's background maintenance (2026-11-26)
+
+A local patch, not in upstream, to the tests alone. A fetch, a commit, a merge and a received push
+each end by starting `git maintenance run --auto`, which detaches. git 2.56, which CI's runners
+have, prunes worktrees in it by default, and that prune deletes the entry of a worktree that
+`git worktree add` is still creating: the `add` dies, the step that ran it crashes, and a test
+finds an issue waiting that it expected delivered. On a busy runner that failed a test now and
+then, another one each time. The engine's version stays 1.2.22: nothing in the engine changes.
+
+| File | What changed |
+| --- | --- |
+| `tests/helpers.py` | `TempRepo` makes its clones with `maintenance.auto` false (`NO_MAINTENANCE`), the engine's among them, whose worktrees read it, and sets `receive.autogc` to false in its bare remote. |
+| `tests/test_temp_repo.py` | New test: a commit, a push, a squash merge, a fetch and a merge in a `TempRepo` start no maintenance, read from git's own trace, which does show one where git is told to start it. |
+
 ## An answer `gh` could not read is not a refusal (2026-11-25)
 
 A local patch, not in upstream. When an error answer says it is JSON and its body is empty or cut
