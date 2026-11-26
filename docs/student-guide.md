@@ -303,6 +303,7 @@ ask for help, give the cause's name. Never paste your key.
 | `capacity_unavailable` | The pool's session is on, and the pool waits for a GPU machine to become available (section 6) | Run `rhi wait coursework`, with the model's name: the pool keeps asking for its machines. If it lasts, use your own subscription for this session |
 | `engine_error` | The model failed, or ended its answer early | Try again. If it keeps happening, start a fresh session of your harness and tell the instructor |
 | `time_limit` | The request reached the 30-minute limit | Split the work into smaller requests |
+| `context_length_exceeded` | The conversation has grown longer than the model's context | Nothing, in Claude Code: it compacts the session by itself and goes on. In another harness, compact the session (its own command for it), or start a new one |
 
 ## 9. The concurrency limit
 

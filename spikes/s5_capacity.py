@@ -1162,6 +1162,7 @@ class Figure(StrEnum):
     FAILED_NO_SESSION = "failed_no_session"
     FAILED_ENGINE_ERROR = "failed_engine_error"
     FAILED_TIME_LIMIT = "failed_time_limit"
+    FAILED_CONTEXT_LENGTH_EXCEEDED = "failed_context_length_exceeded"
     FAILED_IN_STREAM = "failed_in_stream"
     """Those answered 200 whose stream then carried the gateway's error event, also under their cause."""
     FAILED_WITHOUT_CAUSE = "failed_without_cause"
