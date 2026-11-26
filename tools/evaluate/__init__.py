@@ -10,4 +10,8 @@ package, and what `booking` keeps in its journal is private and is never written
 
 `evaluate.workers` starts and disposes of the containers a trial and its submitted code run in,
 from the image `evaluate.image` prepares.
+
+`evaluate.streams` reads one streamed attempt on each of the three routes: how it ended, when its
+output came, the usage it reported and its speed. It reads with the gateway's and the load
+generator's readers, so it needs `services/gateway` and `spikes` on the path as well.
 """

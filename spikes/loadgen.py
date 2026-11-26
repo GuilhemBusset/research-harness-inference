@@ -356,7 +356,7 @@ def output_of(wire: Wire, event: SseEvent) -> bool | None:
     return delta.get("type") != "thinking_delta" if field and _is_text(delta.get(field)) else None
 
 
-def _usage(data: Mapping[str, Any]) -> dict[str, Any]:
+def usage_in(data: Mapping[str, Any]) -> dict[str, Any]:
     """The usage object an event's data or a whole answer carries: its own, its message's or its response's."""
     for holder in (data, data.get("message"), data.get("response")):
         if isinstance(holder, dict) and isinstance(holder.get("usage"), dict):
@@ -364,7 +364,7 @@ def _usage(data: Mapping[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _merge(usage: dict[str, Any], update: Mapping[str, Any]) -> None:
+def merge_usage(usage: dict[str, Any], update: Mapping[str, Any]) -> None:
     """Takes a stream's next usage object into `usage`: a field it carries as a whole number replaces
     the one before, an object of details is taken in the same way, and a field that is `null` or
     anything else leaves the count already reported."""
@@ -372,7 +372,7 @@ def _merge(usage: dict[str, Any], update: Mapping[str, Any]) -> None:
         if isinstance(value, dict):
             details = usage.get(name)
             usage[name] = details = details if isinstance(details, dict) else {}
-            _merge(details, value)
+            merge_usage(details, value)
         elif _whole(value) is not None:
             usage[name] = value
 
@@ -518,7 +518,7 @@ async def _send(
                         continue
                     data = _object(event.data)
                     cause = cause or cause_of(data)
-                    _merge(usage, _usage(data))
+                    merge_usage(usage, usage_in(data))
                     carried = output_of(wire, event) if wire else None
                     if carried is None:
                         continue
@@ -534,7 +534,7 @@ async def _send(
         failure = failure_of(error)
     if not streamed:
         whole_answer = _object(whole.decode(errors="replace"))
-        usage, cause = _usage(whole_answer), cause_of(whole_answer)
+        usage, cause = usage_in(whole_answer), cause_of(whole_answer)
     input_tokens, cached, output_tokens = tokens_of(wire, usage)
     speed = None
     if first is not None and last is not None and last > first and output_tokens is not None and output_tokens >= 2:
