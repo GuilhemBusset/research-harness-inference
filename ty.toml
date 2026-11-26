@@ -24,6 +24,8 @@ root = [
     "tools/backlog", "tools/backlog/tests",
     "tools/measurements",
     "tools/advisories",
+    # `tools` itself, for the one tool that is a package: `evaluate` (tools/evaluate/__init__.py).
+    "tools",
     "tests/examiner",
     "tests/replay",
     "tests/unit/spikes",
@@ -47,7 +49,7 @@ root = [
 # roots above and the tests.
 include = [
     "tools/implementation-loop", "tools/hygiene", "tools/backlog", "tools/measurements",
-    "tools/advisories",
+    "tools/advisories", "tools/evaluate",
     "app.py",
     "src",
     "services/common",

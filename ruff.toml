@@ -24,6 +24,8 @@ src = [
   "tools/backlog", "tools/backlog/tests",
   "tools/measurements",
   "tools/advisories",
+  # `tools` itself, for the one tool that is a package: `evaluate` (tools/evaluate/__init__.py).
+  "tools",
   "tests/examiner",
   "tests/replay",
   "tests/unit/spikes",
