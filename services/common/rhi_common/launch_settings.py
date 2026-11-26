@@ -31,9 +31,9 @@ looks like: a short word can be a private alias as well as a public name.
 **What is left out**, known and never read: the model, which is the one argument that is no
 option and holds the model bucket's name or a local folder; `--rhi-fetch-model`, which holds the
 same location; `--served-model-name`, the pool's name; `--port` and `--allowed-media-domains`,
-the same for every pool; `--kv-cache-metrics` and `--custom-histogram-buckets`, which change what
-the engine reports and not what it serves. The image and the model revision are not arguments:
-`rhi_lifecycle_release_info` carries them.
+the same for every pool; `--kv-cache-metrics`, `--enable-prompt-tokens-details` and
+`--custom-histogram-buckets`, which change what the engine reports and not what it serves. The
+image and the model revision are not arguments: `rhi_lifecycle_release_info` carries them.
 
 **How an argument is written does not count.** `--option value` and `--option=value` are one
 setting, the order of the options is not kept, and a number is read as a number. What vLLM does
@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 # The version of this contract, which is part of what is hashed.
-CONTRACT = 1
+CONTRACT = 2
 
 # What stands for a fingerprint where there is none to give. No fingerprint is this word.
 UNAVAILABLE = "unavailable"
@@ -162,7 +162,7 @@ _SWITCHES = frozenset({"--enable-prefix-caching", "--enable-auto-tool-choice", "
 _LEFT_OUT_VALUED = frozenset({
     "--rhi-fetch-model", "--served-model-name", "--port", "--allowed-media-domains", "--custom-histogram-buckets",
 })  # fmt: skip
-_LEFT_OUT_SWITCHES = frozenset({"--kv-cache-metrics"})
+_LEFT_OUT_SWITCHES = frozenset({"--kv-cache-metrics", "--enable-prompt-tokens-details"})
 
 
 def _switch(option: str) -> tuple[str, bool]:

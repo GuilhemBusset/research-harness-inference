@@ -35,7 +35,15 @@ name each option in full and take its type and default from an attribute of a co
   the most requests running at once;
 - `--kv-cache-metrics`: `--kv-cache-metrics` in `EngineArgs.add_cli_args`, from
   `ObservabilityConfig.kv_cache_metrics` in `vllm/config/observability.py`, a boolean that is
-  false when left out.
+  false when left out;
+- `--enable-prompt-tokens-details`: `BaseFrontendArgs.enable_prompt_tokens_details` in
+  `vllm/entrypoints/common/cli_args.py`, which `FrontendArgs` inherits, a boolean that is false
+  when left out. Left out, an answer reports no cached input: `_build_anthropic_usage` in
+  `vllm/entrypoints/anthropic/serving.py` leaves a Messages answer's `cache_read_input_tokens`
+  unset and reports the whole prompt as `input_tokens`, and a Chat Completions answer has no
+  `prompt_tokens_details`. With it, a Messages answer reports the cached part as
+  `cache_read_input_tokens` and the rest as `input_tokens`, so its input fields add up to the whole
+  input, as the gateway's usage parsers read them (section 7.2).
 
 **What a pool is given only when its serving settings ask** (`rhi_common.pool_config`). A setting
 the pool leaves out, or gives the value vLLM has by itself, adds no argument:
@@ -216,6 +224,8 @@ def arguments(pool: Pool, *, bucket: str) -> list[str]:
         *("--max-model-len", str(pool.context_length)),
         *("--max-num-seqs", str(pool.target_concurrency)),
         "--kv-cache-metrics",
+        # The cached part of each request's input, in its answer.
+        "--enable-prompt-tokens-details",
     ]
     # The serving settings: one that is as vLLM runs by itself adds nothing.
     if pool.kv_cache_bits == 8:
