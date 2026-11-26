@@ -643,6 +643,32 @@ def test_an_unreadable_earlier_booking_keeps_the_cleanup_unconfirmed_while_the_h
     assert 'cleanup: "unconfirmed"' in shown_status(driver, run_id).splitlines()
 
 
+def test_a_failed_run_whose_cleanup_became_unconfirmed_comments_the_new_cleanup(
+    driver: Driver, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver.pool.hosts = 1
+    assert run(driver) == controller.Exit.INCOMPLETE
+    run_id = only_run(driver)
+    assert "`released`" in comments(driver)[-1]
+
+    def died(*_args: object) -> None:
+        raise Died
+
+    driver.pool.after_put = died
+    with monkeypatch.context() as patched:
+        patched.setattr(booking.Capacity, "release", died)
+        with pytest.raises(Died):
+            run(driver, "--resume", run_id)
+    (driver.runs / run_id / "booking-1.json").write_text("{not json")
+
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+    assert run(driver, "--resume", run_id) == controller.Exit.INCOMPLETE
+
+    said = [body for body in comments(driver) if "`unconfirmed`" in body]
+    assert len(said) == 1 and said[0] == comments(driver)[-1]
+    assert 'cleanup: "unconfirmed"' in shown_status(driver, run_id).splitlines()
+
+
 def test_a_restart_whose_measurement_cannot_be_prepared_still_stops_the_booking_it_holds(
     driver: Driver, monkeypatch: pytest.MonkeyPatch
 ) -> None:

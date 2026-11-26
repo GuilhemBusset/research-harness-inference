@@ -1358,13 +1358,15 @@ class _Invocation:
         )
 
 
-# The lines of a run's comment that say its result: the ending, the reason, the cells, the evidence.
-_RESULT_LINES = ("### Run ", "- Reason: ", "- Completed cells: ", "- Bundle digest: ")
+# The lines of a run's comment that say its result: the ending, the reason, the cells, the cleanup,
+# the evidence.
+_RESULT_LINES = ("### Run ", "- Reason: ", "- Completed cells: ", "- Cleanup: ", "- Bundle digest: ")
 
 
 def _covers(body: object, result: RunResult) -> bool:
     """Whether a run comment already queued says `result`: the same ending, reason, completed
-    cells and evidence. What it says of the cleanup does not count."""
+    cells, cleanup and evidence. A cleanup outcome that changed, as when a booking journal became
+    unreadable, is commented again."""
     try:
         wanted = publisher.render_run(result)
     except PublishError:
