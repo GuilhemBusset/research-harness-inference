@@ -11,6 +11,11 @@ package, and what `booking` keeps in its journal is private and is never written
 `evaluate.workers` starts and disposes of the containers a trial and its submitted code run in,
 from the image `evaluate.image` prepares.
 
+`evaluate.course` holds the course tasks, one package for each family. `evaluate.course.optimization`
+is the production-planning task: its three instances, the files a trial's workspace is given, and,
+kept outside every workspace, the reference fix and the grader that reads the plan and the table
+a run wrote. The grader needs the standard library only.
+
 `evaluate.plan` expands a suite (`suites/`) into the ordered workload of a profile and the bookings
 that hold it, offline. `evaluate.cli` is the command line, which `scripts/evaluate.sh` runs.
 
