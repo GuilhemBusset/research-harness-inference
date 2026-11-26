@@ -564,7 +564,7 @@ def in_service_of(release: Sequence[common.Series], start: float, end: float) ->
             times.setdefault(instance, {}).setdefault(kind, []).extend(one.values())
     found = {}
     for instance, by_kind in times.items():
-        served = {kind: _covered(taken, start, end) for kind, taken in by_kind.items()}
+        served = {kind: seconds_covered(taken, start, end) for kind, taken in by_kind.items()}
         served = {kind: seconds for kind, seconds in served.items() if seconds > 0}
         if not served:
             continue
@@ -575,7 +575,7 @@ def in_service_of(release: Sequence[common.Series], start: float, end: float) ->
     return found
 
 
-def _covered(taken: Sequence[float], start: float, end: float) -> float:
+def seconds_covered(taken: Sequence[float], start: float, end: float) -> float:
     """The seconds from `start` to `end` within a scrape either side of a time of `taken`: their
     union, inside the window."""
     seconds, covered = 0.0, start
@@ -639,12 +639,14 @@ class Key(StrEnum):
     OUTPUT_DISTRIBUTION = "output_distribution"
 
 
-def _selector(name: Name, suffix: str, pool: str) -> str:
+def selector(name: Name, suffix: str, pool: str) -> str:
+    """The series of `name` on the pool, the samples with `suffix` after the family's name: the
+    pool's, and of those the part the name's own labels select."""
     matchers = [f'pool="{pool}"', *(f'{label}="{value}"' for label, value in name.labels.items())]
     return f"{name}{suffix}{{{','.join(matchers)}}}"
 
 
-def _range(seconds: float) -> str:
+def range_of(seconds: float) -> str:
     """A range of `seconds` to the millisecond, so that it starts where the run did, not at a whole
     second before it: in seconds when they are whole, else in milliseconds."""
     millis = max(1, round(seconds * 1000))
@@ -689,16 +691,16 @@ def reads(pool: str, engine: str, window_seconds: float, counted_seconds: float 
     def increase(name: Name, suffix: str = "") -> Read:
         if not suffix:
             suffix = "_total" if name.kind is Kind.COUNTER else ""
-        return Read(_selector(name, suffix, pool), How.SUM)
+        return Read(selector(name, suffix, pool), How.SUM)
 
     def quantile(fraction: float, name: Name) -> Read:
-        return Read(_selector(name, "_bucket", pool), How.QUANTILE, fraction)
+        return Read(selector(name, "_bucket", pool), How.QUANTILE, fraction)
 
     def gauge(how: How, aggregate: str, name: Name) -> Read:
-        return Read(f"{aggregate} by (instance) ({_selector(name, '', pool)})", how)
+        return Read(f"{aggregate} by (instance) ({selector(name, '', pool)})", how)
 
     ttft, tpot = names[Quantity.TIME_TO_FIRST_TOKEN], names[Quantity.TIME_PER_OUTPUT_TOKEN]
-    capacity = f'{CACHE_CAPACITY_METRIC}{{pool="{pool}"}}[{_range(counted_seconds + SCRAPE_SECONDS)}]'
+    capacity = f'{CACHE_CAPACITY_METRIC}{{pool="{pool}"}}[{range_of(counted_seconds + SCRAPE_SECONDS)}]'
     found = {
         Key.OUTPUT_TOKENS: increase(names[Quantity.OUTPUT_TOKENS]),
         Key.INPUT_TOKENS: increase(names[Quantity.INPUT_TOKENS]),
@@ -1043,7 +1045,7 @@ class Job:
         def one(instance: str, at: float, value: float, le: str = "") -> common.Series:
             return common.Series({"instance": instance, **({"le": le} if le else {})}, ((at, value),))
 
-        covered = _range(after - start + LOOKBACK_SECONDS)
+        covered = range_of(after - start + LOOKBACK_SECONDS)
         answers: dict[Key, list[common.Series]] = {}
         for key, how in reads(self.pool, self.engine, max(end - start, 1.0), after - start).items():
             if how.how is How.LAST:
