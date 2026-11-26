@@ -38,8 +38,14 @@ attempt.
 
 After an error event nothing is read. After a last event only an error event is: no output, no
 time and no usage is taken from what follows it. The status stays on the attempt beside the
-outcome, `None` when none arrived, so an error inside a 200 shows both. The reader is for streamed
-requests: a 200 that is not a stream has no last event and reads as truncated.
+outcome, `None` when none arrived, so an error inside a 200 shows both.
+
+**An answer that is not a stream.** A harness that asks for no stream is answered with one JSON
+document, and the driver says so with the status (`answered(status, stream=False)`). Such an answer
+is `completed` when the document came whole, `error_event` when it is a report of failure, and
+`truncated_stream` or `transport_error` when it did not come whole. Its usage is the document's. It
+has no time of output: nothing of it is an answer before all of it is. A 2xx read as a stream that
+is not one has no last event and reads as truncated.
 
 **Times** are the driver's, in milliseconds on the run's clock, under the names of
 `contracts.RequestRecord`. A chunk has one time, and every event it completes has that time: events
@@ -80,6 +86,8 @@ if TYPE_CHECKING:
 
 # The load generator's name for each route's wire format: the same labels, held equal here.
 _WIRES = {route: Wire(route.value) for route in Route}
+# Bytes: the most of an answer that is not a stream that is held to be read. A larger one is not read.
+WHOLE_ANSWER_BYTES = 8 * 1024 * 1024
 # The last event of a stream that ended well, by its name, on the two routes that name their events.
 STREAM_ENDS = {Route.MESSAGES: frozenset({"message_stop"}), Route.RESPONSES: frozenset(responses.CLEAN_ENDS)}
 FAILURES = tuple(outcome for outcome in RequestOutcome if outcome is not RequestOutcome.COMPLETED)
@@ -153,9 +161,13 @@ def _kind(event: SseEvent, data: Mapping[str, Any]) -> str | None:
     return kind if isinstance(kind, str) else None
 
 
+def _fails(kind: object, data: Mapping[str, Any]) -> bool:
+    """Whether data of this kind is a report of failure, as the gateway tells one (`rhi_gateway.proxy`)."""
+    return kind in FAILURE_EVENTS or data.get("error") is not None or data.get("status") == "failed"
+
+
 def _reports_failure(event: SseEvent, data: Mapping[str, Any]) -> bool:
-    """Whether an event is a report of failure, as the gateway tells one (`rhi_gateway.proxy`)."""
-    return _kind(event, data) in FAILURE_EVENTS or data.get("error") is not None or data.get("status") == "failed"
+    return _fails(_kind(event, data), data)
 
 
 def _ends(route: Route, event: SseEvent, data: Mapping[str, Any] | None) -> bool:
@@ -186,6 +198,8 @@ class StreamReader:
     ) -> None:
         self._route, self._sent, self._retry, self._keep = route, sent_ms, retry, keep
         self._status: int | None = None
+        # The bytes of an answer that is not a stream, until its end; `None` for a stream.
+        self._whole: bytearray | None = None
         self._events = SseReader()
         self._usage: dict[str, Any] = {}
         self._first: int | None = None
@@ -195,13 +209,19 @@ class StreamReader:
         self._outcome: RequestOutcome | None = None
         self._attempt: Attempt | None = None
 
-    def answered(self, status: int) -> None:
-        """The answer's status has arrived."""
+    def answered(self, status: int, *, stream: bool = True) -> None:
+        """The answer's status has arrived. Its body is a stream of events, or, when `stream` is
+        false, one JSON document."""
         self._status = status
+        self._whole = None if stream else bytearray()
 
     def feed(self, chunk: bytes, now_ms: int) -> None:
         """Takes the next bytes of the body, received at `now_ms`."""
         if self._status is None or not 200 <= self._status < 300:
+            return
+        if self._whole is not None:
+            if len(self._whole) <= WHOLE_ANSWER_BYTES:
+                self._whole += chunk
             return
         for event in self._events.feed(chunk):
             if self._outcome is RequestOutcome.ERROR_EVENT:
@@ -232,6 +252,13 @@ class StreamReader:
         attempt, the same one however often asked."""
         if self._attempt is not None:
             return self._attempt
+        if self._whole is not None and len(self._whole) <= WHOLE_ANSWER_BYTES:
+            # The document is whole when it reads as one: cut anywhere, it does not.
+            document = _object(self._whole.decode("utf-8", "replace"))
+            if document is not None:
+                merge_usage(self._usage, usage_in(document))
+                failed = _fails(document.get("type"), document)
+                self._outcome = RequestOutcome.ERROR_EVENT if failed else RequestOutcome.COMPLETED
         if self._status is not None and not 200 <= self._status < 300:
             outcome = RequestOutcome.HTTP_REFUSAL
         elif self._outcome is not None:
@@ -253,7 +280,7 @@ class StreamReader:
             usage=_reported(self._route, self._usage),
         )
         # The stream is read: the end of its last line and its usage object are not held any longer.
-        self._events, self._usage = SseReader(), {}
+        self._events, self._usage, self._whole = SseReader(), {}, None
         if self._keep is not None:
             self._keep(self._attempt)
         return self._attempt

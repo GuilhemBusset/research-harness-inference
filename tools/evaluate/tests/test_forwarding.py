@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, Any
 
@@ -79,7 +80,9 @@ def stream(route: Route, output_tokens: int | None = 5) -> tuple[bytes, bytes]:
         delta = {"type": "content_block_delta", "delta": {"type": "text_delta", "text": ANSWER_TEXT}}
         usage = {"type": "message_delta", "delta": {}, "usage": {"input_tokens": 12, "output_tokens": output_tokens}}
         end = event({"type": "message_stop"}, "message_stop")
-        return event(delta, "content_block_delta"), (b"" if output_tokens is None else event(usage, "message_delta")) + end
+        return event(delta, "content_block_delta"), (
+            b"" if output_tokens is None else event(usage, "message_delta")
+        ) + end
     if route is RESPONSES:
         delta = {"type": "response.output_text.delta", "delta": ANSWER_TEXT}
         usage = {} if output_tokens is None else {"usage": {"input_tokens": 12, "output_tokens": output_tokens}}
@@ -111,8 +114,10 @@ class Call:
         self._handler = handler
         self.path, self.body = handler.path, body
         self.headers = {name.lower(): value for name, value in handler.headers.items()}
-        self.route = next(route for route, path in PATHS.items() if path.split("?")[0] == handler.path.split("?")[0])
-        self.limit = min(body[name] for name in OUTPUT_LIMITS[self.route] if name in body)
+        asked = handler.path.split("?")[0]
+        # A path that generates nothing is of the Messages format, and carries no output limit.
+        self.route = next((route for route, path in PATHS.items() if path.split("?")[0] == asked), MESSAGES)
+        self.limit = min((body[name] for name in OUTPUT_LIMITS[self.route] if name in body), default=0)
 
     def begin(self, status: int = 200) -> None:
         self._handler.send_response(status)
@@ -132,6 +137,16 @@ class Call:
         if hold is not None:
             assert hold.wait(WAIT)
         self.write(end)
+
+    def whole(self, document: dict[str, Any]) -> bytes:
+        """An answer that is not a stream: one JSON document, of a declared length."""
+        payload = json.dumps(document).encode()
+        self._handler.send_response(200)
+        self._handler.send_header("Content-Type", "application/json")
+        self._handler.send_header("Content-Length", str(len(payload)))
+        self._handler.end_headers()
+        self.write(payload)
+        return payload
 
     def closed(self) -> bool:
         """Waits for the other side to close the exchange, and says whether it did."""
@@ -194,10 +209,10 @@ class Clock:
 
 @contextlib.contextmanager
 def forwarding(
-    gateway: Gateway, harness: Harness = Harness.CLAUDE_CODE, *, turns: int = 0, tokens: int = 0
+    gateway: Gateway, harness: Harness = Harness.CLAUDE_CODE, *, turns: int = 0, tokens: int = 0, limits: Limits = PLAN
 ) -> Generator[Forwarder]:
     """A serving forwarder under the plan's limits, of which `turns` and `tokens` are already used."""
-    budget = Budget(PLAN, Clock())
+    budget = Budget(limits, Clock())
     for _ in range(turns):
         budget.settle(budget.admit(turn=True, wanted=1), 0)
     while tokens:
@@ -211,16 +226,18 @@ def forwarding(
 # The trial's side.
 
 
-def send(forwarder: Forwarder, body: dict, route: Route = MESSAGES) -> http.client.HTTPResponse:
+def send(
+    forwarder: Forwarder, body: dict, route: Route = MESSAGES, *, path: str | None = None
+) -> http.client.HTTPResponse:
     """Sends a request as a trial does, with the placeholder it was given, and gives the answer once it has begun."""
     address = urllib.parse.urlsplit(forwarder.url)
     connection = http.client.HTTPConnection(address.hostname or "", address.port, timeout=WAIT)
-    connection.request("POST", PATHS[route], json.dumps(body), {"x-api-key": PLACEHOLDER_KEY})
+    connection.request("POST", path or PATHS[route], json.dumps(body), {"x-api-key": PLACEHOLDER_KEY})
     return connection.getresponse()
 
 
-def ask(forwarder: Forwarder, body: dict, route: Route = MESSAGES) -> tuple[int, bytes]:
-    answer = send(forwarder, body, route)
+def ask(forwarder: Forwarder, body: dict, route: Route = MESSAGES, *, path: str | None = None) -> tuple[int, bytes]:
+    answer = send(forwarder, body, route, path=path)
     with answer:
         return answer.status, answer.read()
 
@@ -273,7 +290,7 @@ def test_a_stream_reaches_the_trial_as_it_arrives_on_its_route_and_its_pool(gate
     gateway.play = lambda call: call.answer(9, hold=read_first)
     text, end = stream(route, 9)
     with forwarding(gateway, Harness.CODEX) as forwarder:
-        answer = send(forwarder, asking(route, limit=32_000 if route is MESSAGES else None), route)
+        answer = send(forwarder, asking(route, limit=9_000 if route is MESSAGES else None), route)
         # The text is read while the gateway still holds the end back: nothing waits for the whole answer.
         first = answer.read1(len(text))
         read_first.set()
@@ -283,8 +300,9 @@ def test_a_stream_reaches_the_trial_as_it_arrives_on_its_route_and_its_pool(gate
     assert (answer.status, first + rest) == (200, text + end)
     [call] = gateway.calls
     assert (call.path, call.body["model"]) == (PATHS[route], POOL)
-    # The output limit the endpoint was given is the request's allowance, declared or not.
-    assert call.limit == forwarder.budget.request_tokens < 32_000
+    # With nothing else in flight, the output limit a request declared is kept as it is; one that
+    # declared none is given all that is left.
+    assert call.limit == (9_000 if route is MESSAGES else 32_000)
     [measured] = evidence.requests
     assert (measured.attempt.route, measured.attempt.outcome) == (route, RequestOutcome.COMPLETED)
     assert measured.attempt.first_output_ms is not None
@@ -369,6 +387,62 @@ def test_durable_evidence_holds_no_prompt_answer_key_or_address(gateway: Gateway
         assert private not in kept
 
 
+def test_a_token_count_goes_to_the_assigned_pool_and_an_unknown_path_goes_nowhere(gateway: Gateway) -> None:
+    gateway.play = lambda call: call.whole({"input_tokens": 3})
+    with forwarding(gateway) as forwarder:
+        status, counted = ask(forwarder, asking(), path="/v1/messages/count_tokens")
+        elsewhere, _ = ask(forwarder, asking(), path="/v1/made-up")
+        evidence = forwarder.evidence()
+    assert (status, json.loads(counted), elsewhere) == (200, {"input_tokens": 3}, 404)
+    [call] = gateway.calls
+    assert (call.path, call.body["model"]) == ("/v1/messages/count_tokens", POOL)
+    assert call.headers["authorization"] == "Bearer " + CANARY_KEY
+    # A count generates nothing: it is no turn and no attempt.
+    assert (evidence.model_turns, evidence.requests, evidence.open_reservations) == (0, (), 0)
+
+
+def test_an_answer_that_is_not_a_stream_is_measured_whole_with_the_usage_it_reports(gateway: Gateway) -> None:
+    message = {"role": "assistant", "content": ANSWER_TEXT}
+    usage = {"prompt_tokens": 12, "completion_tokens": 18}
+    sent: list[bytes] = []
+    gateway.play = lambda call: sent.append(call.whole({"choices": [{"index": 0, "message": message}], "usage": usage}))
+    asked = asking(CHAT)
+    del asked["stream"]
+    with forwarding(gateway, Harness.SDK_TOOL_LOOP) as forwarder:
+        status, received = ask(forwarder, asked, CHAT)
+        assert settled(forwarder)
+        evidence = forwarder.evidence()
+    assert (status, [received]) == (200, sent)
+    [measured] = evidence.requests
+    assert measured.attempt.outcome is RequestOutcome.COMPLETED
+    assert (measured.charged_tokens, evidence.generated_tokens, evidence.tally.usage_missing) == (18, 18, 0)
+
+
+def test_an_answer_whose_end_does_not_reach_the_trial_is_a_failed_attempt_charged_what_it_generated(
+    gateway: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sendall = socket.socket.sendall
+    with forwarding(gateway) as forwarder:
+        port = urllib.parse.urlsplit(forwarder.url).port
+
+        def lost(sock: socket.socket, data: Any, *flags: int) -> None:
+            # The forwarder's write of the stream's last event to the trial fails.
+            if sock.getsockname()[1] == port and b"message_stop" in bytes(data):
+                raise BrokenPipeError
+            return sendall(sock, data, *flags)
+
+        monkeypatch.setattr(socket.socket, "sendall", lost)
+        status, received = ask(forwarder, asking())
+        assert settled(forwarder)
+        evidence = forwarder.evidence()
+    assert status == 200
+    assert b"message_stop" not in received
+    [measured] = evidence.requests
+    assert (measured.attempt.outcome, measured.closed_by_client) == (RequestOutcome.TRUNCATED_STREAM, True)
+    # The gateway sent the answer whole, with its usage: that is what the trial is charged.
+    assert (measured.charged_tokens, evidence.generated_tokens) == (5, 5)
+
+
 # The limits, for calls that overlap and for answers whose size is not known.
 
 
@@ -390,6 +464,73 @@ def test_of_two_children_asking_for_the_last_turn_at_once_one_is_refused(gateway
         evidence = forwarder.evidence()
     assert (evidence.model_turns, evidence.refusals, len(gateway.calls)) == (32, 1, 1)
     assert fails(evidence, FailureReason.TURN_LIMIT)
+
+
+def test_one_failed_turn_is_retried_by_one_request_and_a_second_one_takes_a_turn(gateway: Gateway) -> None:
+    release = threading.Event()
+    body = asking()
+    with forwarding(gateway, turns=31) as forwarder:
+        gateway.play = lambda call: call.begin(503)
+        assert ask(forwarder, body)[0] == 503
+        assert settled(forwarder)
+        gateway.play = lambda call: call.answer(hold=release)
+        assert gateway.arrived.acquire(timeout=WAIT)
+        # Two children send the failed turn again at once: one is its retry, the other a 33rd turn.
+        first = send(forwarder, body)
+        assert gateway.arrived.acquire(timeout=WAIT)
+        refused, _ = ask(forwarder, body)
+        release.set()
+        with first:
+            first.read()
+        assert settled(forwarder)
+        evidence = forwarder.evidence()
+    assert (first.status, refused, len(gateway.calls)) == (200, 429, 2)
+    assert (evidence.model_turns, evidence.retries) == (32, 1)
+    assert fails(evidence, FailureReason.TURN_LIMIT)
+
+
+def test_a_request_waits_for_the_tokens_a_call_in_flight_holds_and_keeps_the_limit_it_declared(
+    gateway: Gateway,
+) -> None:
+    release = threading.Event()
+    generated = iter([5, 9_000])
+    gateway.play = lambda call: call.answer(next(generated), hold=release)
+    with forwarding(gateway) as forwarder, ThreadPoolExecutor(2) as pool:
+        # The first child declares no output limit, so it holds all that is left while it runs.
+        first = pool.submit(ask, forwarder, asking(text="made-up part one"))
+        assert gateway.arrived.acquire(timeout=WAIT)
+        second = pool.submit(ask, forwarder, asking(limit=9_000, text="made-up part two"))
+        # The second is neither sent on nor refused while the first holds every token.
+        assert not gateway.arrived.acquire(timeout=0.3)
+        assert not second.done()
+        release.set()
+        assert (first.result()[0], second.result()[0]) == (200, 200)
+        assert settled(forwarder)
+        evidence = forwarder.evidence()
+    # What the first did not generate was given back, and the second got what it asked for.
+    assert [call.limit for call in gateway.calls] == [32_000, 9_000]
+    assert (evidence.generated_tokens, evidence.refusals, evidence.may_pass) == (9_005, 0, True)
+
+
+def test_a_request_for_several_choices_holds_the_allowance_of_each_or_is_refused(gateway: Gateway) -> None:
+    # Each choice generates up to the limit and no usage is reported: the charge is the allowance.
+    gateway.play = lambda call: call.answer(None)
+    with forwarding(gateway, Harness.SDK_TOOL_LOOP, tokens=31_800) as forwarder:
+        assert ask(forwarder, {**asking(CHAT, limit=150), "n": 2}, CHAT)[0] == 200
+        assert settled(forwarder)
+        # 200 tokens were left for two choices: each is limited to 100, and both are charged.
+        assert (gateway.calls[0].limit, gateway.calls[0].body["n"], forwarder.budget.generated_tokens) == (
+            100,
+            2,
+            32_000,
+        )
+    gateway.calls.clear()
+    with forwarding(gateway, Harness.SDK_TOOL_LOOP, tokens=31_999) as forwarder:
+        # One token is left: two choices of one token each do not fit, and are not sent.
+        assert ask(forwarder, {**asking(CHAT, limit=1), "n": 2}, CHAT)[0] == 429
+        evidence = forwarder.evidence()
+    assert (gateway.calls, evidence.generated_tokens, evidence.open_reservations) == ([], 31_999, 0)
+    assert fails(evidence, FailureReason.TOKEN_LIMIT)
 
 
 def test_two_children_in_flight_together_cannot_generate_past_the_token_cap(gateway: Gateway) -> None:
@@ -426,7 +567,11 @@ def test_missing_usage_is_recorded_as_missing_and_charged_its_allowance(gateway:
         # The stream completed and reported nothing: no count is made up for it, and the trial is
         # charged the most it can have generated, the 600 tokens it was allowed.
         assert (measured.attempt.outcome, measured.attempt.usage) == (RequestOutcome.COMPLETED, None)
-        assert (gateway.calls[0].limit, measured.charged_tokens, forwarder.budget.generated_tokens) == (600, 600, 32_000)
+        assert (gateway.calls[0].limit, measured.charged_tokens, forwarder.budget.generated_tokens) == (
+            600,
+            600,
+            32_000,
+        )
         assert ask(forwarder, asking(text="made-up next turn"))[0] == 429
         evidence = forwarder.evidence()
     assert (evidence.tally.usage_missing, evidence.usage, len(gateway.calls)) == (1, None, 1)
@@ -476,6 +621,44 @@ def test_an_expired_deadline_stops_the_request_and_the_trial_within_the_bound(ga
     assert (measured.cancelled, measured.attempt.failed) == (True, True)
     assert (evidence.invalid, evidence.open_reservations, evidence.tally.unfinished) == (None, 0, 0)
     assert len(gateway.calls) == 1
+    assert fails(evidence, FailureReason.TIMEOUT)
+
+
+def test_a_trial_whose_process_ends_past_its_deadline_is_a_timeout(gateway: Gateway, tmp_path: Path) -> None:
+    with forwarding(gateway, limits=replace(PLAN, trial_wall_time_ms=80)) as forwarder:
+        # The process outlives its 80 ms and ends by itself, long before the supervisor's next look.
+        command = [sys.executable, "-c", "import time; time.sleep(0.3)"]
+        evidence = Supervisor(forwarder, poll_s=2.0).run(
+            command, env=trial_environment(forwarder.url, tmp_path), cwd=tmp_path
+        )
+    assert fails(evidence, FailureReason.TIMEOUT)
+
+
+def test_a_deadline_that_passes_while_the_gateway_is_being_reached_settles_the_request(
+    gateway: Gateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lookup, release = socket.getaddrinfo, threading.Event()
+    port = urllib.parse.urlsplit(gateway.url).port
+    with forwarding(gateway) as forwarder:
+        clock: Any = forwarder.budget.clock
+
+        def stuck(host: Any, service: Any, *more: Any, **named: Any) -> Any:
+            # The connection to the gateway does not come about, and the 12 minutes pass meanwhile.
+            if service == port:
+                clock.skipped = PLAN.trial_wall_time_ms
+                release.wait(WAIT)
+            return lookup(host, service, *more, **named)
+
+        monkeypatch.setattr(socket, "getaddrinfo", stuck)
+        try:
+            evidence = supervised(forwarder, tmp_path)[1]()
+        finally:
+            release.set()
+    # The request had no connection a cancellation could shut: it is settled all the same.
+    [measured] = evidence.requests
+    assert (measured.cancelled, measured.charged_tokens) == (True, 0)
+    assert (evidence.invalid, evidence.open_reservations, evidence.tally.unfinished) == (None, 0, 0)
+    assert gateway.calls == []
     assert fails(evidence, FailureReason.TIMEOUT)
 
 

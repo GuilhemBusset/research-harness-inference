@@ -454,3 +454,36 @@ def test_a_stream_that_did_not_complete_has_no_speed_whatever_it_reported(route:
     assert attempt.usage is not None
     assert attempt.usage.output_tokens == 11
     assert (attempt.output_tokens_per_second, attempt.eligible) == (None, False)
+
+
+# An answer that is not a stream.
+
+WHOLE_USAGE = {
+    Route.MESSAGES: {"input_tokens": 12, "output_tokens": 7},
+    Route.RESPONSES: {"input_tokens": 12, "output_tokens": 7},
+    Route.CHAT_COMPLETIONS: {"prompt_tokens": 12, "completion_tokens": 7},
+}
+
+
+@pytest.mark.parametrize("route", list(Route))
+def test_an_answer_that_is_not_a_stream_is_completed_when_its_document_came_whole(route: Route) -> None:
+    document = json.dumps({"id": "made-up", "error": None, "usage": WHOLE_USAGE[route]}).encode()
+    refused = json.dumps({"type": "error", "error": {"message": ERROR_TEXT}}).encode()
+
+    def read(*chunks: bytes, broken: bool = False) -> Attempt:
+        reader = Attempts().send(route, 0)
+        reader.answered(200, stream=False)
+        for at, chunk in enumerate(chunks):
+            reader.feed(chunk, at)
+        return reader.end(10, transport_error=broken)
+
+    whole = read(document[:9], document[9:])
+    assert (whole.outcome, whole.usage) == (
+        RequestOutcome.COMPLETED,
+        Usage(input_tokens=12, cached_input_tokens=None, output_tokens=7),
+    )
+    # Nothing of it was output before all of it was: it has no time of output, and no speed.
+    assert (output_times(whole), whole.eligible) == ((None, None, None), False)
+    assert read(document[:-1]).outcome is RequestOutcome.TRUNCATED_STREAM
+    assert read(document[:-1], broken=True).outcome is RequestOutcome.TRANSPORT_ERROR
+    assert read(refused).outcome is RequestOutcome.ERROR_EVENT
