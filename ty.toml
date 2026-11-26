@@ -1,6 +1,6 @@
 # ty (https://docs.astral.sh/ty/) for the repository's Python: the implement loop engine, the
-# hygiene scanner, the backlog tooling, the measurement recorder, the advisory check,
-# the CDK app, its services and the tests. From the repository root:
+# hygiene scanner, the backlog tooling, the measurement recorder, the advisory check, the
+# evaluation tool, the CDK app, its services and the tests. From the repository root:
 #
 #   env -u PYTHONPATH uv run --locked ty check
 #
