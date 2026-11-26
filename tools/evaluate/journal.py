@@ -73,7 +73,9 @@ observations it has, flushed to disk first as for a checkpoint. No attempt is ev
 attempt of a cell supersedes the earlier ones of that cell, which were interrupted or
 checkpointed invalid, and each of them then names it in `replaced_by`. The attempt of a cell that
 counts is its last. A cell whose checkpoint is valid for qualification is measured: a new attempt
-of it is refused (`Refusal.CELL_ALREADY_MEASURED`), so that no retry puts a result aside.
+of it is refused (`Refusal.CELL_ALREADY_MEASURED`), so that no retry puts a result aside. A cell
+that is no measurement and is run in every booking, as the warm-up is, is started `again`: its
+earlier checkpoint is then superseded instead.
 
 **A write cut inside a line.** A driver can die halfway through an append, which leaves a last
 line with no end. A record is one once its newline is written: `observations` gives the whole
@@ -681,16 +683,18 @@ class Journal:
         lines, unfinished = _whole_lines(file)
         return (*_seal(lines), unfinished)
 
-    def start_cell(self, cell: int, workload: str, served: str) -> Attempt:
+    def start_cell(self, cell: int, workload: str, served: str, *, again: bool = False) -> Attempt:
         """Opens a new attempt of `cell` under the two fingerprints. Cells run one at a time. The
         earlier attempts of the cell are kept, and name this one as their replacement. A cell
-        that has a checkpoint a resume reuses is not attempted again: what it measured stays."""
+        that has a checkpoint a resume reuses is not attempted again: what it measured stays.
+        `again` is for a cell that is no measurement and is run in every booking, as the warm-up
+        is: its earlier checkpoint is then superseded instead."""
         _whole_number(cell, 0, _MAX_CELL)
         if not all(isinstance(one, str) and _FINGERPRINT.fullmatch(one) for one in (workload, served)):
             raise JournalError(Refusal.INVALID_VALUE)
         if any(attempt.status is AttemptStatus.RUNNING for attempt in self.attempts):
             raise JournalError(Refusal.ATTEMPT_RUNNING)
-        if any(attempt.cell == cell and attempt.reusable for attempt in self.attempts):
+        if not again and any(attempt.cell == cell and attempt.reusable for attempt in self.attempts):
             raise JournalError(Refusal.CELL_ALREADY_MEASURED)
         self._compatible(workload, served)
         new = Attempt(len(self.attempts), cell, workload, served, AttemptStatus.RUNNING, None, None, None, None)

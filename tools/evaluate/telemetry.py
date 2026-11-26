@@ -941,6 +941,28 @@ def _traffic(series: Sequence[Series], window: Window, driver: Driver) -> Traffi
     )
 
 
+def identity_requests(answers: Answers, window: Window, aliases: Sequence[str]) -> dict[str, float | None]:
+    """The gateway's count of each alias's requests over the window, by the rules the cohort's
+    count is read by: the series a task of the gateway closed the window with, each counted from
+    zero when it begins in the window. `None` for an alias no series of the window counts. An alias
+    selects a series and is never written."""
+    by_task: dict[str, list[Series]] = {}
+    for one in answers.get(Source.GATEWAY_REQUESTS, ()):
+        by_task.setdefault(one.labels.get("instance", ""), []).append(one)
+    closed = [one for held in by_task.values() for one in _closed(held, window)]
+    found: dict[str, float | None] = {}
+    for alias in aliases:
+        risen = [
+            increase
+            for one in closed
+            if one.labels.get("alias", "") == alias
+            and (counted := _risen(one, window, from_zero=True)) is not None
+            and _within(increase := counted[0])
+        ]
+        found[alias] = sum(risen) if risen else None
+    return found
+
+
 def _reasons(hosts: Sequence[Host], traffic: Traffic) -> tuple[Reason, ...]:
     """Why a window of these hosts and this traffic cannot qualify, each reason once, in order."""
     reasons: set[Reason] = set()

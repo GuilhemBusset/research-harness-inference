@@ -106,6 +106,13 @@ def test_the_hosts_booked_are_a_treatment_and_not_the_workload(capsys: pytest.Ca
     assert two["host_hours"] == pytest.approx(2 * one["host_hours"], abs=0.002)
 
 
+def test_another_replay_fixture_is_another_workload() -> None:
+    assert SUITE.replay_fixture_digest == plan.file_digest(plan.REPLAY_FIXTURE)
+    same = plan.expand(SUITE, Profile.SCREEN, 2)
+    other = plan.expand(dataclasses.replace(SUITE, replay_fixture_digest="sha256:" + "0" * 64), Profile.SCREEN, 2)
+    assert other.workload_hash != same.workload_hash
+
+
 def test_a_qualification_of_eight_seats_has_162_trials() -> None:
     planned = plan.expand(SUITE, Profile.QUALIFY, 8)
     trials = planned.workload.trials

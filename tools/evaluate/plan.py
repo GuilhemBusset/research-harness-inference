@@ -5,15 +5,20 @@ and measurement protocol").
 `expand` turns a suite (`suites/<name>.toml`), a profile and a class size into a `Plan`: a
 `contracts.Workload`, which is what a run's manifest records, and for each of its cells what the
 identity of a cell does not say (its roles, admissions, drain, identities, seeds, prefix namespace
-and arrivals). It reads the suite and nothing else: no credentials, no network, no clock, and no
-random generator, so the same suite and seeds give the same plan on any machine.
+and arrivals). It reads the suite, and the replay's course fixture for its digest, and nothing
+else: no credentials, no network, no clock, and no random generator, so the same suite and seeds
+give the same plan on any machine.
 
 **The workload.** The hash `plan` prints is `contracts.workload_identity` of that workload, the
 `workload_id` of every manifest built on it. The arrivals and the rest of what is planned for a
-cell are in it through the workload's `arrival_digest` and `protocol_digest`. It pins the
-harnesses its trials run on and no other: a screen, which runs the anchor only, is the same
-workload whatever version another harness is at. The number of hosts is a treatment and is not in
-it: one and two hosts are planned the same workload.
+cell are in it through the workload's `arrival_digest` and `protocol_digest`. So is the course
+fixture the replay builds its requests from (`REPLAY_FIXTURE`): a changed fixture is another
+workload. The protocol names its digest only when it is not `FIRST_REPLAY_FIXTURE`, the fixture
+every workload was planned on before the protocol named one, so that those workloads, and the
+evidence saved under them, keep their identity. It pins the harnesses its trials run on and no
+other: a screen, which runs the anchor only, is the same workload whatever version another harness
+is at. The number of hosts is a treatment and is not in it: one and two hosts are planned the same
+workload.
 
 **The order.** The warm-up first, then one round for each repetition: the capacity sweep, the live
 tasks at low load, the live tasks at class size, the class opening. The cells of a round start a
@@ -54,7 +59,7 @@ import tomllib
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from evaluate import contracts
 from evaluate.contracts import (
@@ -80,7 +85,14 @@ from evaluate.contracts import (
     Workload,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 SUITES = Path(__file__).resolve().parent / "suites"
+# The course fixture the replay draws its tool turns from (`traces.COURSE`), by its bytes.
+REPLAY_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "replay" / "course.json"
+# Its digest when workloads did not name it: a workload on it leaves it out of its protocol.
+FIRST_REPLAY_FIXTURE = "sha256:d2869cbc3755f734ad8bc2341b28838a3c5b5aa7bf3053c14f383afd080b277f"
 DEFAULT_SUITE = "course-v1"
 HOUR_MS = 3_600_000
 # Several-agents doubles the slots of a class, and a cell has 1024 at most.
@@ -174,6 +186,8 @@ class SuiteSpec:
     profiles: dict[Profile, ProfileSpec]
     estimates: Estimates
     protocol: dict[str, Any]
+    # The digest of the course fixture the replay sends from, as it was when the suite was read.
+    replay_fixture_digest: str
 
     def pairs(self, profile: Profile) -> list[tuple[Task, str, Harness]]:
         """The instance/harness pairs the profile requires, each with its task."""
@@ -328,6 +342,11 @@ def _digest(value: object) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def file_digest(path: Path) -> str:
+    """The digest of a file's bytes."""
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _derive(*parts: object) -> int:
     """A seed, or any 32-bit number, that depends on every part and on nothing else."""
     return int(_digest(list(parts))[7:15], 16)
@@ -415,6 +434,7 @@ def _read(name: str, raw: dict[str, Any]) -> SuiteSpec:
         profiles={profile: _profile(raw["profiles"][profile]) for profile in Profile},
         estimates=Estimates(**{key: _whole(value) for key, value in raw["estimates"].items()}),
         protocol={key: raw[key] for key in _PROTOCOL},
+        replay_fixture_digest=file_digest(REPLAY_FIXTURE),
     )
 
 
@@ -521,6 +541,29 @@ class _Expansion:
         )
 
 
+def _digests(spec: SuiteSpec, profile: Profile, cells: Sequence[PlannedCell]) -> tuple[str, str, str]:
+    """The suite, arrival and protocol digests of a workload: of the suite, of the arrivals of
+    its cells, and of the suite's protocol with the profile and what was planned for each cell."""
+    protocol = spec.protocol | {
+        "profile": spec.profiles[profile].table,
+        "background": {task: spec.background[task] for task in sorted(spec.background)},
+        "core": sorted(spec.core),
+        "cells": [cell.planned() for cell in cells],
+    }
+    if spec.replay_fixture_digest != FIRST_REPLAY_FIXTURE:
+        protocol["replay_fixture_digest"] = spec.replay_fixture_digest
+    arrivals = _digest([list(cell.arrivals_ms) for cell in cells])
+    return contracts.content_hash(spec.suite), arrivals, _digest(protocol)
+
+
+def digests_hold(plan: Plan) -> bool:
+    """Whether the plan's workload still names what its spec and its cells would send: the suite,
+    arrival and protocol digests computed again from them are the ones the workload froze."""
+    workload = plan.workload
+    frozen = (workload.suite_digest, workload.arrival_digest, workload.protocol_digest)
+    return _digests(plan.spec, workload.profile, plan.cells) == frozen
+
+
 def expand(
     spec: SuiteSpec,
     profile: Profile,
@@ -618,20 +661,15 @@ def expand(
         if len(seeds_used) != chosen.repetitions:
             # Two repetitions on one seed would be, in part, one measurement made twice.
             raise PlanError(Refusal.INVALID_REQUEST)
-    protocol = spec.protocol | {
-        "profile": chosen.table,
-        "background": {task: spec.background[task] for task in sorted(spec.background)},
-        "core": sorted(spec.core),
-        "cells": [cell.planned() for cell in cells],
-    }
     scheduled = {trial.harness for trial in plan.trials}
+    suite_digest, arrival_digest, protocol_digest = _digests(spec, profile, cells)
     try:
         workload = Workload(
             profile=profile,
             students=students,
-            suite_digest=contracts.content_hash(spec.suite),
-            arrival_digest=_digest([list(cell.arrivals_ms) for cell in cells]),
-            protocol_digest=_digest(protocol),
+            suite_digest=suite_digest,
+            arrival_digest=arrival_digest,
+            protocol_digest=protocol_digest,
             input_seed=input_seed,
             schedule_seed=schedule_seed,
             cache_policy=spec.cache_policy,
