@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-import contracts
-from contracts import (
+from evaluate import contracts
+from evaluate.contracts import (
     CellIdentity,
     CellRecord,
     CellStatus,
@@ -58,7 +58,7 @@ from contracts import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-TOOL = Path(__file__).resolve().parents[1]
+TOOLS = Path(__file__).resolve().parents[2]
 
 
 class _Drop:
@@ -325,14 +325,14 @@ def test_a_document_reads_back_equal_with_the_same_bytes_and_hash(kind: str) -> 
 def test_another_interpreter_reads_the_same_hashes_and_identities() -> None:
     lines = [contracts.dumps(document) for document in KNOWN.values()]
     program = (
-        "import sys, contracts\n"
+        "import sys\nfrom evaluate import contracts\n"
         "for line in sys.stdin.read().splitlines():\n"
         "    document = contracts.parse(line)\n"
         "    ids = [document.workload_id, document.treatment_id, document.run_id] if document.KIND == 'manifest' else []\n"
         "    print(contracts.content_hash(document), contracts.dumps(document) == line, *ids)\n"
     )
     # Another hash seed: nothing of the bytes may rest on the order a set or a dict happens to have.
-    environment = {**os.environ, "PYTHONPATH": str(TOOL), "PYTHONHASHSEED": "745"}
+    environment = {**os.environ, "PYTHONPATH": str(TOOLS), "PYTHONHASHSEED": "745"}
     printed = subprocess.run(
         [sys.executable, "-c", program],
         input="\n".join(lines),

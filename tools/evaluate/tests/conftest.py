@@ -1,6 +1,6 @@
-"""The tool is a set of modules, not a package: put its folder on sys.path so the tests import `contracts`."""
+"""The tool is a package under `tools`: put that folder on sys.path so the tests import `evaluate`."""
 
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
