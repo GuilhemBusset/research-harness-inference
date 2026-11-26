@@ -474,10 +474,11 @@ class _Drive:
         first_request: int,
         evidence: Evidence,
         started: asyncio.Event | None = None,
+        first_conversation: int = 0,
     ) -> None:
         self.plan, self.cell, self.gateway, self.keys, self.stops, self.sizes = plan, cell, gateway, keys, stops, sizes
         self.evidence = evidence
-        self.started = started
+        self.started, self.first_conversation = started, first_conversation
         self.clock = gateway.clock
         self.rule = _RULES[cell.identity.phase]
         self.course = traces.read_course()
@@ -496,7 +497,7 @@ class _Drive:
     def conversation(self, slot: int, ordinal: int) -> tuple[int, traces.Trace]:
         """Conversation `ordinal` of a slot: its number in the records, and its trace."""
         cell = self.cell
-        number = slot + ordinal * cell.replay_slots
+        number = self.first_conversation + slot + ordinal * cell.replay_slots
         drawn = cell.identity.cell * CONVERSATIONS + number
         return number, traces.build(
             self.gateway.model, cell.input_seed, cell.prefix_namespace, drawn, sizes=self.sizes, course=self.course
@@ -777,6 +778,7 @@ async def run_cell(
     first_request: int = 0,
     evidence: Evidence | None = None,
     started: asyncio.Event | None = None,
+    first_conversation: int = 0,
 ) -> CellRun:
     """Drives cell `cell` of the plan on the gateway and returns what it left.
 
@@ -787,7 +789,9 @@ async def run_cell(
     prefix cache, and takes what this one shows: without it nothing was shown before, and every
     student of the cell must meet the prefix uncached here, as every student of a class opening
     must whatever was shown before. `started`, when given, is set at the instant the cell starts,
-    its record's `started_ms`: before any of its requests is sent.
+    its record's `started_ms`: before any of its requests is sent. `first_conversation` is the
+    number of its first conversation: a cell driven again, beside another trial of it, goes on from
+    the conversations it sent before, each with a transcript of its own.
 
     `ReplayError`, with nothing sent, for fewer distinct keys than the cell has identities, for a
     warm-up or a live cell that nothing would end, and for a suite that replays on another route.
@@ -811,5 +815,6 @@ async def run_cell(
         first_request,
         Evidence() if evidence is None else evidence,
         started,
+        first_conversation,
     )
     return await drive.run()

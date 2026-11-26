@@ -91,7 +91,8 @@ from evaluate.contracts import (
     TrialRecord,
 )
 from evaluate.course import analysis, optimization, research, revision
-from evaluate.forwarding import CANCEL_S, Budget, Forwarder
+from evaluate.forwarding import CANCEL_S, Budget, Evidence, Forwarder
+from evaluate.streams import Attempts
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Mapping, Sequence
@@ -99,7 +100,7 @@ if TYPE_CHECKING:
 
     from evaluate.adapters import Delegation
     from evaluate.contracts import HarnessAssignment, RequestRecord
-    from evaluate.forwarding import Evidence
+    from evaluate.contracts import Task as SuiteTask
     from evaluate.plan import Plan, PlannedCell, Role
 
 # The student a live trial runs as: the seat `replay.reserved_seats` keeps, the first.
@@ -245,10 +246,12 @@ class CellRan:
     @property
     def complete(self) -> bool:
         """Whether every planned trial of the cell has an attempt that counts, each with its whole
-        background: an invalid attempt leaves it incomplete until it is replaced."""
+        background, and the background measured what the plan asked of it (`valid_for_qualification`:
+        a driver that lagged past its tolerance, or a cell short of its evidence, does not count):
+        an invalid attempt leaves it incomplete until it is replaced."""
         counted = {one.record.trial for one in self.trials if one.record.counts_as_attempt}
         record = self.background.record
-        loaded = record is not None and record.status is CellStatus.COMPLETE
+        loaded = record is not None and record.valid_for_qualification
         return loaded and counted == set(self.cell.trials)
 
 
@@ -285,6 +288,15 @@ class Run:
 
 def _family(trial: TrialIdentity) -> Family:
     return Family(trial.instance_id.split(".")[0])
+
+
+def task_of(plan: Plan, trial: TrialIdentity) -> SuiteTask:
+    """The task of the suite whose instance the trial runs."""
+    return next(
+        task
+        for task in plan.spec.suite.tasks
+        if any(instance.instance_id == trial.instance_id for instance in task.instances)
+    )
 
 
 def live_cells(plan: Plan) -> tuple[int, ...]:
@@ -337,42 +349,66 @@ class _Runner:
     async def cell(self, cell: int) -> CellRan:
         planned = self.plan.cells[cell]
         executed: list[Executed] = []
+        # The number of the next background conversation: each attempt's replay goes on from the
+        # last one the attempt before it sent, so that no conversation's transcript is sent twice.
+        conversation = 0
         for trial in planned.trials:
             if self.cancel.is_set():
                 break
-            executed.append(await self.attempt(planned, self.plan.workload.trials[trial]))
+            one = await self.attempt(planned, self.plan.workload.trials[trial], conversation)
+            executed.append(one)
+            if one.background is None:
+                # A replay that broke ends its cell, as a cell ends at a request it could not
+                # record: what it sent is not known, nor which conversation could come next.
+                break
+            numbers = [request.conversation for request in one.background.requests]
+            conversation = max(numbers, default=conversation - 1) + 1
         return CellRan(planned, tuple(executed))
 
-    async def attempt(self, cell: PlannedCell, trial: TrialIdentity) -> Executed:
+    async def attempt(self, cell: PlannedCell, trial: TrialIdentity, conversation: int) -> Executed:
         """One attempt in its own background: started before it, sending until it has ended,
-        drained before it is graded."""
-        finished, started, stop = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        drained before it is graded. When the task running it is cancelled, the background stops
+        sending and cuts its streams at once, while the attempt's worker is released."""
+        finished, started, stop, halt = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
         background = asyncio.ensure_future(
             replay.run_cell(
                 self.plan,
                 cell.identity.cell,
                 self.gateway,
                 self.keys,
-                stops=replay.Stops(finished=finished, cancel=self.cancel),
+                stops=replay.Stops(finished=finished, cancel=halt),
                 first_request=self.request,
                 evidence=self.evidence,
                 started=started,
+                first_conversation=conversation,
             )
         )
         # The attempt stops at once when the run is cancelled or its background ends before it.
-        watch = asyncio.ensure_future(self._watch(background, stop))
+        watch = asyncio.ensure_future(self._watch(background, stop, halt))
         try:
             await _first(started.wait(), asyncio.shield(background))
             if not started.is_set():
                 return self._unstarted(trial)
-            return await self._attempted(trial, background, finished, stop)
+            live = asyncio.ensure_future(self._attempted(trial, background, finished, stop))
+            try:
+                return await asyncio.shield(live)
+            except asyncio.CancelledError:
+                # Nothing more is sent beside an attempt whose run was cancelled, while it unwinds.
+                halt.set()
+                stop.set()
+                live.cancel()
+                await _settled(asyncio.wait({live}))
+                raise
         finally:
+            halt.set()
             watch.cancel()
             background.cancel()
             await _settled(asyncio.gather(watch, background, return_exceptions=True))
 
-    async def _watch(self, background: asyncio.Future[replay.CellRun], stop: asyncio.Event) -> None:
+    async def _watch(self, background: asyncio.Future[replay.CellRun], stop: asyncio.Event, halt: asyncio.Event) -> None:
         await _first(asyncio.shield(background), self.cancel.wait())
+        if self.cancel.is_set():
+            halt.set()
         stop.set()
 
     async def _attempted(
@@ -406,6 +442,12 @@ class _Runner:
                     grade = self.graders[_family(trial)](trial, work)
                 except Exception:  # noqa: BLE001 - a grader that could not grade makes the attempt invalid
                     evidence = replace(evidence, invalid=InvalidReason.GRADER_ERROR)
+                else:
+                    if len(grade.properties) != task_of(self.plan, trial).required_properties:
+                        # A grade answers each required property of its task: one that does not
+                        # could not grade it, and accepts nothing.
+                        grade = None
+                        evidence = replace(evidence, invalid=InvalidReason.GRADER_ERROR)
             record = evidence.trial_record(
                 execution=self.execution, trial=trial.trial, student=LIVE_STUDENT, grade=grade
             )
@@ -625,17 +667,20 @@ class WorkerHarnesses:
 
     def assignment(self, trial: TrialIdentity) -> HarnessAssignment:
         """The trial's harness as its task assigns it, with the features the task needs."""
-        task = next(
-            task
-            for task in self.plan.spec.suite.tasks
-            if any(instance.instance_id == trial.instance_id for instance in task.instances)
-        )
-        return next(one for one in task.harnesses if one.harness is trial.harness)
+        return next(one for one in task_of(self.plan, trial).harnesses if one.harness is trial.harness)
 
     @contextlib.asynccontextmanager
     async def attempt(self, trial: TrialIdentity, key: str, cancel: asyncio.Event) -> AsyncGenerator[Work]:
         budget = Budget(self.plan.workload.limits, self.clock)
-        forwarder = Forwarder(self.upstream, pool=self.pool, key=key, harness=trial.harness, budget=budget)
+        try:
+            forwarder = Forwarder(self.upstream, pool=self.pool, key=key, harness=trial.harness, budget=budget)
+        except OSError:
+            # Its forwarder could not listen: the attempt never ran, and the driver broke.
+            forwarder = None
+        if forwarder is None:
+            with tempfile.TemporaryDirectory() as nothing:
+                yield Work(self._unmeasured(budget), Path(nothing))
+            return
         held = _Held()
         ran: asyncio.Future[Work] | None = None
         with forwarder, tempfile.TemporaryDirectory() as nothing:
@@ -664,6 +709,24 @@ class WorkerHarnesses:
                     for thing in left:
                         error.add_note(f"not removed: {thing}")
                     raise error
+
+    def _unmeasured(self, budget: Budget) -> Evidence:
+        """The evidence of an attempt whose forwarder never served: nothing was sent, and the
+        measurement is the driver's error."""
+        return Evidence(
+            started_ms=budget.started_ms,
+            ended_ms=self.clock(),
+            failure=None,
+            invalid=InvalidReason.DRIVER_ERROR,
+            model_turns=0,
+            side_calls=0,
+            retries=0,
+            refusals=0,
+            generated_tokens=0,
+            open_reservations=0,
+            tally=Attempts().tally(),
+            requests=(),
+        )
 
     async def _deadline(self, budget: Budget) -> None:
         """Until the trial's wall time has passed on the run's clock."""

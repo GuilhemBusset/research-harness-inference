@@ -258,9 +258,11 @@ class Harnesses:
 
 
 def grade(trial: TrialIdentity, work: trials.Work) -> Grade:
-    """A grader double: the answer is right or it is not."""
+    """A grader double: every required property of the task holds but the last, which is whether
+    the answer is right."""
     right = (work.artifacts / "answer.txt").read_text(encoding="utf-8") == "right"
-    return Grade(properties=(True, right), within_limits=True)
+    required = trials.task_of(CLASS, trial).required_properties
+    return Grade(properties=(True,) * (required - 1) + (right,), within_limits=True)
 
 
 def broken(trial: TrialIdentity, work: trials.Work) -> Grade:
@@ -449,9 +451,17 @@ def test_a_wrong_artifact_a_timeout_or_an_endpoint_refusal_is_a_failed_attempt(
     assert (ran.successes, ran.attempts, ran.incomplete) == (0, 1, ())
 
 
-def test_a_broken_grader_leaves_the_attempt_invalid_and_its_cell_incomplete(tmp_path: Path) -> None:
+def short(trial: TrialIdentity, work: trials.Work) -> Grade:
+    """A grader that leaves the task's last required property unanswered."""
+    return Grade(properties=(True,) * (trials.task_of(CLASS, trial).required_properties - 1), within_limits=True)
+
+
+@pytest.mark.parametrize("grader", [broken, short], ids=["raises", "answers-too-few-properties"])
+def test_a_broken_grader_leaves_the_attempt_invalid_and_its_cell_incomplete(
+    grader: trials.Grader, tmp_path: Path
+) -> None:
     chosen = cells(CLASS, Family.ANALYSIS, phase=Phase.LIVE_CLASS_LOAD)
-    ran, _pool, harnesses = run(CLASS, chosen, tmp_path, graders=GRADERS | {Family.ANALYSIS: broken})
+    ran, _pool, harnesses = run(CLASS, chosen, tmp_path, graders=GRADERS | {Family.ANALYSIS: grader})
     assert ran is not None
 
     (record,) = ran.records
@@ -499,6 +509,106 @@ def test_cancellation_stops_all_background_work_and_releases_the_attempt(how: st
         assert ran.incomplete == (cell.cell.identity.cell,)
         assert executed.background is not None
         assert executed.background.summary.stopped_by is replay.Stop.CANCELLED
+
+
+def test_a_cancelled_run_sends_nothing_more_while_its_attempt_is_released(tmp_path: Path) -> None:
+    clock = Clock()
+    pool = Gateway(clock, KEYS)
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock, pool)
+    inner = Harnesses(clock, tmp_path)
+    releasing, released = asyncio.Event(), asyncio.Event()
+
+    class SlowRelease:
+        @contextlib.asynccontextmanager
+        async def attempt(self, trial: TrialIdentity, key: str, cancel: asyncio.Event) -> AsyncGenerator[trials.Work]:
+            try:
+                async with inner.attempt(trial, key, cancel) as work:
+                    yield work
+            finally:
+                releasing.set()
+                await released.wait()
+
+    async def exercise() -> None:
+        chosen = cells(CLASS, Family.OPTIMIZATION, phase=Phase.LIVE_CLASS_LOAD)
+        task = asyncio.ensure_future(trials.run(CLASS, gateway, KEYS, SlowRelease(), GRADERS, cells=chosen))
+        await clock.sleep_ms(TRIAL_MS // 2)
+        assert pool.arrived
+        task.cancel()
+        await releasing.wait()
+        arrived = len(pool.arrived)
+        await clock.sleep_ms(5_000)
+        # Nothing more reached the gateway, and no stream is left open, while the worker is released.
+        assert len(pool.arrived) == arrived
+        assert sum(pool.open.values()) == 0
+        assert not task.done()
+        released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    clock.drive(exercise())
+
+
+def test_a_driver_lagging_past_its_tolerance_leaves_the_loaded_cell_incomplete(tmp_path: Path) -> None:
+    from evaluate.tests.test_replay import Busy
+
+    clock = Clock()
+    tolerance = CLASS.spec.protocol["driver"]["scheduling_lag_p95_ms_max"]
+    lagging = Busy(clock, late_ms=tolerance + 50)  # ty: ignore[invalid-argument-type] - the replay's clock double
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", lagging, Gateway(clock, KEYS))
+    chosen = cells(CLASS, Family.OPTIMIZATION, phase=Phase.LIVE_CLASS_LOAD)
+    ran = clock.drive(trials.run(CLASS, gateway, KEYS, Harnesses(clock, tmp_path), GRADERS, cells=chosen))
+
+    (cell,) = ran.cells
+    record = cell.background.record
+    assert record is not None and record.driver_lag_p95_ms is not None
+    assert record.driver_lag_p95_ms > tolerance and not record.valid_for_qualification
+    # The trial is kept as it ran, and its cell does not count.
+    assert [one.outcome for one in ran.records] == [TrialOutcome.PASSED]
+    assert ran.incomplete == tuple(chosen)
+
+
+def test_each_attempt_replays_background_conversations_of_its_own(tmp_path: Path) -> None:
+    from evaluate.tests.test_replay import Pool
+
+    clock = Clock()
+    pool = Pool(clock, KEYS)  # ty: ignore[invalid-argument-type] - the replay test's clock double
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock, pool)
+    chosen = cells(TWICE, Family.OPTIMIZATION, phase=Phase.LIVE_CLASS_LOAD)
+    ran = clock.drive(trials.run(TWICE, gateway, KEYS, Harnesses(clock, tmp_path), GRADERS, cells=chosen))
+
+    (cell,) = ran.cells
+    assert len(cell.trials) == 2
+    # Each background conversation opened with a transcript of its own, under the cell's one prefix.
+    openings = [one for one in pool.arrived if one.turn == 0]
+    assert len(openings) > 2 * 7
+    assert len({one.content for one in openings}) == len(openings)
+    assert len({one.prefix for one in openings}) == 1
+    numbers = [{one.conversation for one in attempt.background.requests} for attempt in cell.trials if attempt.background]
+    assert len(numbers) == 2 and not numbers[0] & numbers[1]
+    assert ran.incomplete == ()
+
+
+def test_a_forwarder_that_cannot_listen_leaves_an_invalid_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from evaluate import forwarding
+
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OSError("no local listener available")
+
+    monkeypatch.setattr(forwarding.ThreadingHTTPServer, "server_bind", unavailable)
+
+    def never(_spec: workers.Spec) -> Worker:
+        raise AssertionError("no worker is started without a forwarder")
+
+    clock = replay.RunClock()
+    harnesses = worker_harnesses(ALONE, never, lambda _trial: trials.Task(tmp_path, ("Run",)), clock)
+    gateway = replay.Gateway("https://gateway.example.com", "coursework", clock)
+    chosen = cells(ALONE, Family.OPTIMIZATION)
+    ran = asyncio.run(trials.run(ALONE, gateway, KEYS, harnesses, GRADERS, cells=chosen))
+
+    assert {record.invalid for record in ran.records} == {InvalidReason.DRIVER_ERROR}
+    assert (ran.attempts, ran.incomplete) == (0, tuple(chosen))
 
 
 def test_peak_fan_out_is_requests_in_flight_at_once() -> None:
