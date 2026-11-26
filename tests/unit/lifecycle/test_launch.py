@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 
 from rhi_common import launch_settings
 from rhi_lifecycle import release
-from rhi_lifecycle.host import Host, HostError
+from rhi_lifecycle.host import EngineContainer, Host, HostError
 from rhi_lifecycle.launch import (
     ENGINE_URL,
     METADATA_URL,
@@ -105,10 +105,11 @@ class World(Host):
         self.start_fails = False
         # The engine's flags, as the boot program wrote them for the unit, and what docker holds of
         # the engine's container: the flags it was started with, None while none runs. `asked`
-        # says whether docker can be asked.
+        # says whether docker can be asked. Every start of the unit makes another container.
         self.flags: tuple[str, ...] = tuple(VALUE["engine_flags"])
         self.launched: tuple[str, ...] | None = None
         self.asked = True
+        self.starts = 0
         # The record of a launch under way: whether the host keeps one, and one that its steps
         # passed, whether each can be written, and what the two were at each of the steps named.
         self.on_record = False
@@ -169,11 +170,12 @@ class World(Host):
         self.started_at = self.now
         # The unit gives the container the flags that are on the host at this start.
         self.launched = self.flags
+        self.starts += 1
 
-    def engine_arguments(self) -> tuple[str, ...] | None:
+    def engine_container(self, timeout: float | None = None) -> EngineContainer | None:
         if not self.asked:
             raise HostError("inspect")
-        return self.launched
+        return None if self.launched is None else EngineContainer(f"{self.starts:064x}", self.launched)
 
     def begin_launch(self) -> None:
         if self.record_fails:

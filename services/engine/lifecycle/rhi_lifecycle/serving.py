@@ -21,15 +21,26 @@ dashboard read it.
 **The launch, as a metric.** Two instances can serve one image and one model revision with
 different engine arguments, so `rhi_lifecycle_launch_info` is 1 and its label
 `settings_fingerprint` is the fingerprint of the settings the engine in service was started with
-(`launch.settings_fingerprint`; `rhi_common.launch_settings` says what it covers and what it
-leaves out). It is read from the host's record of the container that runs, never from the release
-the instance holds or the one its pool wants, at each check of the engine below: when the duties
-start, and every minute. A check that waits for a restarted engine's health route reads nothing,
-and the agent takes the fingerprint back before it restarts the engine: until the engine it
-started answers, no fingerprint is given for it. Where there is none to give the label says
-`unavailable`: an instance whose unit is older than the reading, a container that does not run,
-arguments the contract does not know. That is a gap in the evidence and changes nothing else:
-the heartbeat and `rhi_lifecycle_release_info` are as they were, with the labels they had.
+(`launch.started_engine`; `rhi_common.launch_settings` says what it covers and what it leaves
+out). It is read from the host's record of the container that runs, never from the release the
+instance holds or the one its pool wants, at each check of the engine below: when the duties
+start, and every minute.
+
+A container that runs is not an engine that serves: after any start, the agent's or systemd's own
+after a failure, it first loads its model. So a fingerprint is given only for a container that
+was shown to serve: the engine answered the check's completion, and the host named the same
+container, by its ID, before the completion and after it. From then on each check asks the host
+once, and gives that fingerprint for as long as the same container runs, whether or not a busy
+engine answers that minute's completion. Any other answer of the host takes it back until a
+container is shown to serve again, and so does the agent before it restarts the engine. The
+duties that end take it back too, as when the instance has drained and its engine is stopped:
+nothing would read it again.
+
+Where there is none to give the label says `unavailable`: an instance whose unit is older than
+the reading, a container that does not run or has not served yet, a docker that does not answer
+within `INSPECT_SECONDS`, arguments the contract does not know. That is a gap in the evidence and
+changes nothing else: the check of the engine goes on at its time, and the heartbeat and
+`rhi_lifecycle_release_info` are as they were, with the labels they had.
 
 **The cache capacity, as a metric.** The answer of the engine's `/metrics` that each heartbeat
 fetches also goes to `rhi_lifecycle.cache`, which reads the engine's cache capacity in tokens where
@@ -77,6 +88,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import threading
 import time
 import urllib.request
 from collections.abc import Awaitable, Callable
@@ -106,6 +118,9 @@ PROBE_INTERVAL_SECONDS = 60.0
 # requests queue behind long prefills can take longer for one token, which is why a completion
 # with no answer restarts only an engine that counts no token.
 PROBE_SECONDS = 30.0
+# How long the host's docker may take to say which container of the engine runs. A check asks at
+# most twice, so the completion and both questions end within the minute.
+INSPECT_SECONDS = 5.0
 
 # The stage an instance in service has reached, as its heartbeat names it.
 STAGE = "serving"
@@ -215,15 +230,19 @@ class Serving:
             ("image_digest", "model_revision"),
             registry=registry,
         ).labels(image_digest=self._image_digest, model_revision=self._model_revision).set(1)
-        # The fingerprint of the settings the engine in service was started with, as the check
-        # last read it. Only the check's thread writes it.
         self._launch = Gauge(
             LAUNCH_METRIC,
             "The engine in service: the fingerprint of the settings it was started with.",
             ("settings_fingerprint",),
             registry=registry,
         )
-        self._fingerprint = UNAVAILABLE
+        # The container that was shown to serve, with its fingerprint: only the check's thread
+        # writes it. The fingerprint the metric says, and whether the duties have ended: the
+        # check's thread and the event loop's both write them, under the lock.
+        self._served: launch.Started | None = None
+        self._said = UNAVAILABLE
+        self._ended = False
+        self._saying = threading.Lock()
         self._launch.labels(settings_fingerprint=UNAVAILABLE).set(1)
         self._restarts = Counter(
             RESTARTS_METRIC,
@@ -234,9 +253,18 @@ class Serving:
 
     async def run(self) -> None:
         """Do both duties until cancelled."""
-        async with asyncio.TaskGroup() as duties:
-            duties.create_task(self.report())
-            duties.create_task(self.watch())
+        with self._saying:
+            self._ended = False
+        try:
+            async with asyncio.TaskGroup() as duties:
+                duties.create_task(self.report())
+                duties.create_task(self.watch())
+        finally:
+            # Nothing reads the engine's container from here on. A check that is still under way
+            # in its thread says nothing more either.
+            with self._saying:
+                self._ended = True
+            self._say(UNAVAILABLE)
 
     async def report(self) -> None:
         """Write the heartbeat every 5 seconds until cancelled."""
@@ -301,27 +329,29 @@ class Serving:
         return progressed_at is not None and self._clock() - progressed_at <= PROBE_INTERVAL_SECONDS
 
     def check(self) -> bool:
-        """Read what the engine in service was started with, and send the engine a completion of
-        one token. When none comes back and the engine has counted no token for a minute, restart
-        its unit. Says whether the engine was restarted."""
+        """Read which container of the engine runs, and send the engine a completion of one
+        token. When none comes back and the engine has counted no token for a minute, restart its
+        unit. Says whether the engine was restarted."""
         if self._starting:
             if not self._engine.healthy():
                 return False
             self._starting = False
-        self._label(launch.settings_fingerprint(self._host))
+        runs = self._observe()
         secret = self._secret()
         if secret is None:
             _LOG.warning("the pool's secret cannot be read: the engine is not checked this minute")
             return False
         # The pool's name is the model name the engine serves (section 4.2).
         if self._engine.warm_up(self._settings.pool, secret, timeout=PROBE_SECONDS):
+            self._answered(runs)
             return False
         if self._progressing():
             # Busy, not hung: a restart would kill every request it runs (section 4.3).
             _LOG.warning("the engine did not answer a completion, and it counts tokens: it is not restarted")
             return False
-        # The engine that had the fingerprint is stopped, whatever becomes of the restart.
-        self._label(UNAVAILABLE)
+        # The engine that had the fingerprint serves no more, whatever becomes of the restart.
+        self._served = None
+        self._say(UNAVAILABLE)
         try:
             self._host.restart_engine()
         except HostError:
@@ -332,14 +362,38 @@ class Serving:
         _LOG.warning("the engine did not answer a completion and counts no token: its unit was restarted")
         return True
 
-    def _label(self, fingerprint: str) -> None:
-        """Say `fingerprint` in the launch metric, in place of the one it said."""
-        if fingerprint == self._fingerprint:
+    def _observe(self) -> launch.Started | None:
+        """Ask the host which container of the engine runs. The metric keeps the fingerprint of
+        the container that was shown to serve while the host names that one, and says none
+        otherwise: a host that gives no answer in time has not said that it still runs."""
+        runs = launch.started_engine(self._host, INSPECT_SECONDS)
+        served = self._served
+        self._say(served.fingerprint if served is not None and runs == served else UNAVAILABLE)
+        return runs
+
+    def _answered(self, before: launch.Started | None) -> None:
+        """The engine answered a completion, and `before` is the container the host named before
+        it was sent. When the host names the same one now, no other container can have given the
+        answer: that container serves, and the metric says its fingerprint."""
+        if before is None or before == self._served:
             return
-        # The one before goes first: a scrape between the two reads none, never both.
-        self._launch.clear()
-        self._launch.labels(settings_fingerprint=fingerprint).set(1)
-        self._fingerprint = fingerprint
+        if launch.started_engine(self._host, INSPECT_SECONDS) != before:
+            return
+        self._served = before
+        self._say(before.fingerprint)
+
+    def _say(self, fingerprint: str) -> None:
+        """Say `fingerprint` in the launch metric, in place of the one it said. Once the duties
+        have ended it says none."""
+        with self._saying:
+            if self._ended:
+                fingerprint = UNAVAILABLE
+            if fingerprint == self._said:
+                return
+            # The one before goes first: a scrape between the two reads none, never both.
+            self._launch.clear()
+            self._launch.labels(settings_fingerprint=fingerprint).set(1)
+            self._said = fingerprint
 
     def _secret(self) -> str | None:
         """The pool's bearer secret, as it is now, or None when it cannot be read."""

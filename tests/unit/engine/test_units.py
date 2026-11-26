@@ -424,14 +424,18 @@ def test_the_agent_reads_back_the_flags_of_the_container_the_unit_started(host: 
     started = host.started({"RHI_ENGINE_OPTIONS": f"--label {agent_host.FLAGS_LABEL}=1"})
     assert started.options["--label"][-1] == f"{agent_host.FLAGS_LABEL}={len(flags)}"
 
-    # Docker's record of that container: it runs, each label has the last value it was given, and
-    # its arguments are what follows the image. The agent's host module asks docker for the three.
+    # Docker's record of that container: its ID, that it runs, each label with the last value it
+    # was given, and its arguments, which are what follows the image. The agent's host module asks
+    # docker for the four.
     labels = dict(label.split("=", 1) for label in started.options["--label"])
     docker = tmp_path / "nsenter"
     docker.write_text('#!/bin/sh\ncat "$0.answer"\n', encoding="utf-8")
     docker.chmod(0o755)
-    (tmp_path / "nsenter.answer").write_text(json.dumps([True, labels, started.command]), encoding="utf-8")
-    assert agent_host.Host(object(), nsenter=str(docker)).engine_arguments() == tuple(flags)
+    record = ["d" * 64, True, labels, started.command]
+    (tmp_path / "nsenter.answer").write_text(json.dumps(record), encoding="utf-8")
+    running = agent_host.Host(object(), nsenter=str(docker)).engine_container()
+    assert running is not None
+    assert running.arguments == tuple(flags)
 
 
 def test_the_engine_starts_as_before_without_a_drop_in_and_with_the_options_of_one(host: Host) -> None:

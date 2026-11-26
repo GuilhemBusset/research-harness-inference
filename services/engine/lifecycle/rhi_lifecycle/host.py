@@ -27,17 +27,20 @@ program writes there.
 
 The host's docker also says what the engine runs with. The engine's unit gives its container
 the release's flags after the image's own command, and labels the container with their number
-(`FLAGS_LABEL`; `services/engine/units/rhi-engine.service`). `Host.engine_arguments` asks docker
+(`FLAGS_LABEL`; `services/engine/units/rhi-engine.service`). `Host.engine_container` asks docker
 for the container that runs now, and takes that many arguments from the end of its record: the
-flags of the engine in service, and not those of a release that is only wanted, or of a start
-that docker refused. They can hold values of the deployment, such as the model bucket's name:
-the agent keeps them in memory, makes a public fingerprint of them (`rhi_lifecycle.launch`) and
-writes them nowhere.
+flags that container was started with, and not those of a release that is only wanted, or of a
+start that docker refused. They can hold values of the deployment, such as the model bucket's
+name: the agent keeps them in memory, makes a public fingerprint of them (`rhi_lifecycle.launch`)
+and writes them nowhere. The answer carries the ID docker gave the container, which no other
+container has: every start of the unit makes a new one, so two answers with one ID are of one
+start. A container that runs may still load its model: docker does not say whether it serves.
 
 A command that fails raises `HostError`, which names the action and the exit status and repeats
 nothing the command or AWS printed. So does a command that is still running when the time its
 caller gave it has passed: it is stopped, because the run of a canary has a deadline
-(`rhi_lifecycle.canary`). Three answers are read and never repeated: the state systemd gives the
+(`rhi_lifecycle.canary`), or the agent's check of the engine its cadence (`rhi_lifecycle.serving`).
+Three answers are read and never repeated: the state systemd gives the
 engine's unit, a word of systemd's own vocabulary, the names of the files beside the records, and
 docker's record of the engine's container.
 """
@@ -46,10 +49,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextlib
 import json
+import os
 import re
+import signal
 import subprocess
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import boto3
@@ -61,9 +68,9 @@ ENGINE_UNIT = "rhi-engine"
 # the release's flags, which are the last arguments of the container.
 ENGINE_CONTAINER = "rhi-engine"
 FLAGS_LABEL = "rhi-engine-flags"
-# What docker is asked of the container: whether it runs, its labels and its arguments, as one
-# JSON list.
-_LAUNCH_FORMAT = "[{{json .State.Running}},{{json .Config.Labels}},{{json .Args}}]"
+# What docker is asked of the container: its ID, whether it runs, its labels and its arguments,
+# as one JSON list.
+_LAUNCH_FORMAT = "[{{json .Id}},{{json .State.Running}},{{json .Config.Labels}},{{json .Args}}]"
 
 # The host's console device: the kernel writes it to the serial console of an instance.
 CONSOLE = "/dev/console"
@@ -92,6 +99,15 @@ class HostError(Exception):
         super().__init__(f"{action}: the command {how}")
         self.action = action
         self.returncode = returncode
+
+
+@dataclass(frozen=True)
+class EngineContainer:
+    """The engine's container that runs, as docker holds it: the ID of the container, which is
+    this start's alone, and the release's flags it was started with, in order."""
+
+    id: str
+    arguments: tuple[str, ...]
 
 
 class Host:
@@ -148,27 +164,30 @@ class Host:
             raise HostError("state", returncode)
         return state != "inactive"
 
-    def engine_arguments(self) -> tuple[str, ...] | None:
-        """The release's flags the engine's container was started with, in order, when the
-        container runs now. None when docker's record does not give them: no such container, one
-        that does not run, or one a unit without `FLAGS_LABEL` started. A host that could not be
-        asked raises `HostError`."""
+    def engine_container(self, timeout: float | None = None) -> EngineContainer | None:
+        """The engine's container, when it runs now: its ID and the release's flags it was started
+        with. None when docker's record does not give them: no such container, one that does not
+        run, or one a unit without `FLAGS_LABEL` started. A host that could not be asked, or a
+        docker that has not answered within `timeout` seconds when one is given, raises
+        `HostError`."""
         command = ("docker", "container", "inspect", "--format", _LAUNCH_FORMAT, ENGINE_CONTAINER)
-        returncode, answer = self._read("inspect", command)
+        returncode, answer = self._read("inspect", command, timeout)
         if returncode != 0:
             return None
         try:
-            running, labels, arguments = json.loads(answer)
+            container, running, labels, arguments = json.loads(answer)
             count = labels[FLAGS_LABEL]
         except (ValueError, TypeError, LookupError):
             return None
-        if running is not True or not isinstance(count, str) or not count.isascii() or not count.isdigit():
+        if not isinstance(container, str) or not container or running is not True:
+            return None
+        if not isinstance(count, str) or not count.isascii() or not count.isdigit():
             return None
         if not isinstance(arguments, list) or not all(isinstance(argument, str) for argument in arguments):
             return None
         if int(count) > len(arguments):
             return None
-        return tuple(arguments[len(arguments) - int(count) :])
+        return EngineContainer(container, tuple(arguments[len(arguments) - int(count) :]))
 
     def begin_launch(self) -> None:
         """Put on record that a launch is under way on the host."""
@@ -228,17 +247,30 @@ class Host:
             raise HostError("login")
         return user, password
 
-    def _read(self, action: str, command: tuple[str, ...]) -> tuple[int, str]:
+    def _read(self, action: str, command: tuple[str, ...], timeout: float | None = None) -> tuple[int, str]:
         """Run `command` in the host's namespaces, and give its exit status and what it wrote on
-        its standard output."""
+        its standard output. A command still running after `timeout` seconds, when a time is
+        given, is stopped, and has given no answer: `HostError`."""
         arguments = (self._nsenter, *HOST_NAMESPACES, "--", *command)
         try:
-            done = subprocess.run(
-                arguments, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False
-            )
+            # A session of its own, so that stopping the command stops what `nsenter` started for
+            # it too: a caller that asks every minute leaves no process behind each time.
+            with subprocess.Popen(
+                arguments,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            ) as running:
+                try:
+                    answer, _ = running.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(running.pid, signal.SIGKILL)
+                    raise HostError(action) from None
         except OSError:
             raise HostError(action) from None
-        return done.returncode, done.stdout.decode("ascii", errors="replace").strip()
+        return running.returncode, answer.decode("ascii", errors="replace").strip()
 
     def _run(
         self,

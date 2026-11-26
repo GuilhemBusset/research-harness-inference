@@ -26,11 +26,12 @@ import pytest
 from botocore.exceptions import ClientError
 from prometheus_client import CollectorRegistry
 
+from rhi_common import launch_settings
 from rhi_common.engine_metrics import MOCK, Quantity, metric_names
 from rhi_common.records import InstanceHeartbeat
 from rhi_lifecycle import __main__ as program
 from rhi_lifecycle import launch, metrics, release, serving
-from rhi_lifecycle.host import Host, HostError
+from rhi_lifecycle.host import EngineContainer, Host, HostError
 from rhi_lifecycle.termination import POLL_SECONDS
 from rhi_mock_engine.app import Settings as MockSettings
 from rhi_mock_engine.app import create_app
@@ -145,6 +146,7 @@ class World(Host):
         self.gate = asyncio.Event()
         self.gate.set()
         self.closed = False
+        self.registry = CollectorRegistry()
 
     def serves_already(self) -> None:
         """The instance was launched by an agent that ran before this one: its engine was started, and runs."""
@@ -185,7 +187,7 @@ class World(Host):
             host=self,
             fetch=self.fetch,
             held=self.held,
-            registry=CollectorRegistry(),
+            registry=self.registry,
             port=0,
             clock=self.clock.time,
             wall=self.clock.time,
@@ -209,6 +211,12 @@ class World(Host):
         """The rows the serving duties wrote. A launch writes rows too, under its stages' names."""
         rows = [InstanceHeartbeat.from_item(item) for item in self.items]
         return [row for row in rows if row.stage == serving.STAGE]
+
+    @property
+    def fingerprints(self) -> list[str]:
+        """What the agent's launch metric says of the engine in service, now."""
+        samples = [sample for family in self.registry.collect() for sample in family.samples]
+        return [sample.labels["settings_fingerprint"] for sample in samples if sample.name == serving.LAUNCH_METRIC]
 
     async def ticks(self, count: int) -> None:
         """Let `count` ticks of the program pass, each with its reading of the target state."""
@@ -251,8 +259,9 @@ class World(Host):
     def engine_started(self) -> bool:
         return self.app is not None
 
-    def engine_arguments(self) -> tuple[str, ...] | None:
-        return None if self.app is None else tuple(VALUE["engine_flags"])
+    def engine_container(self, timeout: float | None = None) -> EngineContainer | None:
+        # One container, the one the engine's unit started, for as long as the engine runs.
+        return None if self.app is None else EngineContainer("d" * 64, tuple(VALUE["engine_flags"]))
 
     def begin_launch(self) -> None:
         self.launching = True
@@ -406,6 +415,10 @@ def test_a_launch_serves_then_drains_once_the_instance_is_terminated(tmp_path: P
             await until(lambda: world.calls.count("completion") == 2 and len(world.beats) == 1)
             assert world.calls[:6] == ["pull", "check", "start", "health", "completion", "launch hook"]
             assert world.completions == [completion("launch")]
+            # The engine that answered is the one in service: the agent says what it was started with.
+            started_with = launch_settings.fingerprint(VALUE["engine_flags"])
+            assert started_with != launch_settings.UNAVAILABLE
+            await until(lambda: world.fingerprints == [started_with])
 
             # The group terminates the instance while a student's request runs on it.
             student = await world.student()
@@ -427,11 +440,14 @@ def test_a_launch_serves_then_drains_once_the_instance_is_terminated(tmp_path: P
             assert world.completions[1:] == [completion("termination")]
 
             # The duties are stopped: over the next minute, a heartbeat's 5 seconds twelve times
-            # and the minute of a completion, the engine is asked nothing.
+            # and the minute of a completion, the engine is asked nothing. No engine is in
+            # service, and the agent gives no fingerprint of one.
             await until(lambda: world.readings[-1] == world.clock.now)
+            assert world.fingerprints == [launch_settings.UNAVAILABLE]
             asked = world.asked
             await world.ticks(12)
             assert world.asked == asked
+            assert world.fingerprints == [launch_settings.UNAVAILABLE]
             assert len(world.beats) == 3
             assert world.completions[1:] == [completion("termination")]
 
