@@ -150,8 +150,9 @@ EVALUATIONS = Path("docs") / "evaluations"
 _EXPORT_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 _PLACES = 6
 # Where the host price of the cost estimates comes from, as `cli.Source` labels it: the only
-# labels a summary carries for it. The price itself is a bounded number.
-PRICE_SOURCES = ("example", "supplied")
+# labels a summary carries for it. The price itself is a bounded number. `deployed` is the price
+# the selected pool's deployed settings give its instance type, which a live run reads.
+PRICE_SOURCES = ("example", "supplied", "deployed")
 PRICE_MAX = 10**6
 
 

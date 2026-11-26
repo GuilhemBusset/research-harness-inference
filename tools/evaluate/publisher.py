@@ -33,8 +33,9 @@ sent: it is ruled out and saved again with the login before anything is sent.
 
 **Comments in the journal.** `publish_run` queues the run's terminal comment and
 `publish_comparison` the final comment of each pair the run is the candidate of, each a `DELIVER`
-intent that holds the rendered body and its marker before anything is posted. A second comment for
-the same run, or the same pair, is refused (`Refusal.ALREADY_QUEUED`). They are delivered one at a time, in the order they were
+intent that holds the rendered body and its marker before anything is posted. A run resumed in a
+later booking posts one comment for each invocation. A second comment for the same invocation of a
+run, or the same pair, is refused (`Refusal.ALREADY_QUEUED`). They are delivered one at a time, in the order they were
 queued, so a comparison ready while its run's comment is still in doubt is saved whole and posted
 after it. A delivery that GitHub does not answer keeps its intent pending: the bundle stays where it
 is, and the result counts it as waiting, apart from the run's verdicts.
@@ -400,6 +401,90 @@ def render_issue(experiment: Experiment) -> tuple[str, str]:
     return f"Evaluation: {fields['question']}"[:256], "\n".join(lines) + "\n"
 
 
+def _value(text: str) -> object:
+    """A value as `_shown` wrote it: a number, `true`, `false`, or else the label itself."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def _number(text: str) -> float:
+    found = _value(text)
+    if isinstance(found, bool) or not isinstance(found, int | float):
+        raise _reject()
+    return found
+
+
+def _pairs(text: str) -> dict[str, object]:
+    """The `name=`value`` pairs of a settings line, as `_settings_line` wrote them."""
+    if text == "none":
+        return {}
+    found = {}
+    for part in text.split(", "):
+        name, equals, quoted = part.partition("=")
+        if not equals or len(quoted) < 2 or quoted[0] != "`" or quoted[-1] != "`":
+            raise _reject()
+        found[name] = _value(quoted[1:-1])
+    return found
+
+
+def experiment_of(body: object) -> Experiment:
+    """The experiment an issue's body records, read back from the lines `render_issue` wrote and
+    held to the identity line beside them: a body whose fields do not give that identity, or that
+    is not one this module rendered, is `Refusal.ISSUE_MISMATCH`."""
+    if not isinstance(body, str):
+        raise PublishError(Refusal.ISSUE_MISMATCH)
+    lines = body.splitlines()
+
+    def after(prefix: str) -> str:
+        found = [line[len(prefix) :] for line in lines if line.startswith(prefix)]
+        if len(found) != 1:
+            raise _reject()
+        return found[0]
+
+    def quoted(prefix: str) -> str:
+        text = after(prefix)
+        if len(text) < 2 or text[0] != "`" or text[-1] != "`":
+            raise _reject()
+        return text[1:-1]
+
+    def section(heading: str) -> list[str]:
+        start = lines.index(heading) + 2
+        end = next((at for at in range(start, len(lines)) if not lines[at].startswith("- `")), len(lines))
+        return lines[start:end]
+
+    def entry(line: str) -> tuple[str, str]:
+        name, colon, rest = line[3:].partition("`: ")
+        if not colon:
+            raise _reject()
+        return name, rest
+
+    try:
+        suite, slash, profile = after("- Suite / profile: ").partition(" / ")
+        identity = quoted("Experiment identity: ")
+        experiment = Experiment(
+            question=after("**Question:** "),
+            source_commit=quoted("- Source commit: "),
+            suite=suite.strip("`"),
+            profile=Profile(profile.strip("`")),
+            workload=quoted("- Workload: "),
+            targets={name: _pairs(rest) for name, rest in map(entry, section("**Target configurations**"))},
+            seeds=tuple(int(seed) for seed in after("- Seeds: ").split(", ")),
+            floors={name: _number(rest) for name, rest in map(entry, section("**Acceptance floors**"))},
+        )
+        if not slash or experiment_identity(experiment) != identity:
+            raise _reject()
+    except (PublishError, ValueError, TypeError):
+        raise PublishError(Refusal.ISSUE_MISMATCH) from None
+    return experiment
+
+
+def valid_repository(text: object) -> bool:
+    """Whether `text` names a repository as `owner/name`: what a `GitHub` is made for."""
+    return isinstance(text, str) and _REPOSITORY.fullmatch(text) is not None
+
+
 def _settings_line(settings: Mapping[str, object]) -> str:
     return ", ".join(f"{key}=`{_shown(value)}`" for key, value in sorted(settings.items())) or "none"
 
@@ -666,6 +751,20 @@ class Publisher:
             raise PublishError(Refusal.ISSUE_UNCONFIRMED)
         return self._settle_issue(journal, intent, sent_before=False)
 
+    def experiment(self, number: int) -> Experiment:
+        """The experiment the issue `number` records, read from GitHub: an issue, not a pull
+        request, written by the driver, whose body gives its own identity (`experiment_of`).
+        `Refusal.ISSUE_UNCONFIRMED` when GitHub does not answer, `ISSUE_MISMATCH` otherwise."""
+        if type(number) is not int or not 0 < number <= _MAX_COUNT:
+            raise _reject()
+        try:
+            found, driver = self.github.issue(number), self.github.login()
+        except (Unanswered, Rejected) as error:
+            raise PublishError(Refusal.ISSUE_UNCONFIRMED) from error
+        if not isinstance(found, dict) or "pull_request" in found or _author(found) != driver:
+            raise PublishError(Refusal.ISSUE_MISMATCH)
+        return experiment_of(found.get("body"))
+
     def _select(self, journal: Journal, identity: str, number: int) -> int:
         try:
             found, driver = self.github.issue(number), self.github.login()
@@ -716,12 +815,14 @@ class Publisher:
 
     # --- Comments ---
 
-    def publish_run(self, journal: Journal, result: RunResult) -> Outbox:
-        """Queues the run's terminal comment, then delivers what the journal holds."""
+    def publish_run(self, journal: Journal, result: RunResult, *, invocation: int = 0) -> Outbox:
+        """Queues the run's terminal comment, then delivers what the journal holds. A run resumed
+        in a later booking ends each `invocation` with a comment of its own: the first is 0, and
+        a second comment for the same invocation is refused."""
         body = render_run(result)
-        if result.run_id != journal.run_id:
+        if result.run_id != journal.run_id or type(invocation) is not int or not 0 <= invocation <= _MAX_COUNT:
             raise _reject()
-        return self._queue(journal, Kind.RUN, body, None)
+        return self._queue(journal, Kind.RUN, body, invocation or None)
 
     def publish_comparison(self, journal: Journal, comparison: Comparison) -> Outbox:
         """Queues the pair's final comment in the candidate's journal, after its run's."""
@@ -730,8 +831,9 @@ class Publisher:
             raise _reject()
         return self._queue(journal, Kind.COMPARISON, body, comparison.reference_run)
 
-    def _queue(self, journal: Journal, kind: Kind, body: str, reference: str | None) -> Outbox:
-        """Queues one comment of each run, and one of each pair it is the candidate of."""
+    def _queue(self, journal: Journal, kind: Kind, body: str, reference: str | int | None) -> Outbox:
+        """Queues one comment of each invocation of a run, and one of each pair it is the
+        candidate of."""
         for one in journal.intents:
             if one.action is Action.DELIVER and one.status is not IntentStatus.RULED_OUT:
                 payload = one.payload

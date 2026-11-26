@@ -78,4 +78,11 @@ created or selected before any booking, and a terminal comment per run and per p
 rendered from allow-listed fields, scanned before each write and queued in the run's journal. It
 reconciles a lost answer by its marker against the driver's own records and resumes delivery from
 the journal alone. It needs the standard library, `evaluate.journal` and the hygiene scanner only.
+
+`evaluate.controller` is the operator controller: one bounded invocation of a run, scoped to the
+selected pool and the experiment's repository. It binds the journal, the preflight, the issue, the
+booking, the phases, the cleanup, the local report and the terminal comment in that order, resumes a
+run after reconciling what it booked, and gives the exit code of the verdict. `evaluate.cli` runs it
+for `run`, `status`, `cancel`, `publish --resume` and `compare --issue`. `evaluate.live` resolves
+the instruments of the selected pool for a live run, from the driver's AWS session and this host.
 """

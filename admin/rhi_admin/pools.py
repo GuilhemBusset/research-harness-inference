@@ -101,6 +101,12 @@ def _deployed(pools: Pools) -> tuple[Pool, ...]:
         raise AdminError("the scaler's function does not hold the pools' settings") from None
 
 
+def deployed(pools: Pools) -> dict[str, Pool]:
+    """Every deployed pool by its name, with its settings, from the settings of the scaler's
+    function: its instance types and their prices among them."""
+    return {pool.name: pool for pool in _deployed(pools)}
+
+
 def max_instances(pools: Pools) -> dict[str, int]:
     """Every deployed pool and its `max_instances`, the most a session may book of it, from the
     settings of the scaler's function."""
