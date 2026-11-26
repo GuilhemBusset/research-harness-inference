@@ -1,8 +1,8 @@
 # Evaluation scorecard
 
-Summary digest: `sha256:7d09e513c811902c2935f3d04de1439878792ab5f324344ca7e5afc1d2bb973e`
+Summary digest: `sha256:3f047a5bb8735c0777bf5f64dc443b9bfd62f4990b3f93146d580998a3e79db5`
 
-Run `sha256:ed46137b655f67746ea395378d4fa6fd7e9ede1893373ead1562bc2bc1262254`, workload `sha256:cce9dfb2cd7e2ffda4a0b60a0fb24cb3458977299ee384ea1401665eaa0a71f3`, treatment `sha256:ee1b33aaf2e3f77f617a0ad0b079867172d3e63f5aadc98190352b2560f55170`.
+Run `sha256:0bebfca6e2eb75da84f51d05234b2e68a6ef8730bc6b74a411842f7ba216becf`, workload `sha256:ac1ca1fdb960e3392556d26c40721d25c8436af4ee71cfd31f614e1a23e1ef36`, treatment `sha256:ee1b33aaf2e3f77f617a0ad0b079867172d3e63f5aadc98190352b2560f55170`.
 Suite course-v1, profile qualify, class size 2.
 
 ## Recommendation

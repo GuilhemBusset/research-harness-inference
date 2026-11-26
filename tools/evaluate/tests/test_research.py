@@ -255,6 +255,8 @@ def test_a_wrong_unit_is_rejected_on_the_unit_alone(
     [
         (None, "kg/mm"),  # a mass per millimetre, a length: never a metre times a metre
         (1, "mg/m^4"),  # a milligram per metre to the fourth: never a metre-gram per volume
+        (None, "g·m²/mL"),  # an area of grams per millilitre, a length: never a metre-litre
+        (None, "kg·K/mK·m"),  # mK is a metre-kelvin only where nothing else is one, as in W/mK
         (None, "kg/km^200"),  # a factor no float holds: a rejection, not an error
         (0, "W/mK^-200·K^201"),  # out of range in one reading is no unit, whatever another measures
     ],

@@ -73,13 +73,14 @@ PROPERTIES = tuple(Property)
 # sources print it; a divisor that is a parenthesis ends with it, so kg/(m³)·m is kg·m/m³. A
 # prefix binds to the symbol it is written against, as SI writes it, and a prefixed symbol is
 # never read as the product of its parts: mg is a milligram, not a metre times a gram, mm a
-# millimetre, so kg/mm is a mass per length, and mW/(m·mK) is a milliwatt per metre per
-# millikelvin. One notation is the exception, the datasheets' divisor written run together: where
-# the SI reading measures no quantity, a metre written against another symbol as the first factor
-# of a divisor is the two of them, so W/mK, which measures none as a watt per millikelvin, is
-# W/(m·K). A unit whose factor is out of range, such as km^200, is no unit, whatever another
-# reading of it would measure. A unit of a quantity of `QUANTITIES` is known; any other is no unit
-# here.
+# millimetre, so kg/mm is a mass per length, mL a millilitre, and mW/(m·mK) is a milliwatt per
+# metre per millikelvin. One notation is the exception, a conductivity's divisor as datasheets run
+# it together: where the SI reading measures no quantity, mK as the first factor of a divisor is a
+# metre times a kelvin, so W/mK, which measures none as a watt per millikelvin, is W/(m·K). That
+# reading is taken only where the unit writes no other metre or kelvin, so that it never cancels
+# against another factor. A unit whose factor is out of range, such as km^200, is no unit,
+# whatever another reading of it would measure. A unit of a quantity of `QUANTITIES` is known; any
+# other is no unit here.
 
 # The prefixes a symbol of `_PREFIXED` may carry, and their factors.
 _PREFIXES: Mapping[str, float] = {
@@ -137,25 +138,18 @@ def _in_range(factor: float) -> float:
     return factor
 
 
-# Each symbol, and the symbols of its base: m, mm and km are all metres.
-_SAME_BASE: Mapping[str, frozenset[str]] = {
-    symbol: frozenset(other for other, (_factor, theirs) in SYMBOLS.items() if theirs == powers)
-    for symbol, (_scale, powers) in SYMBOLS.items()
-}
-
-
-def _symbol_at(text: str, at: int) -> str | None:
-    """The longest symbol a text gives at a place, or None."""
-    return next((symbol for symbol in _BY_LENGTH if text.startswith(symbol, at)), None)
+# The one prefixed symbol read as its parts, a millikelvin as a metre and a kelvin, and its bases.
+_RUN_TOGETHER = "mK"
+_RUN_TOGETHER_BASES = ("m", "K")
 
 
 def _readings(unit: str) -> Iterator[list[_Token]]:
     """The ways to read a unit as factors and signs, a product written out as `·`, the SI one first.
 
     The symbols of a run of letters are matched the longest first, so that the first reading binds
-    each prefix to its symbol; a later one splits a prefixed symbol into a metre and the next
-    symbol, only as the first factor of a divisor and only where that symbol is no metre (W/mK).
-    A symbol raised out of the range of a float raises `_OutOfRange`.
+    each prefix to its symbol; a later one reads mK as a metre and a kelvin, only as the first
+    factor of a divisor and only in a unit with no other metre or kelvin (W/mK). No other prefixed
+    symbol is ever split. A symbol raised out of the range of a float raises `_OutOfRange`.
     """
     text = unit.translate(_SIGNS).strip()
     if len(text) > _LONGEST_UNIT:
@@ -174,41 +168,47 @@ def _readings(unit: str) -> Iterator[list[_Token]]:
     # Where no reading of the rest of the text ends: whether one does depends on the place alone.
     dead: set[int] = set()
 
-    def onward(at: int, tokens: tuple[_Token, ...]) -> Iterator[list[_Token]]:
+    def onward(at: int, tokens: tuple[_Token, ...], split: bool) -> Iterator[tuple[list[_Token], bool]]:
         while at < len(text) and (gap := _GAP.match(text, at)):
             at = gap.end()
             if gap["sign"]:  # a space is a product between two factors, nothing next to a sign
                 tokens = joined(tokens, "·" if gap["sign"] in "*." else gap["sign"])
         if at == len(text):
-            yield list(tokens)
+            yield list(tokens), split
             return
         if at in dead:
             return
         ended = False
-        # Only the first factor of a divisor may be split, as datasheets run it together (W/mK).
-        divisor = tokens[-1:] == ("/",) or tokens[-2:] == ("/", "(")
-        longest = None
-        for symbol in _BY_LENGTH:
-            if text.startswith(symbol, at):
-                if longest is None:
-                    longest = symbol
-                elif not divisor or _symbol_at(text, at + len(symbol)) in (None, *_SAME_BASE[symbol]):
-                    continue  # a prefixed symbol is one symbol: mg a milligram, mm a millimetre
-                factor, powers = SYMBOLS[symbol]
-                raised = _POWER.match(text, at + len(symbol))
-                power = int(raised[1]) if raised else 1
-                try:
-                    scaled = _in_range(factor**power)
-                except OverflowError:
-                    raise _OutOfRange from None
-                token = (scaled, {base: exponent * power for base, exponent in powers.items()})
-                for reading in onward(raised.end() if raised else at + len(symbol), joined(tokens, token)):
-                    ended = True
-                    yield reading
+        # The longest symbol only: a prefixed symbol is one symbol, mg a milligram, mm a millimetre.
+        longest = next((symbol for symbol in _BY_LENGTH if text.startswith(symbol, at)), None)
+        symbols = [] if longest is None else [longest]
+        # But mK as the first factor of a divisor, as datasheets run a conductivity's together (W/mK).
+        if longest == _RUN_TOGETHER and (tokens[-1:] == ("/",) or tokens[-2:] == ("/", "(")):
+            symbols.append(_RUN_TOGETHER_BASES[0])
+        for symbol in symbols:
+            factor, powers = SYMBOLS[symbol]
+            raised = _POWER.match(text, at + len(symbol))
+            power = int(raised[1]) if raised else 1
+            try:
+                scaled = _in_range(factor**power)
+            except OverflowError:
+                raise _OutOfRange from None
+            token = (scaled, {base: exponent * power for base, exponent in powers.items()})
+            after = raised.end() if raised else at + len(symbol)
+            for reading in onward(after, joined(tokens, token), split or symbol != longest):
+                ended = True
+                yield reading
         if not ended:
             dead.add(at)
 
-    yield from itertools.islice(onward(0, ()), _MOST_READINGS)
+    def alone(tokens: list[_Token]) -> bool:
+        # A unit read split at mK writes a metre and a kelvin once each, in that split alone.
+        factors = [token[1] for token in tokens if not isinstance(token, str)]
+        return all(sum(base in powers for powers in factors) == 1 for base in _RUN_TOGETHER_BASES)
+
+    for tokens, split in itertools.islice(onward(0, (), False), _MOST_READINGS):
+        if not split or alone(tokens):
+            yield tokens
 
 
 def _parse(tokens: list[_Token]) -> tuple[float, dict[str, int]]:
