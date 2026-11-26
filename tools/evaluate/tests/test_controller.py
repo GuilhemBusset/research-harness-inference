@@ -1027,6 +1027,11 @@ def test_an_issue_backed_comparison_is_posted_once(driver: Driver) -> None:
     found = [one for one in comments(driver) if one.startswith("### Comparison")]
     assert len(found) == 1 and f"candidate `{candidate}` against reference `{reference}`" in found[0]
     assert len(comments(driver)) == 3
+    # The comment names the measurement behind each capacity verdict: the candidate's missed floor.
+    graded = json.loads((driver.runs / candidate / "bundle" / report.SUMMARY).read_text())["capacity"]
+    missed = [row for one in graded.values() if (row := one["limiting_row"]) and row["missed"]]
+    assert missed
+    assert all(f"`{row['floor']}` missed (headroom {row['headroom']}" in found[0] for row in missed)
 
 
 def test_runs_of_another_repository_are_not_compared(driver: Driver, monkeypatch: pytest.MonkeyPatch) -> None:

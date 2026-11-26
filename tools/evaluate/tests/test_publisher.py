@@ -40,6 +40,7 @@ from evaluate.publisher import (
     Unanswered,
     Verdict,
     marker_line,
+    render_comparison,
     render_issue,
     render_run,
     resume_publication,
@@ -490,6 +491,29 @@ def test_public_settings_floors_and_measurements_render_as_given(
     assert f"`paired_margin_points`: {SUITE['objectives']['paired_margin_points']}" in issue
     assert render_issue(experiment) == render_issue(experiment)  # a checked record renders the same
     assert "850.5" in render_run(run("a" * 16, ttft_p95_ms=850.5))
+
+
+def test_a_comparison_shows_each_shape_s_limiting_rows_or_the_evidence_missing() -> None:
+    from evaluate import capacity, quality, report
+
+    # The mirrored vocabularies are those the report grades and the paired decisions read.
+    assert {one.value for one in publisher.Floor} == {one.value for one in capacity.Floor}
+    assert {one.value for one in publisher.Undecided} == {one.value for one in quality.Reason} | {report.LOAD_UNSHOWN}
+    missed = publisher.Limit(publisher.Floor.SPEED_P10, missed=True, headroom=-0.5, repetition=1)
+    shown = render_comparison(
+        replace(
+            comparison("a" * 16),
+            limits={Shape.SEVERAL_AGENTS: (None, missed)},
+            undecided={Shape.HANDS_ON: publisher.Undecided.MISSING_PAIRS},
+        )
+    )
+    several = next(line for line in shown.splitlines() if "several_agents limiting row" in line)
+    assert "reference no floor read" in several and "`speed_p10` missed (headroom -0.5, repetition 1)" in several
+    assert "hands_on limiting row: reference no floor read; candidate no floor read" in shown
+    assert "`missing-pairs`" in shown
+    for limits in ({Shape.HANDS_ON: (replace(missed, missed="yes"), None)}, {Shape.HANDS_ON: (missed,)}):
+        with pytest.raises(PublishError):
+            render_comparison(replace(comparison("a" * 16), limits=limits))
 
 
 def test_a_rejected_question_or_a_scan_finding_sends_nothing(

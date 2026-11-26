@@ -223,6 +223,40 @@ class RunResult:
     permalink: str | None = None
 
 
+class Floor(StrEnum):
+    """A capacity floor: the values of `evaluate.capacity.Floor`, which the publish-only path does
+    not import."""
+
+    TTFT_P95 = "ttft_p95"
+    SPEED_P50 = "speed_p50"
+    SPEED_P10 = "speed_p10"
+    FAILED_SHARE = "failed_share"
+    PREEMPTIONS = "preemptions"
+
+
+class Undecided(StrEnum):
+    """Why a shape's paired quality at class load decides nothing: the values of
+    `evaluate.quality.Reason`, and the report's `load-unshown` (a run of the pair does not show the
+    class load while its tasks ran)."""
+
+    UNMATCHED_WORKLOAD = "unmatched-workload"
+    MISSING_PAIRS = "missing-pairs"
+    SPANS_MARGIN = "spans-margin"
+    DEGENERATE_PRECISION = "degenerate-precision"
+    LOAD_UNSHOWN = "load-unshown"
+
+
+@dataclass(frozen=True)
+class Limit:
+    """A shape's limiting capacity row in a run: the floor with the least headroom, the repetition
+    it is in, and whether it was observed missed."""
+
+    floor: Floor
+    missed: bool
+    headroom: float
+    repetition: int
+
+
 @dataclass(frozen=True)
 class Comparison:
     reference_run: str
@@ -231,6 +265,11 @@ class Comparison:
     quality: Mapping[Shape, Relative]
     bundle_digest: str
     permalink: str | None = None
+    # Each shape's limiting capacity row in the reference and in the candidate, `None` where that
+    # run read no floor of the shape: the evidence behind `capacity`.
+    limits: Mapping[Shape, tuple[Limit | None, Limit | None]] = field(default_factory=dict)
+    # The shapes whose paired quality at class load decides nothing, and why.
+    undecided: Mapping[Shape, Undecided] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -541,10 +580,47 @@ def render_comparison(comparison: Comparison) -> str:
         ),
         "",
         f"- Capacity by shape: {_by_shape(comparison.capacity, Relative)}",
+        *_limit_lines(comparison.capacity, comparison.limits),
         f"- Quality by shape: {_by_shape(comparison.quality, Relative)}",
+        *_undecided_lines(comparison.undecided),
         *_bundle(comparison.bundle_digest, comparison.permalink),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _limit(value: object) -> str:
+    if value is None:
+        return "no floor read"
+    if not isinstance(value, Limit) or type(value.missed) is not bool:
+        raise _reject()
+    return (
+        f"`{_member(Floor, value.floor)}` {'missed' if value.missed else 'met'}"
+        f" (headroom {_shown(_amount(value.headroom, -_MAX_COUNT))}, repetition {_count(value.repetition)})"
+    )
+
+
+def _limit_lines(capacity: object, limits: object) -> list[str]:
+    """Each compared shape's limiting row in both runs, or the evidence missing for one."""
+    if not isinstance(capacity, Mapping) or not isinstance(limits, Mapping) or not set(limits) <= set(capacity):
+        raise _reject()
+    lines = []
+    for shape in sorted(capacity):
+        pair = limits.get(shape, (None, None))
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise _reject()
+        lines.append(
+            f"  - {_member(Shape, shape)} limiting row: reference {_limit(pair[0])}; candidate {_limit(pair[1])}"
+        )
+    return lines
+
+
+def _undecided_lines(undecided: object) -> list[str]:
+    if not isinstance(undecided, Mapping):
+        raise _reject()
+    return [
+        f"  - {_member(Shape, shape)} decides nothing: `{_member(Undecided, reason)}`"
+        for shape, reason in sorted(undecided.items())
+    ]
 
 
 def _bundle(digest: str, permalink: str | None) -> list[str]:

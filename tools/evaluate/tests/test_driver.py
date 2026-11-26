@@ -10,7 +10,9 @@ import dataclasses
 import io
 import json
 import os
+import re
 import secrets
+import shlex
 import shutil
 import socket
 import stat
@@ -36,6 +38,7 @@ if TYPE_CHECKING:
 
     from evaluate.plan import Plan
 
+SKILL = Path(__file__).resolve().parents[3] / ".agents" / "skills" / "evaluate" / "SKILL.md"
 RUN: dict[str, Any] = {
     "profile": "qualify",
     "pool": POOL,
@@ -336,6 +339,31 @@ def test_the_issue_a_later_publication_confirmed_is_shown(host: Host) -> None:
     assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
 
 
+def test_an_issue_created_without_its_confirmation_is_pending_and_its_resume_shows_that_one_issue(host: Host) -> None:
+    """GitHub creates the issue and the answer is lost: the run stops before booking, shows no
+    issue and a pending publication, and the command the `evaluate` skill gives the operator for
+    that state confirms that same issue."""
+    github = host.services.fake.github
+    github.faults.append(("POST", "lost-then-down"))
+    host.start()
+    sid = submission()
+    run_id = host.call(op="submit", submission=sid, run=RUN)["run_id"]
+    seen = host.settled(sid)
+    assert (seen["issue"], seen["running"], seen["publication"]) == (None, False, "pending")
+    assert seen["exit"] == controller.Exit.INCOMPLETE
+    assert host.counts() == (1, 1, 0)
+    assert len(github.issues) == 1  # GitHub has it; the driver could not confirm it
+
+    given = re.findall(r"`scripts/evaluate\.sh (publish [^`]*<run-id>)`", SKILL.read_text(encoding="utf-8"))
+    assert given, "the skill gives the operator a recovery for a pending publication"
+    recovery = cli.parser().parse_args(shlex.split(given[0].replace("<run-id>", run_id)))
+    github.down = False
+    assert controller.publish_resume(host.runs, recovery.run_id, connect=host.services, out=io.StringIO()) == 0
+    (number,) = github.issues
+    assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
+    assert host.counts() == (1, 1, 0)
+
+
 def test_a_run_is_inspected_and_cancelled_while_another_submission_waits_on_its_admission(host: Host) -> None:
     measuring, admitting, release = threading.Event(), threading.Event(), threading.Event()
 
@@ -385,6 +413,9 @@ def test_a_cancel_accepted_while_the_run_is_in_its_preflight_holds_and_nothing_i
     assert answers[0]["ok"] and shown["cancel_requested"]
     assert shown["exit"] == controller.Exit.INCOMPLETE and shown["issue"] is None
     assert host.counts() == (1, 0, 0)
+    # Shown as cancelled with nothing to deliver: no write was attempted, so none was refused.
+    assert shown["publication"] != controller.Publication.PENDING.value
+    assert host.services.fake.github.writes() == []
 
 
 def test_a_client_saves_its_submission_before_sending_it_and_the_same_id_with_other_fields_is_refused(
@@ -530,6 +561,33 @@ def test_a_repository_github_does_not_have_for_the_driver_is_not_admitted(
     assert answer["refused"] == served.Refusal.NOT_ADMITTED.value and "run_id" not in answer
     assert controller.Check.DESTINATION.value in answer["detail"]
     assert host.admitted() == [] and host.counts() == (0, 0, 0)
+
+
+def test_a_repository_the_driver_reads_but_cannot_open_an_issue_in_is_admitted_and_ends_invalid_unbooked(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Admission only reads: a refused issue creation is the admitted run's, before its booking.
+    github = host.services.fake.github
+    routed = github._route
+    monkeypatch.setattr(github, "_route", lambda method, path, body: (403, {}) if method == "POST" else routed(method, path, body))
+    host.start()
+    sid = submission()
+    answer = host.call(op="submit", submission=sid, run=RUN)
+    assert answer["ok"] and answer["run_id"]
+    shown = host.settled(sid)
+    assert shown["run_id"] == answer["run_id"] and shown["exit"] == controller.Exit.INCOMPLETE
+    assert shown.get("issue") is None and host.counts() == (1, 0, 0)
+    # A refused creation shows as a write awaiting confirmation, like a lost answer: delivery
+    # stays pending while the write is refused, and opens that one issue once it is allowed.
+    assert shown["publication"] == controller.Publication.PENDING.value and not shown["cancel_requested"]
+    run_id = answer["run_id"]
+    assert controller.publish_resume(host.runs, run_id, connect=host.services, out=io.StringIO()) == 2
+    assert github.issues == {}
+    monkeypatch.setattr(github, "_route", routed)
+    assert controller.publish_resume(host.runs, run_id, connect=host.services, out=io.StringIO()) == 0
+    (number,) = github.issues
+    assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
+    assert host.counts() == (1, 1, 0)
 
 
 @pytest.mark.parametrize("operator_hosts", [None, 1], ids=["no-session", "another-host-count"])

@@ -38,7 +38,7 @@ export UV_NO_ENV_FILE=1
 engine_python=3.12
 engine_pytest='pytest==8.3.5'
 engine_xdist='pytest-xdist==3.8.0'
-skills=(implement ship backlog)
+skills=(implement ship backlog evaluate)
 
 failed=()
 
