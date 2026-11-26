@@ -2043,17 +2043,18 @@ class Engine:
     def _plugin_only(root: Path) -> Path:
         """`root`, holding the verifier's result plugin under the name the verifier loads it by
         (`verify.PLUGIN`, `implement_loop.loop_pytest`), copied from where the verifier ships it,
-        with an empty `__init__.py` beside it and nothing else of the engine. The plugin drops the
-        package it was loaded from once loaded, so a test then imports the code under review's own
-        `implement_loop` if its path has one, and this empty one if not. A copy, not a link: the
-        plugin finds its package by its own real path."""
+        and a package `__init__.py` of the engine's own (`PLUGIN_PACKAGE`), and nothing else of the
+        engine. Importing that package takes `root` off `sys.path`; the plugin still loads through
+        the package's `__path__`, and drops the package once loaded. So a test then imports the code
+        under review's own `implement_loop` if its path has one, and none if not. A copy, not a
+        link: the plugin finds its package by its own real path."""
         parts = verify.PLUGIN.split(".")
         source = verify.ENGINE_DIR.joinpath(*parts).with_suffix(".py")
         target = root.joinpath(*parts).with_suffix(".py")
         target.parent.mkdir(parents=True, exist_ok=True)
         for package in target.relative_to(root).parents:
             if package != Path("."):
-                (root / package / "__init__.py").touch()
+                (root / package / "__init__.py").write_text(PLUGIN_PACKAGE.format(root=str(root.resolve())))
         shutil.copyfile(source, target)
         return root
 
@@ -3762,6 +3763,22 @@ VERIFIER_RUN = "verifier_run"   # on an open finding: the engine's last run of i
 PROBE_TEXT = "probe_text"       # on a finding a probe witnesses: the probe's content, never committed
 RUN_OUTPUT = 1500               # the characters of a run's output a builder is given, as for a standing check
 FAILED_RUNS = 4                 # the failed commands of one verification whose output a builder is given
+
+
+# The `__init__.py` of the package `Engine._plugin_only` writes, which holds the verifier's result
+# plugin alone. Importing it takes the directory it was found in (`root`) off `sys.path` and out of
+# the path-importer cache: the plugin's own module still loads through the package's `__path__`, and
+# once the plugin has dropped the package from `sys.modules`, `import implement_loop` cannot find
+# this one again. It runs in whatever Python the command uses: standard library and Python 3.8.
+PLUGIN_PACKAGE = """# The verifier's result plugin, for one run of a reproduction; nothing else of the engine.
+import os
+import sys
+
+_ROOT = os.path.realpath({root!r})
+sys.path[:] = [p for p in sys.path if not p or os.path.realpath(p) != _ROOT]
+for _key in [k for k in list(sys.path_importer_cache) if k and os.path.realpath(k) == _ROOT]:
+    sys.path_importer_cache.pop(_key, None)
+"""
 
 
 # A value the engine extends: literal path characters only. A quote, an escape, an expansion

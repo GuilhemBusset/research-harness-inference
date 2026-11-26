@@ -115,7 +115,9 @@ PASSES, FAILS = "def test_x():\n    pass\n", "def test_x():\n    assert 1 == 2\n
 # A pytest run that does not find the verifier's plugin, with the test the probe holds.
 REPLACES = f"env PYTHONPATH=lib {PY} -m pytest -q checks/probe_x.py"
 # The code under review's own `implement_loop`, as a repository whose package has that name holds it.
-UNDER_REVIEW = {"src/implement_loop/__init__.py": "", "src/implement_loop/engine.py": ""}
+UNDER_REVIEW = {"src/implement_loop/__init__.py": "MARK = 'reviewed'\n", "src/implement_loop/engine.py": ""}
+# A probe that imports `implement_loop` bare, after the plugin has loaded.
+BARE = "import sys\n\nsys.path.insert(0, 'src')\n\n\ndef test_x():\n    import implement_loop\n"
 
 
 @pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
@@ -133,6 +135,19 @@ def test_the_extended_run_imports_the_implement_loop_under_review_not_the_verifi
     commit(wt, {"README.md": "code under review\n", **code})
     probe = ("import sys\n\nsys.path.insert(0, 'src')\n\n\ndef test_x():\n"
              "    from implement_loop import engine  # the verifier's copy has one too\n")
+    assert reproduces(engine, wt, REPLACES, probe) is holds
+
+
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+@pytest.mark.parametrize(("code", "probe", "holds"), [
+    ({}, BARE, True),
+    (UNDER_REVIEW, BARE + "    assert implement_loop.MARK == 'reviewed'\n", False),
+], ids=["none-under-review", "one-under-review"])
+def test_a_bare_import_on_the_extended_run_finds_the_implement_loop_under_review_or_none(engine, wt, code, probe, holds):
+    """Codex's review of the third version: the plugin's package left its directory on sys.path,
+    so once the plugin had dropped it, a bare `import implement_loop` found it again and passed
+    where the code under review had none."""
+    commit(wt, {"README.md": "code under review\n", **code})
     assert reproduces(engine, wt, REPLACES, probe) is holds
 
 
