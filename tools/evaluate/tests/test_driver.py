@@ -336,6 +336,25 @@ def test_the_issue_a_later_publication_confirmed_is_shown(host: Host) -> None:
     assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
 
 
+def test_an_issue_created_without_its_confirmation_is_pending_and_its_resume_shows_that_one_issue(host: Host) -> None:
+    """GitHub creates the issue and the answer is lost: the run stops before booking, shows no
+    issue and a pending publication, and the publication's resume confirms that same issue."""
+    github = host.services.fake.github
+    github.faults.append(("POST", "lost-then-down"))
+    host.start()
+    sid = submission()
+    run_id = host.call(op="submit", submission=sid, run=RUN)["run_id"]
+    seen = host.settled(sid)
+    assert (seen["issue"], seen["publication"], seen["exit"]) == (None, "pending", controller.Exit.INCOMPLETE)
+    assert host.counts() == (1, 1, 0)
+
+    github.down = False
+    assert controller.publish_resume(host.runs, run_id, connect=host.services, out=io.StringIO()) == 0
+    (number,) = github.issues
+    assert host.call(op="inspect", run_id=run_id)["issue"] == controller.issue_url(REPO, number)
+    assert host.counts() == (1, 1, 0)
+
+
 def test_a_run_is_inspected_and_cancelled_while_another_submission_waits_on_its_admission(host: Host) -> None:
     measuring, admitting, release = threading.Event(), threading.Event(), threading.Event()
 
