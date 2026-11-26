@@ -1,16 +1,16 @@
 # Evaluation scorecard
 
-Summary digest: `sha256:77a1809d8b1c97de4bab1327ee96b9df52d45af6860644bb8ce6b560a42fdbcf`
+Summary digest: `sha256:279f092622df12c275604a43e1379c448518b4d469b1ca85be1dec6528e4b4dd`
 
 Run `sha256:af56506c217fe7e4224846c66c7ea9e6a68c98c529a13a5df2c0506e49d9d298`, workload `sha256:7f62a46abda53cb7df50d9088621ae380cdbd208616fe2ccf5c18dd0fd69b2ba`, treatment `sha256:ee1b33aaf2e3f77f617a0ad0b079867172d3e63f5aadc98190352b2560f55170`.
 Suite course-v1, profile qualify, class size 2.
 
 ## Recommendation
 
-| Shape | Recommendation | Host count | Run | Tested hosts | Capacity | Absolute quality (class load) | Relative quality (class load) |
-|---|---|---|---|---|---|---|---|
-| hands_on | unknown | – | run | 2 | met | met | unknown (no_reference) |
-| several_agents | not_met | – | run | 2 | missed | met | unknown (no_reference) |
+| Shape | Recommendation | Host count | Run | Tested hosts | Capacity | Absolute quality (class load) | Relative quality (class load) | Class load shown | Hosts served |
+|---|---|---|---|---|---|---|---|---|---|
+| hands_on | unknown | – | run | 2 | met | met | unknown (no_reference) | met | met |
+| several_agents | not_met | – | run | 2 | missed | met | unknown (no_reference) | met | met |
 
 Class size 2. Common configuration: none. Any other class size or host count: unknown (not measured, not projected).
 
@@ -42,38 +42,68 @@ Host cost is an estimate at 3.36 USD a host-hour (example rate).
 
 **hands_on** at 2 agent slots: pass; limiting row: ttft_p95 (headroom 0.22, repetition 0).
 
-| Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s | Cost / M output USD (estimate) |
+| Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s (by host) | Cost / M output USD (estimate) |
 |---|---|---|---|---|---|---|---|---|---|
-| 0 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 | 233.3 |
-| 1 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 | 233.3 |
-| 2 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 | 233.3 |
+| 0 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 1 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 2 | pass | – | 3900 (102/100) | 20 / 20 (104/100) | 0 / 104 (observed floor) | 0 (0–0.03562) | 0 | 8 (0: 4, 1: 4) | 233.3 |
 
 Across repetitions: p95 TTFT 3900 to 3900 ms, p10 speed 20 to 20 tok/s, failed share 0 to 0.
 
 **several_agents** at 4 agent slots: known_miss; limiting row: speed_p10 (headroom -0.5, repetition 1, missed).
 
-| Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s | Cost / M output USD (estimate) |
+| Rep | Verdict | Reasons | p95 TTFT ms (later turns/min) | p50 / p10 tok/s (streams/min) | Failed / attempts | Failed share (Wilson 95%) | Preemptions | Engine tok/s (by host) | Cost / M output USD (estimate) |
 |---|---|---|---|---|---|---|---|---|---|
-| 0 | pass | – | 1500 (104/100) | 20 / 20 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 | 233.3 |
-| 1 | measured_miss | – | 1500 (104/100) | 20 / 5 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 | 233.3 |
-| 2 | pass | – | 1500 (104/100) | 20 / 20 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 | 233.3 |
+| 0 | pass | – | 1500 (104/100) | 20 / 20 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 1 | measured_miss | – | 1500 (104/100) | 20 / 5 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 (0: 4, 1: 4) | 233.3 |
+| 2 | pass | – | 1500 (104/100) | 20 / 20 (108/100) | 0 / 108 (observed floor) | 0 (0–0.03435) | 0 | 8 (0: 4, 1: 4) | 233.3 |
 
 Across repetitions: p95 TTFT 1500 to 1500 ms, p10 speed 5 to 20 tok/s, failed share 0 to 0.
 
-## Live requests by harness and load
+## Capacity sweep (every measured load)
 
-| Load | Harness | Requests | Failed | p95 TTFT ms (later turns) | p50 / p10 tok/s (streams) |
+| Shape | Agent slots | Rep | Class size | Verdict | p95 TTFT ms | p50 / p10 tok/s | Failed share |
+|---|---|---|---|---|---|---|---|
+| hands_on | 2 | 0 | yes | pass | 3900 (102) | 20 / 20 (104) | 0 |
+| hands_on | 2 | 1 | yes | pass | 3900 (102) | 20 / 20 (104) | 0 |
+| hands_on | 2 | 2 | yes | pass | 3900 (102) | 20 / 20 (104) | 0 |
+| several_agents | 4 | 0 | yes | pass | 1500 (104) | 20 / 20 (108) | 0 |
+| several_agents | 4 | 1 | yes | measured_miss | 1500 (104) | 20 / 5 (108) | 0 |
+| several_agents | 4 | 2 | yes | pass | 1500 (104) | 20 / 20 (108) | 0 |
+
+## Class load behind the live tasks
+
+| Shape | Cell | Rep | Shown | Gap | Background seats (planned) |
 |---|---|---|---|---|---|
-| class_load | claude_code | 90 | 0 | 800 (36) | 20 / 20 (90) |
-| class_load | codex | 36 | 0 | 800 (18) | 20 / 20 (36) |
-| class_load | opencode | 18 | 0 | 800 (9) | 20 / 20 (18) |
-| class_load | pi | 18 | 0 | 800 (9) | 20 / 20 (18) |
-| class_load | sdk_tool_loop | 18 | 0 | 800 (9) | 20 / 20 (18) |
-| low_load | claude_code | 90 | 0 | 800 (36) | 20 / 20 (90) |
-| low_load | codex | 36 | 0 | 800 (18) | 20 / 20 (36) |
-| low_load | opencode | 18 | 0 | 800 (9) | 20 / 20 (18) |
-| low_load | pi | 18 | 0 | 800 (9) | 20 / 20 (18) |
-| low_load | sdk_tool_loop | 18 | 0 | 800 (9) | 20 / 20 (18) |
+| hands_on | 15 | 0 | met | – | 1 (1) |
+| hands_on | 16 | 0 | met | – | 1 (1) |
+| hands_on | 33 | 1 | met | – | 1 (1) |
+| hands_on | 34 | 1 | met | – | 1 (1) |
+| hands_on | 52 | 2 | met | – | 1 (1) |
+| hands_on | 55 | 2 | met | – | 1 (1) |
+| several_agents | 14 | 0 | met | – | 1 (1) |
+| several_agents | 17 | 0 | met | – | 1 (1) |
+| several_agents | 35 | 1 | met | – | 1 (1) |
+| several_agents | 36 | 1 | met | – | 1 (1) |
+| several_agents | 53 | 2 | met | – | 1 (1) |
+| several_agents | 54 | 2 | met | – | 1 (1) |
+
+## Live requests by shape, harness and load
+
+| Shape | Load | Harness | Requests | Failed | p95 TTFT ms (later turns) | p50 / p10 tok/s (streams) |
+|---|---|---|---|---|---|---|
+| hands_on | class_load | claude_code | 36 | 0 | 800 (18) | 20 / 20 (36) |
+| hands_on | class_load | codex | 36 | 0 | 800 (18) | 20 / 20 (36) |
+| hands_on | class_load | opencode | 18 | 0 | 800 (9) | 20 / 20 (18) |
+| hands_on | class_load | pi | 18 | 0 | 800 (9) | 20 / 20 (18) |
+| hands_on | class_load | sdk_tool_loop | 18 | 0 | 800 (9) | 20 / 20 (18) |
+| hands_on | low_load | claude_code | 36 | 0 | 800 (18) | 20 / 20 (36) |
+| hands_on | low_load | codex | 36 | 0 | 800 (18) | 20 / 20 (36) |
+| hands_on | low_load | opencode | 18 | 0 | 800 (9) | 20 / 20 (18) |
+| hands_on | low_load | pi | 18 | 0 | 800 (9) | 20 / 20 (18) |
+| hands_on | low_load | sdk_tool_loop | 18 | 0 | 800 (9) | 20 / 20 (18) |
+| several_agents | class_load | claude_code | 54 | 0 | 800 (18) | 20 / 20 (54) |
+| several_agents | low_load | claude_code | 54 | 0 | 800 (18) | 20 / 20 (54) |
 
 ## Quality by family, harness and load
 
@@ -132,5 +162,5 @@ Weighted success at class_load: hands_on 0.9889, several_agents 1; combined 0.99
 
 | Run | Tokenizer (requested) | Tokenizer (observed) | Load | Successful task ms | Completions / hour | Successes / attempts | Emitted tokens / turn |
 |---|---|---|---|---|---|---|---|
-| run | cccccccccccccccccccccccccccccccccccccccc | cccccccccccccccccccccccccccccccccccccccc | low_load | 63462 | 52.55 | 78 / 81 | 61 |
-| run | cccccccccccccccccccccccccccccccccccccccc | cccccccccccccccccccccccccccccccccccccccc | class_load | 63250 | 53.9 | 80 / 81 | 61 |
+| run | cccccccccccccccccccccccccccccccccccccccc | cccccccccccccccccccccccccccccccccccccccc | low_load | 63462 | 51.4 | 78 / 81 | 61 |
+| run | cccccccccccccccccccccccccccccccccccccccc | cccccccccccccccccccccccccccccccccccccccc | class_load | 63250 | 52.72 | 80 / 81 | 61 |

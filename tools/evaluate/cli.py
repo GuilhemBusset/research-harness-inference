@@ -34,9 +34,10 @@ The three read saved bundles offline (`evaluate.report`), with no credentials an
 prints the report. `compare` prints the treatment diff of two bundles first, then their comparison
 scorecard; it writes nothing. `export` writes a validated, scanned copy of a bundle as a new
 directory under `docs/evaluations/`, for review in a pull request. The host price of the cost
-estimates is `--rate`, or the example configuration's, labelled as `plan` labels it. `--json`
-prints the summary or the comparison as one JSON document. Each exits 0 when it read, compared or
-wrote, and 2 with a refusal, whose reason is one of `report.Refusal`.
+estimates is `--rate`; without it `report` and `export` keep the price of the bundle's saved
+summary, and otherwise use the example configuration's, labelled as `plan` labels it. `--json`
+prints the summary or the comparison as one JSON document, the comparison's diff first. Each exits
+0 when it read, compared or wrote, and 2 with a refusal, whose reason is one of `report.Refusal`.
 """
 
 from __future__ import annotations
@@ -246,26 +247,43 @@ def parser() -> argparse.ArgumentParser:
     return top
 
 
-def _evidence(args: argparse.Namespace, rate: float, source: str) -> int:
+def _evidence(args: argparse.Namespace, example_rate: float) -> int:
     """`report`, `compare` and `export`: read saved bundles, offline. The reader is imported here:
-    it needs `spikes` and the services `spikes/common.py` imports, which `plan` does not."""
+    it needs `spikes` and the services `spikes/common.py` imports, which `plan` does not.
+
+    The host price is `--rate` when given. Otherwise `report` and `export` keep the price the
+    bundle's saved summary was made at, so that regenerating a bundle reproduces its digest, and a
+    bundle with no summary yet, or a comparison, is priced at the example configuration's rate."""
     from evaluate import report
 
+    supplied = None if args.rate is None else (args.rate, Source.SUPPLIED)
+    example = (example_rate, Source.EXAMPLE)
+    diff = None
     try:
         if args.command == "compare":
+            manifests = report.read_manifest(args.reference), report.read_manifest(args.candidate)
+            # The diff comes first, whether or not the two compare, and before the rest is read.
+            diff = report.treatment_diff(*manifests)
+            if not args.json:
+                print(report.render_diff(diff), flush=True)
+            report.check_workloads(*manifests)
             reference, candidate = report.load(args.reference), report.load(args.candidate)
-            # The diff comes first, whether or not the two compare.
-            print(report.render_diff(report.treatment_diff(reference.manifest, candidate.manifest)), flush=True)
+            rate, source = supplied or example
             compared = report.compare(reference, candidate, usd_per_host_hour=rate, rate_source=source)
-            print(report.dump(compared) if args.json else report.render_comparison(compared), end="")
+            print(report.dump_first(compared, "diff") if args.json else report.render_comparison(compared), end="")
         elif args.command == "report":
-            derived = report.regenerate(report.load(args.bundle), usd_per_host_hour=rate, rate_source=source)
+            bundle = report.load(args.bundle)
+            rate, source = supplied or report.saved_price(bundle) or example
+            derived = report.regenerate(bundle, usd_per_host_hour=rate, rate_source=source)
             report.write_derived(args.bundle, derived)
             print(derived.summary if args.json else derived.report, end="")
         else:
+            rate, source = supplied or report.saved_price(report.load(args.bundle)) or example
             derived = report.export(args.bundle, args.destination, usd_per_host_hour=rate, rate_source=source)
             print(f"exported: {derived.digest}")
     except report.ReportError as refused:
+        if args.command == "compare" and args.json and diff is not None:
+            print(report.dump_first({"diff": diff, "refused": str(refused)}, "diff"), end="")
         print(f"refused: {refused}", file=sys.stderr)
         return 2
     return 0
@@ -275,8 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     example_window, example_rate = _example()
     if args.command != "plan":
-        rate_source = Source.EXAMPLE if args.rate is None else Source.SUPPLIED
-        return _evidence(args, example_rate if args.rate is None else args.rate, rate_source)
+        return _evidence(args, example_rate)
     sources = {
         "window": Source.EXAMPLE if args.window is None else Source.SUPPLIED,
         "rate": Source.EXAMPLE if args.rate is None else Source.SUPPLIED,

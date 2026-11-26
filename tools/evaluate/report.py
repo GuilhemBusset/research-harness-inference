@@ -28,11 +28,15 @@ identity, but for the floors and the sample budgets. Those are read as the manif
 the run read the deployed values once, and they need not be the suite's examples. The capacity is `capacity.read` over the measured attempts, the quality is `quality.read`
 over every trial and cell record. Nothing reads a clock, the network or an account: the same bundle
 and the same host price give the same bytes of `summary.json`, so the same digest, on any machine.
+The host price is a bounded number with a source of a fixed vocabulary (`PRICE_SOURCES`), and the
+summary keeps it as given: `saved_price` reads it back, so a regenerated bundle keeps its digest.
 
 **What the summary shows.** The requested and the observed settings side by side, neither filled
 from the other. Capacity at the class size for each shape, each repetition with its rows, its
-counts and its verdict, and the shape's limiting row: the floor with the least headroom over its
-objective in any repetition, a missed floor before any met one. The live requests of each harness
+counts, its engine throughput by host and summed, and its verdict, and the shape's limiting row:
+the floor with the least headroom over its objective in any repetition, a missed floor before any
+met one. Every measured cell of the capacity sweep, by shape, load and repetition. Whether each
+live cell read at class load ran under that load. The live requests of each harness in each shape
 at each load. Quality by family, harness and load, the weighted rates of each shape and the
 combined one. The replay against the live tasks of each shape: p50 and p90 of input and output
 tokens, cached share, tool delay and turns per task, the route mix and the fan-out (a measure the
@@ -42,23 +46,33 @@ under the run's tokenizer. And the recommendation.
 **The recommendation** is made for each shape at the class size, from runs that were measured:
 the run's observed host count is a candidate only when every scheduled repetition passed capacity
 (`ShapeVerdict.PASS`), every required family/harness cell of the shape meets the absolute floor at
-class load, and the paired relative check at class load passes. A low-load miss is shown in its
-own rows and decides nothing at class size. A run read alone has no relative check: it is
-`unknown`. In a comparison the reference is the baseline the change is measured from, and the
-candidate needs its paired decision. The smallest qualifying host count is recommended; a class
-size or a host count that was not measured is never projected, it stays unknown. A common host
-count is given only when one run qualifies for both shapes.
+class load, the paired relative check at class load passes, the class load was there (each live
+cell read at class load has every counted send as a row, a request of each trial, and the
+background of every other seat from before its first trial until after its last: `class_load`),
+and that host count served (requested and observed in the manifest, and the hosts each attempt the
+shape is read on observed and accounted for). A low-load miss is shown in its own rows and decides
+nothing at class size. A run with no paired decision of its own is never recommended: one read
+alone, and the reference of a comparison, the baseline the change is measured from. The smallest
+qualifying host count is recommended; a class size or a host count that was not measured is never
+projected, it stays unknown. A common host count is given only when one run qualifies for both
+shapes.
 
-**Comparing** two bundles (`compare`) prints the treatment diff first: the requested settings that
-differ, the run's settings that differ, and the lever each changed setting belongs to (`Lever`).
+**Comparing** two bundles (`compare`) prints the treatment diff first, from the manifests alone,
+before the rest of either bundle is read: the requested settings that differ, the observed ones
+that differ, any setting a run observed other than it requested, the run's settings that differ,
+and the lever each changed setting belongs to (`Lever`). A run whose observed settings contradict
+its requested ones is refused (`CONTRADICTED_SETTING`): no change can be attributed to what it
+requested. Observed settings that differ with their lever not declared changed are refused as
+undeclared.
 Two runs compare only when they are one planned workload: a changed floor (`objectives`) or sample
 budget (`sampling`) is refused by name, any other change of the workload as incompatible. Each
 lever that changed must be shown to have served, in both runs: the hosts and the release by the
 observed settings, the launch settings by every serving host's launch fingerprint, through each
-attempt and equal to the one its run's release requests (and the two runs' requests differ), the
-gateway profile by the observed one. A change that lacks that evidence, a flags-only one in
-particular, is refused as unverified, and so are launch fingerprints that differ when no launch
-setting was declared changed. A change of several levers is labelled `combined`.
+attempt and equal to the one its run's release requests (and the two runs' requests differ), with
+every host the attempt observed accounted for, the gateway profile by the observed one. A
+flags-only change needs both provenances, the engines' and the gateway's. A change that lacks
+that evidence, a flags-only one in particular, is refused as unverified, and so are launch
+fingerprints that differ when no launch setting was declared changed. A change of several levers is labelled `combined`.
 
 **Exporting** (`export`) is explicit and writes a new directory under `docs/evaluations/` and
 nowhere else. It reads the bundle as `load` does, which holds every value to the contracts (an
@@ -79,6 +93,7 @@ import dataclasses
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -128,6 +143,10 @@ DERIVED = (SUMMARY, REPORT, DIGEST)
 EVALUATIONS = Path("docs") / "evaluations"
 _EXPORT_NAME = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 _PLACES = 6
+# Where the host price of the cost estimates comes from, as `cli.Source` labels it: the only
+# labels a summary carries for it. The price itself is a bounded number.
+PRICE_SOURCES = ("example", "supplied")
+PRICE_MAX = 10**6
 
 
 class Refusal(StrEnum):
@@ -144,6 +163,8 @@ class Refusal(StrEnum):
     INCOMPATIBLE_WORKLOAD = "incompatible-workload"
     UNVERIFIED_TREATMENT = "unverified-treatment"
     UNDECLARED_TREATMENT = "undeclared-treatment"
+    CONTRADICTED_SETTING = "contradicted-setting"
+    UNKNOWN_PRICE = "unknown-price"
     EXPORT_OUTSIDE_EVALUATIONS = "export-outside-evaluations"
     EXPORT_EXISTS = "export-exists"
     STALE_DERIVED = "stale-derived"
@@ -417,6 +438,31 @@ def read(bundle: Bundle, *, usd_per_host_hour: float) -> Reading:
         raise ReportError(Refusal.INCONSISTENT_EVIDENCE) from None
 
 
+def check_price(usd_per_host_hour: float, rate_source: str) -> None:
+    """A host price a summary can carry: a bounded number above zero, from a source of the fixed
+    vocabulary. Anything else is refused before a summary is made of it."""
+    number = isinstance(usd_per_host_hour, int | float) and not isinstance(usd_per_host_hour, bool)
+    if not number or not math.isfinite(usd_per_host_hour) or not 0 < usd_per_host_hour < PRICE_MAX:
+        raise ReportError(Refusal.UNKNOWN_PRICE)
+    if rate_source not in PRICE_SOURCES:
+        raise ReportError(Refusal.UNKNOWN_PRICE)
+
+
+def saved_price(bundle: Bundle) -> tuple[float, str] | None:
+    """The host price the bundle's saved summary was made at, and its source, so that regenerating
+    it reproduces it; `None` when the bundle has no summary yet."""
+    text = bundle.derived.get(SUMMARY)
+    if text is None:
+        return None
+    try:
+        price = json.loads(text)["host_price"]
+        rate, source = price["usd_per_host_hour"], price["source"]
+    except (ValueError, KeyError, TypeError):
+        raise ReportError(Refusal.UNREADABLE_BUNDLE) from None
+    check_price(rate, source)
+    return float(rate), source
+
+
 def _measured(bundle: Bundle) -> list[Attempt]:
     """The attempt each cell is read on, as `capacity` chooses it: its valid one, or its last."""
     by_cell: dict[int, list[Attempt]] = {}
@@ -464,16 +510,27 @@ def _conditions(manifest: Manifest) -> list[dict[str, Any]]:
             status = "not_observed"
         else:
             status = "match" if asked == seen else "differs"
-        rows.append({"setting": field.name, "requested": _value(asked), "observed": _value(seen), "status": status})
+        rows.append(
+            {
+                "setting": field.name,
+                "lever": LEVERS[field.name].value,
+                "requested": _value(asked),
+                "observed": _value(seen),
+                "status": status,
+            }
+        )
     return rows
 
 
 def _headroom(floor: Floor, cell: capacity.CellReading, objectives: Objectives) -> float | None:
     """How far a repetition's row is inside its objective, as a share of the objective: below zero
-    is past it. A preemption has no ratio: one or more is a headroom of -1."""
+    is past it. An objective of zero has no ratio: the headroom is the difference itself. A
+    preemption has no ratio either: one or more is a headroom of -1."""
     if floor is Floor.TTFT_P95:
-        p95 = cell.later_turns.p95_ms
-        return None if p95 is None else (objectives.ttft_p95_ms_max - p95) / objectives.ttft_p95_ms_max
+        p95, ceiling = cell.later_turns.p95_ms, objectives.ttft_p95_ms_max
+        if p95 is None:
+            return None
+        return (ceiling - p95) / ceiling if ceiling > 0 else ceiling - p95
     if floor in (Floor.SPEED_P50, Floor.SPEED_P10):
         speed = cell.speeds.p50_tokens_per_s if floor is Floor.SPEED_P50 else cell.speeds.p10_tokens_per_s
         minimum = (
@@ -539,6 +596,12 @@ def _repetition(cell: capacity.CellReading) -> dict[str, Any]:
         "preemptions": None if engine is None else _n(engine.preemptions),
         "engine_output_tokens_per_s": None if engine is None else _n(engine.output_tokens_per_s),
         "engine_hosts": None if engine is None else len(engine.hosts),
+        # Each host's own throughput beside the pool's sum: a pool can hide an idle host.
+        "engine_output_tokens_per_s_by_host": (
+            None
+            if engine is None
+            else [{"host": host.host, "output_tokens_per_s": _n(host.output_tokens_per_s)} for host in engine.hosts]
+        ),
         "delivered_output_tokens": None if engine is None else engine.delivered_output_tokens,
         "cached_share": None if engine is None else _n(engine.cached_share),
         "waiting_requests_peak": None if engine is None else _n(engine.waiting_requests_peak),
@@ -571,6 +634,23 @@ def _capacity(reading: Reading) -> dict[str, Any]:
     return shapes
 
 
+def _sweep(reading: Reading) -> list[dict[str, Any]]:
+    """Every measured cell of the capacity sweep, each shape at each load it was driven at, with
+    its rows and its verdict: where a shape crosses a floor. Descriptive: the recommendation is read
+    at the class size alone."""
+    rows = [
+        {
+            "shape": cell.identity.shape.value,
+            "agent_slots": cell.identity.agent_slots,
+            "class_floor": cell.class_floor,
+            **_repetition(cell),
+        }
+        for cell in reading.capacity.cells
+        if cell.record is not None and cell.identity.phase is contracts.Phase.CAPACITY_SWEEP
+    ]
+    return sorted(rows, key=lambda row: (row["shape"], row["agent_slots"], row["repetition"], row["cell"]))
+
+
 def _live(reading: Reading) -> list[tuple[Load, RequestRecord]]:
     """The live requests of the measured attempts, each at every load its cell is read at."""
     workload = reading.manifest.workload
@@ -584,18 +664,22 @@ def _live(reading: Reading) -> list[tuple[Load, RequestRecord]]:
 
 
 def _by_harness(reading: Reading) -> list[dict[str, Any]]:
-    """What the live requests of each harness saw at each load: descriptive, held to no floor."""
-    trials = reading.manifest.workload.trials
-    groups: dict[tuple[Load, str], list[RequestRecord]] = {}
+    """What the live requests of each harness saw in each shape at each load: descriptive, held to
+    no floor. A harness that serves both shapes has a row for each."""
+    workload = reading.manifest.workload
+    trials = workload.trials
+    groups: dict[tuple[str, Load, str], list[RequestRecord]] = {}
     for load, request in _live(reading):
         if request.trial is not None and request.trial < len(trials):
-            groups.setdefault((load, trials[request.trial].harness.value), []).append(request)
+            shape = workload.cells[request.cell].shape.value
+            groups.setdefault((shape, load, trials[request.trial].harness.value), []).append(request)
     rows = []
-    for (load, harness), requests in sorted(groups.items()):
+    for (shape, load, harness), requests in sorted(groups.items()):
         later = [float(one.first_output_ms - one.sent_ms) for one in requests if one.turn > 0 and one.first_output_ms]
         speeds = [speed for one in requests if (speed := capacity.speed_of(one)) is not None]
         rows.append(
             {
+                "shape": shape,
                 "load": load.value,
                 "harness": harness,
                 "requests": len(requests),
@@ -666,13 +750,16 @@ def _peak(intervals: Iterable[tuple[int, int]]) -> int:
 
 
 def _tool_delays(groups: Iterable[Sequence[RequestRecord]]) -> list[float]:
-    """Within each conversation, the wait from a turn that ended in a tool call to the time the
-    next turn was eligible: the tool's own time."""
+    """Within each conversation, the wait from the end of a turn to the time the next turn was
+    eligible: the tool's own time. A turn that ended its answer (a stop, a length cut) or failed
+    is followed by no tool; the replay driver writes no finish reason, and the pause it scheduled
+    between two turns is read from their times alone."""
     delays = []
     for requests in groups:
         ordered = sorted(requests, key=lambda one: one.turn)
         for before, after in pairwise(ordered):
-            if before.finish_reason is FinishReason.TOOL_USE and after.turn == before.turn + 1:
+            tool = before.finish_reason in (FinishReason.TOOL_USE, None) and not before.failed
+            if tool and after.turn == before.turn + 1:
                 delays.append(float(max(0, after.eligible_ms - before.ended_ms)))
     return delays
 
@@ -802,13 +889,102 @@ def _tokenizer(reading: Reading) -> dict[str, Any]:
 # --- The recommendation -------------------------------------------------------------------------
 
 MET, MISSED, UNKNOWN = "met", "missed", "unknown"
-# What the relative check of a run is when it is read alone, and when it is the reference.
+# What the relative check of a run is when it is read alone, and when it is the reference: in
+# neither has the run a paired decision of its own, so in neither is it recommended.
 NO_REFERENCE, BASELINE = "no_reference", "baseline"
+LIVE_PHASES = (contracts.Phase.LIVE_LOW_LOAD, contracts.Phase.LIVE_CLASS_LOAD)
+
+
+class LoadGap(StrEnum):
+    """Why a live cell read at class load does not show that load."""
+
+    NOT_MEASURED = "not_measured"
+    SENDS_UNACCOUNTED = "sends_unaccounted"
+    TRIAL_UNSENT = "trial_unsent"
+    BACKGROUND_MISSING = "background_missing"
+    BACKGROUND_SHORT = "background_short"
+
+
+def _load_gap(reading: Reading, planned: planning.PlannedCell, attempt: Attempt | None) -> LoadGap | None:
+    """What a live cell read at class load lacks to show it ran under that load, or `None`. Every
+    send the scheduler counted must be a row (`capacity`'s reconciliation), every trial that counts
+    must have sent its own requests, and each seat the plan gives the background (all but the live
+    task's first) must have sent background traffic from before the first trial started until
+    after the last one ended."""
+    if attempt is None:
+        return LoadGap.NOT_MEASURED
+    cell = next(one for one in reading.capacity.cells if one.identity.cell == planned.identity.cell)
+    if capacity.Reason.ATTEMPTS_UNACCOUNTED in cell.reasons:
+        return LoadGap.SENDS_UNACCOUNTED
+    trials = [trial for trial in attempt.trials if trial.counts_as_attempt]
+    sent = {request.trial for request in attempt.requests if request.traffic is Traffic.LIVE}
+    if any(trial.trial not in sent for trial in trials):
+        return LoadGap.TRIAL_UNSENT
+    if planned.identity.phase is not contracts.Phase.LIVE_CLASS_LOAD or not trials:
+        return None
+    first, last = min(trial.started_ms for trial in trials), max(trial.ended_ms for trial in trials)
+    for seat in range(1, planned.identities):
+        background = [
+            request for request in attempt.requests if request.traffic is Traffic.BACKGROUND and request.student == seat
+        ]
+        if not background:
+            return LoadGap.BACKGROUND_MISSING
+        if min(one.sent_ms for one in background) > first or max(one.ended_ms for one in background) < last:
+            return LoadGap.BACKGROUND_SHORT
+    return None
+
+
+def class_load(reading: Reading, shape: Shape) -> list[dict[str, Any]]:
+    """Each live cell of a shape read at class load, and whether its evidence shows that load."""
+    measured = {attempt.record.cell: attempt for attempt in _measured(reading.bundle)}
+    workload = reading.manifest.workload
+    rows = []
+    for planned in reading.bundle.plan.cells:
+        identity = planned.identity
+        if identity.shape is not shape or Load.CLASS not in quality.loads_of(workload, identity.cell):
+            continue
+        attempt = measured.get(identity.cell)
+        gap = _load_gap(reading, planned, attempt)
+        background = (
+            0
+            if attempt is None
+            else len({one.student for one in attempt.requests if one.traffic is Traffic.BACKGROUND})
+        )
+        rows.append(
+            {
+                "cell": identity.cell,
+                "repetition": identity.repetition,
+                "status": MET if gap is None else UNKNOWN,
+                "gap": None if gap is None else gap.value,
+                "background_seats": background,
+                "background_seats_planned": planned.identities - 1 if identity.phase in LIVE_PHASES else 0,
+            }
+        )
+    return rows
+
+
+def _hosts_served(reading: Reading, shape: Shape) -> bool:
+    """Whether the run's host count is the one that served the shape: requested and observed in
+    the manifest, and observed by each attempt its capacity and its quality are read on, with each
+    of those hosts accounted for."""
+    manifest = reading.manifest
+    hosts = manifest.observed.host_count
+    if hosts is None or hosts != manifest.requested.host_count:
+        return False
+    plan = reading.bundle.plan
+    read_on = [
+        attempt
+        for attempt in _measured(reading.bundle)
+        if (planned := plan.cells[attempt.record.cell]).identity.shape is shape
+        and (Role.CLASS_FLOOR in planned.roles or planned.identity.phase in LIVE_PHASES)
+    ]
+    return bool(read_on) and all(
+        attempt.record.hosts_observed == hosts and len(attempt.checkpoint.hosts) == hosts for attempt in read_on
+    )
 
 
 def _checks(reading: Reading, shape: Shape, relative: Outcome | str) -> dict[str, str]:
     """The checks a shape needs at class size, each met, missed or unknown."""
-    manifest = reading.manifest
     shaped = reading.capacity.shapes.get(shape)
     verdict = None if shaped is None else shaped.verdict
     capacity_check = MET if verdict is ShapeVerdict.PASS else MISSED if verdict is ShapeVerdict.KNOWN_MISS else UNKNOWN
@@ -821,21 +997,22 @@ def _checks(reading: Reading, shape: Shape, relative: Outcome | str) -> dict[str
         absolute = MET
     else:
         absolute = UNKNOWN
-    if relative == BASELINE:
-        paired = MET
-    elif relative == NO_REFERENCE:
+    if relative in (BASELINE, NO_REFERENCE):
         paired = UNKNOWN
     else:
         paired = {Outcome.PASS: MET, Outcome.FAIL: MISSED}.get(Outcome(relative), UNKNOWN)
-    hosts = manifest.observed.host_count
-    host_check = MET if hosts is not None and hosts == manifest.requested.host_count else UNKNOWN
+    loaded = class_load(reading, shape)
     return {
         "capacity": capacity_check,
         "absolute_quality": absolute,
         "relative_quality": paired,
         "relative_basis": relative.value if isinstance(relative, Outcome) else relative,
-        "host_count": host_check,
+        "class_load_evidence": MET if loaded and all(row["status"] == MET for row in loaded) else UNKNOWN,
+        "host_count": MET if _hosts_served(reading, shape) else UNKNOWN,
     }
+
+
+REQUIRED_CHECKS = ("capacity", "absolute_quality", "relative_quality", "class_load_evidence", "host_count")
 
 
 def recommend(runs: Sequence[tuple[str, Reading, Mapping[Shape, Outcome] | str]]) -> dict[str, Any]:
@@ -850,7 +1027,7 @@ def recommend(runs: Sequence[tuple[str, Reading, Mapping[Shape, Outcome] | str]]
         for name, reading, relative in runs:
             basis = relative if isinstance(relative, str) else relative.get(shape, Outcome.INCONCLUSIVE)
             checks = _checks(reading, shape, basis)
-            states = [checks[key] for key in ("capacity", "absolute_quality", "relative_quality", "host_count")]
+            states = [checks[key] for key in REQUIRED_CHECKS]
             status = MET if all(state == MET for state in states) else MISSED if MISSED in states else UNKNOWN
             hosts = reading.manifest.observed.host_count
             tested.append({"run": name, "host_count": hosts, "status": status, "checks": checks})
@@ -897,9 +1074,12 @@ def scorecard(reading: Reading, *, usd_per_host_hour: float, rate_source: str) -
         "class_size": workload.students,
         "objectives": workload.objectives.to_json(),
         "sampling": workload.sampling.to_json(),
-        "host_price": {"usd_per_host_hour": _n(usd_per_host_hour), "source": rate_source, "estimate": True},
+        # The price as given, not rounded: regenerating the summary at it gives the same bytes.
+        "host_price": {"usd_per_host_hour": float(usd_per_host_hour), "source": rate_source, "estimate": True},
         "conditions": _conditions(manifest),
         "capacity": _capacity(reading),
+        "capacity_sweep": _sweep(reading),
+        "class_load_evidence": {shape.value: class_load(reading, shape) for shape in Shape},
         "capacity_by_harness": _by_harness(reading),
         "quality": _quality(reading),
         "distributions": _distributions(reading),
@@ -911,6 +1091,14 @@ def scorecard(reading: Reading, *, usd_per_host_hour: float, rate_source: str) -
 def dump(summary: Mapping[str, Any]) -> str:
     """The summary's bytes: sorted keys, two-space indents, one final newline."""
     return json.dumps(summary, sort_keys=True, indent=2, allow_nan=False) + "\n"
+
+
+def dump_first(document: Mapping[str, Any], first: str) -> str:
+    """One JSON document whose key `first` comes first, every other key sorted: the comparison
+    as `--json` prints it, its treatment diff before anything else."""
+    rest = json.loads(dump({key: value for key, value in document.items() if key != first}))
+    head = json.loads(dump({first: document[first]}))
+    return json.dumps(head | rest, indent=2, allow_nan=False) + "\n"
 
 
 def digest_of(text: str) -> str:
@@ -929,6 +1117,7 @@ class Derived:
 
 def regenerate(bundle: Bundle, *, usd_per_host_hour: float, rate_source: str) -> Derived:
     """The derived files of a bundle: its summary, its report and the summary's digest."""
+    check_price(usd_per_host_hour, rate_source)
     summary = scorecard(
         read(bundle, usd_per_host_hour=usd_per_host_hour), usd_per_host_hour=usd_per_host_hour, rate_source=rate_source
     )
@@ -967,6 +1156,28 @@ def treatment_diff(reference: Manifest, candidate: Manifest) -> dict[str, Any]:
         for field in dataclasses.fields(type(reference.run))
         if field.name != "ordinal" and getattr(reference.run, field.name) != getattr(candidate.run, field.name)
     ]
+    observed = [
+        {
+            "setting": field.name,
+            "lever": LEVERS[field.name].value,
+            "reference": _value(getattr(reference.observed, field.name)),
+            "candidate": _value(getattr(candidate.observed, field.name)),
+        }
+        for field in dataclasses.fields(Settings)
+        if getattr(reference.observed, field.name) != getattr(candidate.observed, field.name)
+    ]
+    contradicted = [
+        {
+            "run": name,
+            "setting": row["setting"],
+            "lever": row["lever"],
+            "requested": row["requested"],
+            "observed": row["observed"],
+        }
+        for name, manifest in (("reference", reference), ("candidate", candidate))
+        for row in _conditions(manifest)
+        if row["status"] == "differs"
+    ]
     levers = sorted({LEVERS[row["setting"]] for row in settings})
     if not levers:
         label = "repeat"
@@ -974,7 +1185,14 @@ def treatment_diff(reference: Manifest, candidate: Manifest) -> dict[str, Any]:
         label = "combined"
     else:
         label = "flags_only" if levers[0] in FLAGS else levers[0].value
-    return {"label": label, "levers": [lever.value for lever in levers], "settings": settings, "runs": runs}
+    return {
+        "label": label,
+        "levers": [lever.value for lever in levers],
+        "settings": settings,
+        "observed": observed,
+        "contradicted": contradicted,
+        "runs": runs,
+    }
 
 
 def _launch_fingerprint(bundle: Bundle) -> str | None:
@@ -984,16 +1202,26 @@ def _launch_fingerprint(bundle: Bundle) -> str | None:
 
 
 def _launched_as_requested(bundle: Bundle) -> bool:
-    """Whether every host of every attempt said the requested launch fingerprint through its time
-    in service, and every attempt had a host that said it."""
+    """Whether every serving host of every attempt is accounted for and said the requested launch
+    fingerprint through its time in service: each attempt lists as many hosts as its record
+    observed, which is the run's host count, and no host is left without a fingerprint."""
     requested = _launch_fingerprint(bundle)
-    if requested is None or not bundle.attempts:
+    hosts = bundle.manifest.requested.host_count
+    if requested is None or not bundle.attempts or hosts is None:
         return False
     return all(
-        attempt.checkpoint.hosts
+        attempt.record.hosts_observed == hosts
+        and len(attempt.checkpoint.hosts) == hosts
         and all(host.launch_fingerprint == requested and host.launch_whole_window for host in attempt.checkpoint.hosts)
         for attempt in bundle.attempts
     )
+
+
+def _gateway_as_requested(bundle: Bundle) -> bool:
+    """Whether the gateway profile that served the run was observed, and is the one requested."""
+    manifest = bundle.manifest
+    asked = manifest.requested.gateway_profile_digest
+    return asked is not None and manifest.observed.gateway_profile_digest == asked
 
 
 def _served(bundle: Bundle, lever: Lever, changed: Sequence[str]) -> bool:
@@ -1006,7 +1234,10 @@ def _served(bundle: Bundle, lever: Lever, changed: Sequence[str]) -> bool:
     )
     if lever is Lever.HOSTS:
         hosts = manifest.requested.host_count
-        cells = all(attempt.record.hosts_observed == hosts for attempt in bundle.attempts)
+        cells = all(
+            attempt.record.hosts_observed == hosts and len(attempt.checkpoint.hosts) == hosts
+            for attempt in bundle.attempts
+        )
         return as_observed and ("host_count" not in changed or cells)
     if lever is Lever.LAUNCH_SETTINGS:
         # What the engine itself exposes must not say otherwise; what it does not expose is
@@ -1016,26 +1247,54 @@ def _served(bundle: Bundle, lever: Lever, changed: Sequence[str]) -> bool:
             and getattr(manifest.observed, name) != getattr(manifest.requested, name)
             for name in changed
         )
-        return not contradicted and _launched_as_requested(bundle)
+        return not contradicted and _launched_as_requested(bundle) and _gateway_as_requested(bundle)
+    if lever is Lever.GATEWAY_PROFILE:
+        # A flags-only change needs both provenances: the gateway's and each engine's.
+        return as_observed and _gateway_as_requested(bundle) and _launched_as_requested(bundle)
     return as_observed
+
+
+def read_manifest(directory: Path) -> Manifest:
+    """The manifest of a bundle alone, held to its contract: what the treatment diff is made of,
+    before the rest of the bundle is read."""
+    try:
+        return contracts.loads((directory / MANIFEST).read_bytes(), Manifest)
+    except (OSError, ContractError):
+        raise ReportError(Refusal.UNREADABLE_BUNDLE) from None
+
+
+def check_workloads(reference: Manifest, candidate: Manifest) -> None:
+    """A refusal unless the two runs are one planned workload, at the same floors and budgets."""
+    if candidate.workload.objectives != reference.workload.objectives:
+        raise ReportError(Refusal.CHANGED_FLOOR)
+    if candidate.workload.sampling != reference.workload.sampling:
+        raise ReportError(Refusal.CHANGED_SAMPLE_BUDGET)
+    if candidate.workload_id != reference.workload_id:
+        raise ReportError(Refusal.INCOMPATIBLE_WORKLOAD)
 
 
 def check_comparable(reference: Bundle, candidate: Bundle) -> dict[str, Any]:
     """The diff of two runs, once they are shown comparable; a refusal otherwise."""
     ours, theirs = candidate.manifest, reference.manifest
-    if ours.workload.objectives != theirs.workload.objectives:
-        raise ReportError(Refusal.CHANGED_FLOOR)
-    if ours.workload.sampling != theirs.workload.sampling:
-        raise ReportError(Refusal.CHANGED_SAMPLE_BUDGET)
-    if ours.workload_id != theirs.workload_id:
-        raise ReportError(Refusal.INCOMPATIBLE_WORKLOAD)
+    check_workloads(theirs, ours)
     diff = treatment_diff(theirs, ours)
+    if diff["contradicted"]:
+        # A run whose evidence says another setting served than it requested: no change can be
+        # attributed to what either requested.
+        raise ReportError(Refusal.CONTRADICTED_SETTING, Lever(diff["contradicted"][0]["lever"]))
     changed: dict[Lever, list[str]] = {}
     for row in diff["settings"]:
         changed.setdefault(LEVERS[row["setting"]], []).append(row["setting"])
     for lever, names in sorted(changed.items()):
         if not (_served(reference, lever, names) and _served(candidate, lever, names)):
             raise ReportError(Refusal.UNVERIFIED_TREATMENT, lever)
+    seen_apart = {
+        Lever(row["lever"]) for row in diff["observed"] if row["reference"] is not None and row["candidate"] is not None
+    }
+    undeclared = sorted(seen_apart - set(changed))
+    if undeclared:
+        # The two observed different settings that neither requested apart.
+        raise ReportError(Refusal.UNDECLARED_TREATMENT, undeclared[0])
     fingerprints = (_launch_fingerprint(reference), _launch_fingerprint(candidate))
     if Lever.LAUNCH_SETTINGS in changed and fingerprints[0] == fingerprints[1]:
         # Both releases launch the same arguments: the declared change never reached an engine.
@@ -1090,6 +1349,7 @@ def compare(reference: Bundle, candidate: Bundle, *, usd_per_host_hour: float, r
     """The comparison of a candidate against a reference: the diff first, the paired decisions,
     the realized load of each, task time across their tokenizers, and the recommendation over the
     two. A refusal when they cannot be compared."""
+    check_price(usd_per_host_hour, rate_source)
     diff = check_comparable(reference, candidate)
     theirs = read(reference, usd_per_host_hour=usd_per_host_hour)
     ours = read(candidate, usd_per_host_hour=usd_per_host_hour)
@@ -1147,6 +1407,8 @@ def _recommendation_lines(recommendation: Mapping[str, Any]) -> list[str]:
                     checks["capacity"],
                     checks["absolute_quality"],
                     f"{checks['relative_quality']} ({checks['relative_basis']})",
+                    checks["class_load_evidence"],
+                    checks["host_count"],
                 )
             )
     lines += _table(
@@ -1159,6 +1421,8 @@ def _recommendation_lines(recommendation: Mapping[str, Any]) -> list[str]:
             "Capacity",
             "Absolute quality (class load)",
             "Relative quality (class load)",
+            "Class load shown",
+            "Hosts served",
         ),
         rows,
     )
@@ -1203,7 +1467,7 @@ def _run_lines(summary: Mapping[str, Any], level: str = "##") -> list[str]:
                 "Failed / attempts",
                 "Failed share (Wilson 95%)",
                 "Preemptions",
-                "Engine tok/s",
+                "Engine tok/s (by host)",
                 "Cost / M output USD (estimate)",
             ),
             (
@@ -1220,7 +1484,7 @@ def _run_lines(summary: Mapping[str, Any], level: str = "##") -> list[str]:
                     + (" (observed floor)" if rep["failed_observed_floor"] else ""),
                     f"{_cell(rep['failed_share'])} ({_cell(rep['failed_wilson_low'])}–{_cell(rep['failed_wilson_high'])})",
                     rep["preemptions"],
-                    rep["engine_output_tokens_per_s"],
+                    _by_host(rep),
                     rep["host_cost_estimate_per_million_output_usd"],
                 )
                 for rep in one["repetitions"]
@@ -1237,11 +1501,45 @@ def _run_lines(summary: Mapping[str, Any], level: str = "##") -> list[str]:
             + ".",
             "",
         ]
-    lines += [f"{level} Live requests by harness and load", ""]
+    lines += [f"{level} Capacity sweep (every measured load)", ""]
     lines += _table(
-        ("Load", "Harness", "Requests", "Failed", "p95 TTFT ms (later turns)", "p50 / p10 tok/s (streams)"),
+        ("Shape", "Agent slots", "Rep", "Class size", "Verdict", "p95 TTFT ms", "p50 / p10 tok/s", "Failed share"),
         (
             (
+                row["shape"],
+                row["agent_slots"],
+                row["repetition"],
+                row["class_floor"],
+                row["verdict"],
+                f"{_cell(row['ttft_p95_ms'])} ({row['later_turns']})",
+                f"{_cell(row['speed_p50_tokens_per_s'])} / {_cell(row['speed_p10_tokens_per_s'])} ({row['streams']})",
+                row["failed_share"],
+            )
+            for row in summary["capacity_sweep"]
+        ),
+    )
+    lines += [f"{level} Class load behind the live tasks", ""]
+    lines += _table(
+        ("Shape", "Cell", "Rep", "Shown", "Gap", "Background seats (planned)"),
+        (
+            (
+                shape,
+                row["cell"],
+                row["repetition"],
+                row["status"],
+                row["gap"],
+                f"{row['background_seats']} ({row['background_seats_planned']})",
+            )
+            for shape, rows in summary["class_load_evidence"].items()
+            for row in rows
+        ),
+    )
+    lines += [f"{level} Live requests by shape, harness and load", ""]
+    lines += _table(
+        ("Shape", "Load", "Harness", "Requests", "Failed", "p95 TTFT ms (later turns)", "p50 / p10 tok/s (streams)"),
+        (
+            (
+                row["shape"],
                 row["load"],
                 row["harness"],
                 row["requests"],
@@ -1280,6 +1578,14 @@ def _run_lines(summary: Mapping[str, Any], level: str = "##") -> list[str]:
             rows.append((shape, f"route {route}", replay["route_mix"][route], live["route_mix"][route]))
     lines += _table(("Shape", "Measure", "Replay", "Live tasks"), rows)
     return lines
+
+
+def _by_host(rep: Mapping[str, Any]) -> str:
+    hosts = rep["engine_output_tokens_per_s_by_host"]
+    if hosts is None:
+        return "–"
+    each = ", ".join(f"{one['host']}: {_cell(one['output_tokens_per_s'])}" for one in hosts)
+    return f"{_cell(rep['engine_output_tokens_per_s'])} ({each})"
 
 
 def _tokenizer_rows(name: str, tokenizer: Mapping[str, Any]) -> list[tuple[object, ...]]:
@@ -1336,6 +1642,15 @@ def render_diff(diff: Mapping[str, Any]) -> str:
         f"  {row['setting']} [{row['lever']}]: {_cell(row['reference'])} -> {_cell(row['candidate'])}"
         for row in diff["settings"]
     ] or ["  no requested setting differs"]
+    lines += [
+        f"  observed {row['setting']} [{row['lever']}]: {_cell(row['reference'])} -> {_cell(row['candidate'])}"
+        for row in diff["observed"]
+    ]
+    lines += [
+        f"  contradicted in {row['run']}: {row['setting']} [{row['lever']}] requested {_cell(row['requested'])},"
+        f" observed {_cell(row['observed'])}"
+        for row in diff["contradicted"]
+    ]
     lines += [f"  run {row['setting']}: {_cell(row['reference'])} -> {_cell(row['candidate'])}" for row in diff["runs"]]
     return "\n".join(lines) + "\n"
 

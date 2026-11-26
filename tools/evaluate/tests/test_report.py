@@ -7,7 +7,8 @@ class of two, on two hosts, written by `build` below: `uv run --locked python` o
 the import path `scripts/evaluate.sh` sets, writes it again. Its class-size repetitions are 102 later
 turns of 20 tokens a second each. Hands-on answers the slowest later turns in 3.9 s, under the 5 s
 limit; several-agents streams a fifth of its turns at 5 tokens a second in repetition 1, below the
-10 tokens a second p10 floor. Every trial passes, but one optimization attempt on OpenCode at class
+10 tokens a second p10 floor. Each live cell at class load has the other seat's replay behind its
+trials. Every trial passes, but one optimization attempt on OpenCode at class
 load and three debugging attempts on Codex at low load. The reference of a comparison is the same
 plan on one host, which answers hands-on in 6.9 s and passes fewer attempts.
 """
@@ -211,8 +212,10 @@ def live(
     cell: plan.PlannedCell, at: int, executions: int, variant: Variant, workload: contracts.Workload
 ) -> tuple[list[Document], int]:
     """The trials of a live cell, one after the other from `at`, each two turns of its harness
-    (and a delegated worker beside the first, for a family that delegates). Returns the cell's
+    (and a delegated worker beside the first, for a family that delegates), and at class load the
+    other seats' replay from before the first trial until after the last. Returns the cell's
     observations and when its last trial ended."""
+    begun = at
     load = "low_load" if cell.identity.phase is Phase.LIVE_LOW_LOAD else "class_load"
     required = {task.task_id: task.required_properties for task in plan.load_suite().suite.tasks}
     observations: list[Document] = []
@@ -267,7 +270,42 @@ def live(
             )
         )
         at = ended + 1000
+    if cell.replay_slots:
+        observations += background(cell, begun - 500, at + 2000, len(observations))
     return observations, at
+
+
+def background(cell: plan.PlannedCell, start: int, end: int, first: int) -> list[RequestRecord]:
+    """The replay the seats after the live one keep up in a live cell at class size: a turn of
+    each of their conversations every 10 s from `start` until a turn has ended after `end`."""
+    per = plan.load_suite().conversations[cell.identity.shape]
+    rows: list[RequestRecord] = []
+    for slot in range(cell.replay_slots):
+        sent, turn = start + 50 * slot, 0
+        while not rows or rows[-1].conversation != slot or rows[-1].ended_ms < end:
+            rows.append(
+                RequestRecord(
+                    request=first + len(rows),
+                    cell=cell.identity.cell,
+                    student=1 + slot // per,
+                    conversation=slot,
+                    turn=turn,
+                    traffic=Traffic.BACKGROUND,
+                    trial=None,
+                    route=Route.MESSAGES,
+                    eligible_ms=sent,
+                    sent_ms=sent,
+                    first_output_ms=sent + 1500,
+                    first_answer_ms=sent + 1500,
+                    last_output_ms=sent + 2500,
+                    ended_ms=sent + 2510,
+                    outcome=RequestOutcome.COMPLETED,
+                    finish_reason=None,
+                    usage=Usage(input_tokens=20_000, cached_input_tokens=20_000 if turn else 0, output_tokens=21),
+                )
+            )
+            sent, turn = sent + 10_000, turn + 1
+    return rows
 
 
 CANDIDATE = Variant()
@@ -320,7 +358,7 @@ def build(directory: Path, variant: Variant = CANDIDATE) -> Path:
             observations, last = live(cell, clock + 1000, executions, variant, workload)
             executions += len(cell.trials)
             rows = [one for one in observations if isinstance(one, RequestRecord)]
-            window = (clock, last, last + 10_000)
+            window = (clock, last, last + 20_000)
         else:
             continue
         record = CellRecord(
@@ -376,6 +414,15 @@ def reseal(directory: Path) -> None:
     (directory / report.CHECKPOINTS).write_text("".join(lines))
 
 
+def manifest_edited(directory: Path, change: Callable[[dict], object]) -> Path:
+    """The bundle with its manifest changed in place, as JSON."""
+    path = directory / report.MANIFEST
+    manifest = json.loads(path.read_text())
+    change(manifest)
+    path.write_text(json.dumps(manifest))
+    return directory
+
+
 def edited(tmp_path: Path, name: str, change: Callable[[str], str]) -> Path:
     """A copy of the saved bundle with one file changed, its derived files left out."""
     copy = tmp_path / "edited"
@@ -407,7 +454,11 @@ def test_a_saved_bundle_reproduces_its_scorecard_and_digest_offline():
 def test_the_scorecard_shows_capacity_and_quality_by_shape_harness_and_load_and_both_conditions():
     summary = json.loads(scorecard(FIXTURE).summary)
     conditions = {row["setting"]: row for row in summary["conditions"]}
-    assert conditions["host_count"] == {"setting": "host_count", "requested": 2, "observed": 2, "status": "match"}
+    assert {key: conditions["host_count"][key] for key in ("requested", "observed", "status")} == {
+        "requested": 2,
+        "observed": 2,
+        "status": "match",
+    }
     # What no evidence showed is not observed, and never filled from the request.
     assert (conditions["step_budget_tokens"]["observed"], conditions["step_budget_tokens"]["status"]) == (
         None,
@@ -421,8 +472,14 @@ def test_the_scorecard_shows_capacity_and_quality_by_shape_harness_and_load_and_
         104,
     )
     assert repetition["failed_observed_floor"] and repetition["failed_wilson_high"] > 0
-    harnesses = {(row["load"], row["harness"]) for row in summary["capacity_by_harness"]}
-    assert {("low_load", "codex"), ("class_load", "opencode"), ("class_load", "sdk_tool_loop")} <= harnesses
+    assert [host["output_tokens_per_s"] for host in repetition["engine_output_tokens_per_s_by_host"]] == [4.0, 4.0]
+    harnesses = {(row["shape"], row["load"], row["harness"]) for row in summary["capacity_by_harness"]}
+    # A harness that serves both shapes has a row in each.
+    assert {("hands_on", "class_load", "claude_code"), ("several_agents", "class_load", "claude_code")} <= harnesses
+    assert {("hands_on", "low_load", "codex"), ("hands_on", "class_load", "opencode")} <= harnesses
+    # Each class-load live cell shows the other seat's replay behind its trials.
+    loaded = [row for rows in summary["class_load_evidence"].values() for row in rows]
+    assert loaded and all((row["status"], row["background_seats"]) == ("met", 1) for row in loaded)
     cells = {
         (load, cell["family"], cell["harness"]): cell
         for load, one in summary["quality"].items()
@@ -451,6 +508,56 @@ def test_a_line_missing_from_the_evidence_is_refused_or_left_unaccounted(tmp_pat
     assert first["verdict"] == "invalid" and "attempts_unaccounted" in first["reasons"]
 
 
+def test_each_host_keeps_its_own_engine_throughput_beside_the_pool_total(tmp_path: Path):
+    def skew(text: str) -> str:
+        rows = [json.loads(line) for line in text.splitlines()]
+        for row in rows:
+            if row.get("metric") == "output_tokens_total":
+                row["value"] *= 2 if row["host"] == 0 else 0
+        return "".join(json.dumps(row) + "\n" for row in rows)
+
+    copy = edited(tmp_path, "observations/attempt-0.jsonl", skew)
+    first = json.loads(scorecard(copy).summary)["capacity"]["hands_on"]["repetitions"][0]
+    assert first["engine_output_tokens_per_s"] == 8.0
+    assert [host["output_tokens_per_s"] for host in first["engine_output_tokens_per_s_by_host"]] == [8.0, 0.0]
+
+
+def test_every_measured_sweep_load_is_in_the_scorecard(tmp_path: Path):
+    bundle = report.load(FIXTURE)
+    cell = next(
+        one
+        for one in bundle.plan.cells
+        if Role.DIAGNOSTIC in one.roles and one.identity.shape.value == "hands_on" and one.identity.agent_slots == 4
+    )
+    first = bundle.attempts[0].checkpoint
+    record = replace(first.record, cell=cell.identity.cell, conversations_planned=4, conversations_started=4)
+    record = replace(record, conversations_completed=4)
+
+    def sweep(name: str, ttft_ms: int) -> list[dict]:
+        rows = replay(cell, Variant(hands_on_ttft_ms=ttft_ms))
+        evidence = report.Evidence(
+            record,
+            (*rows, *samples(cell.identity.cell, 2)),
+            tally(rows),
+            first.hosts,
+            first.requested_launch_fingerprint,
+        )
+        report.write_evidence(tmp_path / name, bundle.manifest, [evidence])
+        return json.loads(scorecard(tmp_path / name).summary)["capacity_sweep"]
+
+    fast, slow = sweep("fast", 1000), sweep("slow", 6000)
+    assert [(row["shape"], row["agent_slots"], row["repetition"]) for row in slow] == [("hands_on", 4, 0)]
+    assert (fast[0]["verdict"], slow[0]["verdict"]) == ("pass", "measured_miss")
+    assert slow[0]["ttft_p95_ms"] > 5000 > fast[0]["ttft_p95_ms"]
+
+
+def test_a_zero_ceiling_is_a_miss_with_headroom_not_a_division():
+    reading = report.read(report.load(FIXTURE), usd_per_host_hour=PRICE)
+    objectives = replace(reading.manifest.workload.objectives, ttft_p95_ms_max=0.0)
+    row = report.limiting_row(reading.capacity.shapes[contracts.Shape.HANDS_ON], objectives)
+    assert row is not None and row["floor"] == "ttft_p95" and row["headroom"] < 0
+
+
 # --- The recommendation ------------------------------------------------------------------------
 
 
@@ -471,6 +578,58 @@ def test_only_a_tested_host_count_meeting_capacity_and_both_quality_checks_is_re
     assert comparison["recommendation"]["common"] is None
 
 
+def test_the_reference_is_a_baseline_and_an_inconclusive_pair_recommends_nothing():
+    comparison = compared(FIXTURE, FIXTURE)
+    decision = next(one for one in comparison["decisions"] if (one["load"], one["shape"]) == ("class_load", "hands_on"))
+    assert decision["outcome"] == "inconclusive"
+    hands_on = comparison["recommendation"]["shapes"]["hands_on"]
+    assert (hands_on["status"], hands_on["host_count"]) == ("unknown", None)
+    reference = hands_on["tested"][0]["checks"]
+    assert (reference["relative_basis"], reference["relative_quality"]) == ("baseline", "unknown")
+
+
+def test_a_host_count_the_evidence_does_not_show_serving_is_not_recommended(tmp_path: Path):
+    # Both manifests say three hosts; every attempt was served by two.
+    runs = build(tmp_path / "reference", replace(REFERENCE, host_count=2)), build(tmp_path / "candidate")
+    for run in runs:
+        path = run / report.MANIFEST
+        manifest = json.loads(path.read_text())
+        manifest["requested"]["host_count"] = manifest["observed"]["host_count"] = 3
+        path.write_text(json.dumps(manifest))
+    hands_on = compared(*runs)["recommendation"]["shapes"]["hands_on"]
+    assert hands_on["host_count"] is None
+    assert [one["checks"]["host_count"] for one in hands_on["tested"]] == ["unknown", "unknown"]
+
+
+@pytest.mark.parametrize("missing", [Traffic.BACKGROUND, Traffic.LIVE])
+def test_class_load_quality_needs_the_class_load_it_was_measured_under(
+    reference: Path, tmp_path: Path, missing: Traffic
+):
+    bundle = report.load(FIXTURE)
+    evidence = []
+    for attempt in bundle.attempts:
+        rows, sent = attempt.requests, attempt.checkpoint.tally
+        if bundle.manifest.workload.cells[attempt.record.cell].phase is Phase.LIVE_CLASS_LOAD:
+            rows = tuple(row for row in rows if row.traffic is not missing)
+            # Without the other seat every send is still accounted for; without the live rows the
+            # scheduler still counts the sends they were.
+            sent = tally(rows) if missing is Traffic.BACKGROUND else sent
+        checkpoint = attempt.checkpoint
+        observations = (*rows, *attempt.trials, *attempt.samples)
+        evidence.append(
+            report.Evidence(
+                attempt.record, observations, sent, checkpoint.hosts, checkpoint.requested_launch_fingerprint
+            )
+        )
+    report.write_evidence(tmp_path / "candidate", bundle.manifest, evidence)
+    hands_on = compared(reference, tmp_path / "candidate")["recommendation"]["shapes"]["hands_on"]
+    assert hands_on["host_count"] is None and hands_on["tested"][1]["checks"]["class_load_evidence"] == "unknown"
+    gaps = {
+        row["gap"] for row in json.loads(scorecard(tmp_path / "candidate").summary)["class_load_evidence"]["hands_on"]
+    }
+    assert gaps == {"background_missing" if missing is Traffic.BACKGROUND else "sends_unaccounted"}
+
+
 # --- Comparing ---------------------------------------------------------------------------------
 
 
@@ -480,6 +639,27 @@ def test_compare_prints_the_treatment_diff_before_the_scorecard(reference: Path,
     assert printed.startswith("treatment diff (hosts):\n  host_count [hosts]: 1 -> 2\n")
     assert printed.index("treatment diff") < printed.index("# Comparison scorecard")
     assert "## Task time and completions across tokenizers" in printed
+
+
+def test_the_json_comparison_is_one_document_with_its_diff_first(reference: Path, capsys: pytest.CaptureFixture[str]):
+    assert cli.main(["compare", str(reference), str(FIXTURE), "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert next(iter(printed)) == "diff" and printed["diff"]["label"] == "hosts"
+
+
+def test_a_changed_protocol_prints_the_diff_and_is_then_refused(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    candidate = tmp_path / "candidate"
+    shutil.copytree(FIXTURE, candidate)
+
+    def change(manifest: dict) -> None:
+        manifest["workload"]["protocol_digest"] = "sha256:" + "d" * 64
+        manifest["requested"]["host_count"] = manifest["observed"]["host_count"] = 1
+
+    manifest_edited(candidate, change)
+    assert cli.main(["compare", str(FIXTURE), str(candidate)]) == 2
+    printed = capsys.readouterr()
+    assert printed.out.startswith("treatment diff (hosts):\n  host_count [hosts]: 2 -> 1\n")
+    assert printed.err.startswith("refused: incompatible-workload")
 
 
 def test_the_script_reads_and_compares_saved_bundles_offline_from_any_folder(tmp_path: Path):
@@ -537,6 +717,38 @@ def test_a_flags_only_treatment_compares_once_each_host_launched_what_its_run_re
     diff = compared(FIXTURE, candidate)["diff"]
     assert (diff["label"], diff["verified"]) == ("flags_only", ["launch_settings"])
     assert [row["setting"] for row in diff["settings"]] == ["step_budget_tokens"]
+
+
+@pytest.mark.parametrize("gap", ["host", "gateway"])
+def test_a_flags_only_treatment_needs_every_serving_host_and_the_gateway_observed(tmp_path: Path, gap: str):
+    fingerprint = launch("step-4096")
+    candidate = build(
+        tmp_path / "candidate", Variant(step_budget_tokens=4096, launched=fingerprint, requested_launch=fingerprint)
+    )
+    if gap == "host":
+        # One of the two hosts that served an attempt is not in its checkpoint.
+        path = candidate / report.CHECKPOINTS
+        lines = [json.loads(line) for line in path.read_text().splitlines()]
+        lines[0]["hosts"].pop()
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    else:
+        manifest_edited(candidate, lambda manifest: manifest["observed"].update(gateway_profile_digest=None))
+    with pytest.raises(ReportError) as refused:
+        compared(FIXTURE, candidate)
+    assert (refused.value.reason, refused.value.lever) == (Refusal.UNVERIFIED_TREATMENT, report.Lever.LAUNCH_SETTINGS)
+
+
+def test_a_setting_observed_other_than_requested_withholds_the_attribution(
+    reference: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    # Both runs requested one model; the candidate's hosts served another.
+    candidate = build(tmp_path / "candidate")
+    manifest_edited(candidate, lambda manifest: manifest["observed"].update(model_revision="d" * 40))
+    with pytest.raises(ReportError) as refused:
+        compared(reference, candidate)
+    assert (refused.value.reason, refused.value.lever) == (Refusal.CONTRADICTED_SETTING, report.Lever.RELEASE)
+    assert cli.main(["compare", str(reference), str(candidate)]) == 2
+    assert "contradicted in candidate: model_revision [release]" in capsys.readouterr().out
 
 
 LAST_HANDS_ON_REPETITION = max(
@@ -597,6 +809,24 @@ def test_the_report_sets_the_replay_against_the_live_tasks_of_each_shape_and_tas
     assert set(both) == {"reference", "candidate"}
 
 
+def test_the_replay_drivers_own_rows_give_its_scheduled_tool_pauses(tmp_path: Path):
+    """The driver writes no finish reason: its pauses are read from the turns' times."""
+    from evaluate.tests import test_replay as driven
+
+    bundle = report.load(FIXTURE)
+    cell = next(
+        one for one in bundle.plan.cells if Role.CLASS_FLOOR in one.roles and one.identity.shape.value == "hands_on"
+    )
+    run, _pool = driven.run(bundle.plan, cell.identity.cell, sizes=driven.SIZES, deadline_ms=driven.START + 20_000)
+    assert any(row.turn > 0 for row in run.requests) and all(row.finish_reason is None for row in run.requests)
+    report.write_evidence(
+        tmp_path / "driven", bundle.manifest, [report.Evidence(run.record, tuple(run.requests), None, (), None)]
+    )
+    delays = json.loads(scorecard(tmp_path / "driven").summary)["distributions"]["hands_on"]["replay"]["tool_delay_ms"]
+    low, high = driven.SIZES.tool_delay_ms
+    assert delays["count"] > 0 and low <= delays["p50"] <= high
+
+
 # --- The public export -------------------------------------------------------------------------
 
 
@@ -612,6 +842,27 @@ def test_an_export_writes_a_validated_scanned_bundle_under_docs_evaluations(tmp_
     with pytest.raises(ReportError) as refused:
         report.export(FIXTURE, tmp_path / "elsewhere", usd_per_host_hour=PRICE, rate_source=SOURCE, root=tmp_path)
     assert refused.value.reason is Refusal.EXPORT_OUTSIDE_EVALUATIONS
+
+
+def test_regenerating_an_export_keeps_the_price_it_was_made_at(tmp_path: Path, capsys: pytest.CaptureFixture[str]):
+    source, target = tmp_path / "source", tmp_path / "docs" / "evaluations" / "priced"
+    shutil.copytree(FIXTURE, source, ignore=shutil.ignore_patterns(*report.DERIVED))
+    derived = report.export(source, target, usd_per_host_hour=7.25, rate_source="supplied", root=tmp_path)
+    assert cli.main(["report", str(target)]) == 0
+    assert (target / report.DIGEST).read_text().strip() == derived.digest
+    assert json.loads((target / report.SUMMARY).read_text())["host_price"]["source"] == "supplied"
+    # An explicit rate reprices it.
+    assert cli.main(["report", str(target), "--rate", "2"]) == 0
+    assert (target / report.DIGEST).read_text().strip() != derived.digest
+    capsys.readouterr()
+
+
+def test_a_price_source_outside_the_vocabulary_is_refused_before_anything_is_written(tmp_path: Path):
+    target = tmp_path / "docs" / "evaluations" / "run"
+    with pytest.raises(ReportError) as refused:
+        report.export(FIXTURE, target, usd_per_host_hour=2.0, rate_source="lab-seat-3", root=tmp_path)
+    assert refused.value.reason is Refusal.UNKNOWN_PRICE
+    assert not (tmp_path / "docs").exists()
 
 
 HOME = "/" + "home"  # written in two parts, so that this file is no finding of its own
