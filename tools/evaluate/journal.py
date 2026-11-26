@@ -465,14 +465,21 @@ class Journal:
         self._state = state
 
     @classmethod
-    def create(cls, root: Path = DEFAULT_ROOT) -> Self:
-        """A new run under `root`: its ID is made here and saved before the handle is returned."""
+    def create(cls, root: Path = DEFAULT_ROOT, run_id: str | None = None) -> Self:
+        """A new run under `root`: its ID is made here and saved before the handle is returned.
+        A driver that saved the ID first, where it finds it again (`evaluate.driver`), gives it as
+        `run_id`: a directory a creation cut short left for that ID is then taken over, and a run
+        already journaled under it is refused."""
         _make_directory(root)
-        run_id = secrets.token_hex(8)
+        reserved = run_id is not None
+        if run_id is None:
+            run_id = secrets.token_hex(8)
         directory = root / run_id
-        # Never an existing directory: an ID is one run's.
-        directory.mkdir(mode=_PRIVATE_DIRECTORY)
-        (directory / _OBSERVATIONS).mkdir(mode=_PRIVATE_DIRECTORY)
+        if not _RUN_ID.fullmatch(run_id) or (directory / _STATE).exists():
+            raise JournalError(Refusal.INVALID_VALUE)
+        # Never an existing directory of a run made here: an ID is one run's.
+        directory.mkdir(mode=_PRIVATE_DIRECTORY, exist_ok=reserved)
+        (directory / _OBSERVATIONS).mkdir(mode=_PRIVATE_DIRECTORY, exist_ok=reserved)
         journal = cls(directory, _lock(directory), _State(run_id))
         try:
             journal._transition()

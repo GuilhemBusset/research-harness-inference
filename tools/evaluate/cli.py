@@ -73,6 +73,21 @@ and `cancel` asks that driver to stop: it stops admissions and releases the book
 `compare --issue` compares two runs of the same experiment issue, in the same repository, from their
 local bundles and posts the comparison once on it. A malformed `--repository`, or an issue number
 that is not one, is refused with 2 before anything is connected to.
+
+    scripts/evaluate.sh driver
+    scripts/evaluate.sh submit --profile screen --pool coursework --students 8 --instances 1 --for 3h --issue new
+    scripts/evaluate.sh inspect --submission <submission-id>
+    scripts/evaluate.sh cancel --socket --submission <submission-id>
+
+The same runs, from a coding agent (`evaluate.driver`): the operator starts `driver`, which holds
+the operator's AWS session and GitHub token and listens on an owner-only socket (`--socket`, or
+`RHI_EVALUATE_SOCKET`, or one in the user's runtime directory). `submit` takes `run`'s fields,
+saves them with a submission ID in its private `--outbox` and prints the ID before it sends them;
+after a lost answer, the same command with `--submission <id>` gets the same run. The driver
+admits a run only once the selected pool's limits and the experiment's destination are checked,
+and answers its run ID and status; `inspect` shows it again, with the issue's URL once GitHub
+confirmed it, and `cancel --socket` asks the driver to stop it. Each exits 0 with an answer and 2
+with a refusal or no answer. The run goes on in the driver whatever the client does.
 """
 
 from __future__ import annotations
@@ -99,6 +114,8 @@ EXAMPLE_CONFIG = Path(__file__).resolve().parents[2] / "config.example.toml"
 RUNS = Path(__file__).resolve().parents[2] / ".cache" / "eval" / "runs"
 # The experiment's repository, `owner/name`, when `--repository` does not give it.
 REPOSITORY_VARIABLE = "RHI_EVALUATE_REPOSITORY"
+# Where the client keeps each submission before it sends it, beside the run journals.
+OUTBOX = RUNS.parent / "submitted"
 _ISSUE = re.compile(r"new|[1-9][0-9]{0,8}")
 MINUTE_MS = 60_000
 _DURATION = re.compile(r"([1-9][0-9]{0,4})([hm])")
@@ -328,7 +345,35 @@ def parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="show a run: its progress, verdicts, cleanup and publication")
     status.add_argument("run_id")
     cancel = commands.add_parser("cancel", help="ask the driver of a run to stop and release its booking")
-    cancel.add_argument("run_id")
+    cancel.add_argument("run_id", nargs="?")
+    cancel.add_argument(
+        "--socket", nargs="?", const="", help="ask the operator's driver, through its socket (its default one if none is named)"
+    )
+    driver = commands.add_parser("driver", help="start the operator's driver: it runs the runs submitted to its socket")
+    submit = commands.add_parser("submit", help="submit a run to the operator's driver")
+    submit.add_argument("--suite", default=planning.DEFAULT_SUITE)
+    submit.add_argument("--profile", choices=[profile.value for profile in Profile], required=True)
+    submit.add_argument("--pool", required=True, help="the already-deployed pool to measure")
+    submit.add_argument("--students", type=int, required=True, help="the class size")
+    submit.add_argument("--instances", type=int, required=True, help="the hosts to book")
+    submit.add_argument("--for", "--window", dest="window", type=_duration_ms, help="the longest booking, such as 3h")
+    submit.add_argument("--session", choices=["existing"], help="measure in the session the operator booked")
+    submit.add_argument("--issue", type=_issue, required=True, help="new, or the experiment issue's number")
+    submit.add_argument("--question", help="the experiment's public question, for a new issue")
+    submit.add_argument("--target", default="reference", help="the label of this configuration in a new issue")
+    submit.add_argument("--input-seed", type=int)
+    submit.add_argument("--schedule-seed", type=int)
+    submit.add_argument("--rate", type=_rate, help="dollars a host-hour, for the cost estimates")
+    submit.add_argument("--repository", help="the experiment's repository, owner/name")
+    submit.add_argument("--submission", help="the submission's ID, to submit it again after a lost answer")
+    submit.add_argument("--outbox", type=Path, default=OUTBOX, help="where the client keeps its submissions")
+    inspect = commands.add_parser("inspect", help="show a run of the operator's driver")
+    inspect.add_argument("run_id", nargs="?")
+    for one in (cancel, inspect):
+        one.add_argument("--submission", help="the run's submission ID")
+    for one in (driver, submit, inspect):
+        one.add_argument("--socket", help="the driver's socket (RHI_EVALUATE_SOCKET, or one in the user's runtime directory)")
+    driver.add_argument("--runs", type=Path, default=RUNS, help="where the run journals are")
     publish = commands.add_parser("publish", help="deliver a run's pending issue and comments, and nothing else")
     publish.add_argument("--resume", dest="run_id", metavar="RUN_ID", required=True)
     for one in (run, status, cancel, publish, compare):
@@ -392,6 +437,70 @@ def _live(args: argparse.Namespace, example_rate: float, connect: Connect | None
     return controller.execute(request, connect=chosen, root=args.runs, out=sys.stdout)
 
 
+def _shown(answer: dict[str, Any]) -> int:
+    """Prints the driver's answer, one field a line: 0 for a run it shows, 2 for a refusal."""
+    if not answer.get("ok"):
+        detail = answer.get("detail")
+        print(f"refused: {answer.get('refused')}" + ("" if detail is None else f": {detail}"), file=sys.stderr)
+        return 2
+    for key in ("submission", "run_id", "step", "issue", "ending", "exit", "publication", "cancel_requested", "running"):
+        if answer.get(key) is not None:
+            print(f"{key}: {json.dumps(answer[key])}")
+    return 0
+
+
+def _client(args: argparse.Namespace, example_rate: float, connect: Connect | None) -> int:
+    """`driver`, `submit`, `inspect` and `cancel --socket`: the operator's driver, and the typed
+    client of its socket, which holds no credential (`evaluate.driver`)."""
+    from evaluate import controller, driver
+
+    socket_path = Path(args.socket) if args.socket else driver.default_socket()
+    if args.command == "driver":
+        chosen = controller.connect_live if connect is None else connect
+        served = driver.Driver(args.runs, socket_path, connect=chosen, fallback_rate=(example_rate, Source.EXAMPLE))
+        print("driver: listening, stop it with Ctrl-C", flush=True)
+        served.serve_forever()
+        print("driver: stopped", flush=True)
+        return 0
+    if args.command == "submit":
+        run = {
+            "suite": args.suite,
+            "profile": args.profile,
+            "pool": args.pool,
+            "students": args.students,
+            "instances": args.instances,
+            "window_ms": args.window,
+            "session": args.session,
+            "issue": "new" if args.issue is None else args.issue,
+            "repository": args.repository or os.environ.get(REPOSITORY_VARIABLE),
+            "question": args.question,
+            "target": args.target,
+            "input_seed": args.input_seed,
+            "schedule_seed": args.schedule_seed,
+            "rate": args.rate,
+        }
+        try:
+            submission = driver.persist_submission(args.outbox, args.submission, run)
+        except driver.DriverError as refused:
+            print(f"refused: {refused}", file=sys.stderr)
+            return 2
+        # Printed before anything is sent: an answer that is lost leaves the ID to submit again.
+        print(f"submission: {submission}", flush=True)
+        message: dict[str, Any] = {"op": "submit", "submission": submission, "run": run}
+    else:
+        if (args.run_id is None) == (args.submission is None):
+            print("refused: name the run or its --submission", file=sys.stderr)
+            return 2
+        named = {"run_id": args.run_id} if args.submission is None else {"submission": args.submission}
+        message = {"op": args.command, **named}
+    try:
+        return _shown(driver.call(socket_path, message))
+    except driver.Unanswered as lost:
+        again = f", submit it again with --submission {message['submission']}" if args.command == "submit" else ""
+        print(f"unanswered: the driver did not answer ({lost}){again}", file=sys.stderr)
+        return 2
+
+
 def _evidence(args: argparse.Namespace, example_rate: float) -> int:
     """`report`, `compare` and `export`: read saved bundles, offline. The reader is imported here:
     it needs `spikes` and the services `spikes/common.py` imports, which `plan` does not.
@@ -441,6 +550,11 @@ def main(argv: list[str] | None = None, *, connect: Connect | None = None) -> in
     it is the driver's live one (`controller.connect_live`)."""
     args = parser().parse_args(argv)
     example_window, example_rate = _example()
+    if args.command in ("driver", "submit", "inspect") or (args.command == "cancel" and args.socket is not None):
+        return _client(args, example_rate, connect)
+    if args.command == "cancel" and args.run_id is None:
+        print("refused: name the run", file=sys.stderr)
+        return 2
     if args.command in ("run", "status", "cancel", "publish") or (args.command == "compare" and args.issue is not None):
         return _live(args, example_rate, connect)
     if args.command != "plan":

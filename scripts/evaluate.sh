@@ -46,6 +46,16 @@
 # selected pool's gateway, telemetry, canaries and release from its own AWS session, and prepares
 # the trial image on this host (tools/evaluate/live.py).
 #
+#   scripts/evaluate.sh driver
+#   scripts/evaluate.sh submit --profile screen --pool coursework --students 8 --instances 1 --for 3h --issue new
+#   scripts/evaluate.sh inspect --submission <submission-id>
+#   scripts/evaluate.sh cancel --socket --submission <submission-id>
+#
+# The same runs for a coding agent: the operator starts `driver` with the credentials above, and it
+# runs what is submitted to its owner-only socket through the same controller. `submit`, `inspect`
+# and `cancel --socket` hold no credential; a client that exits leaves the run going
+# (tools/evaluate/driver.py).
+#
 # The tool is the package tools/evaluate, run with the locked environment (`uv run --locked`). The
 # project does not install it, so this script puts `tools` on the import path itself, with
 # `spikes` and the services `spikes/common.py` and `spikes/loadgen.py` import, which the readers of
