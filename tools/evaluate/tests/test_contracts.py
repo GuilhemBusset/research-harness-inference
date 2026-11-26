@@ -674,6 +674,13 @@ def test_a_plan_names_each_required_cell_and_trial_once() -> None:
             workload(trials=tuple(replace(one, trial=at) for at, one in enumerate(left)))
     with pytest.raises(ContractError, match="live cell"):
         contracts.parse(edited(manifest(), "workload.trials", [planned.trials[0].to_json()]))
+    # Live cells of one phase, shape, load and repetition are one for each family of tasks: a
+    # second cell is another family's, and never the same family's again.
+    again = (*cells, replace(cells[1], cell=3))
+    other_family = replace(trials[0], trial=2, cell=3, instance_id="debugging.t01.i01")
+    assert len(workload(cells=again, trials=(*trials, other_family)).cells) == 4
+    with pytest.raises(ContractError, match="planned once"):
+        workload(cells=again, trials=(*trials, replace(other_family, instance_id="optimization.t01.i02")))
     # A capacity or warm-up cell has none, and a plan of such cells only is a plan.
     assert workload(cells=(replace(cells[0], phase=Phase.WARM_UP), replace(cells[0], cell=1)), trials=()).trials == ()
 

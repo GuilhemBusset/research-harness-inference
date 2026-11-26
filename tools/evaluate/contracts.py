@@ -641,7 +641,8 @@ class HarnessPin(Record):
 
 @dataclass(frozen=True, kw_only=True)
 class CellIdentity(Record):
-    """A cell the plan requires: one phase, at one shape and load, one repetition."""
+    """A cell the plan requires: one phase, at one shape and load, one repetition. A live cell is
+    also one family of tasks, which its trials say: a booking can end between two families."""
 
     cell: Ordinal
     phase: Phase
@@ -686,8 +687,17 @@ class Workload(Record):
         _fail(not _in_order(pinned), self, "harnesses are pinned once each, in order")
         _fail(not self.cells, self, "needs a cell")
         _fail(any(cell.cell != at for at, cell in enumerate(self.cells)), self, "a cell's ordinal is its position")
-        planned = {dataclasses.replace(cell, cell=0) for cell in self.cells}
-        _fail(len(planned) != len(self.cells), self, "a cell is planned once")
+        # Live cells of one phase, shape, load and repetition are told apart by the families of
+        # their trials: no two of them run the same family.
+        families: dict[int, set[str]] = {}
+        for trial in self.trials:
+            families.setdefault(trial.cell, set()).add(trial.instance_id.split(".")[0])
+        planned = [
+            (dataclasses.replace(cell, cell=0), family)
+            for cell in self.cells
+            for family in sorted(families.get(cell.cell, ())) or [None]
+        ]
+        _fail(len(set(planned)) != len(planned), self, "a cell is planned once, a live cell once for a family")
         _fail(any(one.trial != at for at, one in enumerate(self.trials)), self, "a trial's ordinal is its position")
         for trial in self.trials:
             live = trial.cell < len(self.cells) and self.cells[trial.cell].phase in LIVE_PHASES
@@ -749,6 +759,12 @@ def _identity(part: str, value: Record) -> str:
     return _sha256(_canonical({"identity": part, "schema_version": SCHEMA_VERSION, "of": value.to_json()}))
 
 
+def workload_identity(workload: Workload) -> str:
+    """The identity of a planned workload, from the workload alone: what `plan` prints before a
+    run exists, and what the manifest of every run of that plan has as its `workload_id`."""
+    return _identity("workload", workload)
+
+
 @dataclass(frozen=True, kw_only=True)
 class Manifest(Document):
     """What a run was: the plan, the settings requested for it, what ran it and what it observed
@@ -763,7 +779,7 @@ class Manifest(Document):
     @property
     def workload_id(self) -> str:
         """The same for every treatment and run of one plan."""
-        return _identity("workload", self.workload)
+        return workload_identity(self.workload)
 
     @property
     def treatment_id(self) -> str:

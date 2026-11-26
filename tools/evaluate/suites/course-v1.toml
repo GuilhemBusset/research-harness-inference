@@ -1,0 +1,215 @@
+# The course suite, version 1: what `scripts/evaluate.sh plan` expands into an ordered workload
+# (docs/design/agent-session-evaluation.md, "Workload and measurement protocol" and "Course quality
+# and the grader"). tools/evaluate/plan.py reads it and holds it to tools/evaluate/contracts.py.
+#
+# Everything above `[estimates]` is part of the planned workload: a change there is another
+# workload identity. `[estimates]` only sizes bookings.
+#
+# Times are in milliseconds, sizes in MiB.
+
+version = 1
+
+# The harness the coverage is anchored on: it runs every family, and a screen runs only it.
+anchor = "claude_code"
+
+# The input seed fixes what is sent, the schedule seed when. `plan` derives one distinct pair for
+# each repetition from them; the same pair is used for every treatment that is compared.
+[seeds]
+input = 1001
+schedule = 2002
+
+# Each repetition starts under a prefix namespace of its own, placed before the reusable content
+# and shared within the repetition; the per-student salt of production is kept. The warm-up and
+# each class opening have a namespace of their own too.
+[cache]
+policy = "fresh_prefix_warm_engine"
+
+# The caps of a trial, counted across its agent tree, and the longest drain of a cell.
+[limits]
+trial_wall_time_ms = 720000
+trial_model_turns = 32
+trial_generated_tokens = 32000
+drain_ms = 120000
+
+# What a steady class-size repetition must hold to be read, the draws of the paired comparison,
+# and how often a host is sampled.
+[sampling]
+ttft_samples_min = 100
+stream_samples_min = 100
+bootstrap_draws = 10000
+host_sample_interval_ms = 15000
+
+# The floors a result is read against. The capacity floors are the example values of the design
+# ("Reading a result"); the two quality values are the proposed course policy.
+[objectives]
+ttft_p95_ms_max = 5000
+stream_speed_p50_tokens_per_s_min = 15
+stream_speed_p10_tokens_per_s_min = 10
+failed_share_max = 0.005
+success_share_min = 0.8
+paired_margin_points = -5
+
+# The conversations a student runs at once in each shape. Hands-on is one serial agent; in
+# several-agents two conversations share the student's key, so a count of agent slots needs half
+# as many identities, rounded up.
+[shapes]
+hands_on = 1
+several_agents = 2
+
+# The replay, which is spike S5's profile: an opening common to the class inside a longer
+# transcript, new input on each later turn, a fixed requested output and a pause for tools.
+[replay]
+route = "messages"
+opening_tokens = 20000
+transcript_tokens = [50000, 100000]
+turn_input_tokens = [1000, 5000]
+turn_output_tokens = 500
+tool_delay_ms = [5000, 10000]
+
+# One streamed tool exchange on each wire format, then short synthetic sessions until each host
+# shows work. It has inputs and a prefix namespace of its own.
+[warm_up]
+routes = ["messages", "responses", "chat_completions"]
+shape = "hands_on"
+agent_slots = 1
+
+# Each shape at these agent slots, then at the class size. A cell that is both is planned once,
+# with the longer admissions.
+[sweep]
+agent_slots = [1, 4, 8, 16]
+diagnostic_admissions_ms = 300000
+class_admissions_ms = 900000
+
+# The class starts its conversations on a seeded schedule inside this window.
+[opening]
+window_ms = 60000
+
+# A cell whose driver dispatched later than this, at the 95th percentile, is invalid.
+[driver]
+scheduling_lag_p95_ms_max = 250
+
+# What each profile runs. `tasks` is "core" or "all"; `harnesses` is "anchor" or "assigned";
+# `instances_per_task` takes the first instances of a task, and 0 takes them all.
+[profiles.screen]
+repetitions = 1
+attempts = 1
+loads = ["class_load"]
+tasks = "core"
+harnesses = "anchor"
+instances_per_task = 1
+
+[profiles.qualify]
+repetitions = 3
+attempts = 3
+loads = ["low_load", "class_load"]
+tasks = "all"
+harnesses = "assigned"
+instances_per_task = 0
+
+# The harnesses, at the versions spikes/harnesses.py pins (the SDK tool loop at its SDK's), each
+# on its normal route, with the features the suite relies on it for: only the anchor delegates.
+[harnesses.claude_code]
+version = "2.1.323"
+route = "messages"
+features = ["delegation", "follow_up", "local_search", "pdf_reading", "skills"]
+
+[harnesses.codex]
+version = "0.169.0"
+route = "responses"
+features = ["follow_up"]
+
+[harnesses.opencode]
+version = "1.19.5"
+route = "chat_completions"
+features = []
+
+[harnesses.pi]
+version = "1.5.2"
+route = "chat_completions"
+features = []
+
+[harnesses.sdk_tool_loop]
+version = "3.57.0"
+route = "chat_completions"
+features = []
+
+# The tasks, in the order of their IDs: one for each family, three instances each. `background` is the replay shape the other
+# seats keep up while the task runs at class size, and the shape of the seat that runs it.
+# `features` is what the task needs of every harness it is assigned to.
+#
+# The fixtures and the graders arrive with the tasks. Until an instance has its own, both of its
+# digests are the one of no file, sixty-four zeros.
+
+# Parallel analysis: overlapping workers, the plotted data, and the named comparison.
+[[tasks]]
+id = "analysis.t01"
+core = true
+required_properties = 3
+background = "several_agents"
+features = ["delegation"]
+harnesses = ["claude_code"]
+instances = [
+    { id = "analysis.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "analysis.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "analysis.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+]
+
+# Debug and revise: the original cases, the changed cases, and the follow-up constraint.
+[[tasks]]
+id = "debugging.t01"
+core = true
+required_properties = 3
+background = "hands_on"
+features = ["follow_up"]
+harnesses = ["claude_code", "codex"]
+instances = [
+    { id = "debugging.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "debugging.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "debugging.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+]
+
+# The production-planning model: integrality, balance, capacity, the objective, and the table.
+[[tasks]]
+id = "optimization.t01"
+core = true
+required_properties = 5
+background = "hands_on"
+features = []
+harnesses = ["claude_code", "codex", "opencode", "pi", "sdk_tool_loop"]
+instances = [
+    { id = "optimization.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "optimization.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "optimization.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+]
+
+# Grounded research: the facts, their units, the source IDs, and the cited page or table.
+[[tasks]]
+id = "research.t01"
+core = true
+required_properties = 4
+background = "several_agents"
+features = ["local_search", "pdf_reading"]
+harnesses = ["claude_code"]
+instances = [
+    { id = "research.t01.i01", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "research.t01.i02", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+    { id = "research.t01.i03", fixture_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000", grader_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000" },
+]
+
+# Not part of the workload: what a booking is sized with. The design fixes none of these. With
+# them a screen of eight seats fits the three-hour booking of the design's example.
+#   capacity_wait_ms      the wait for the booked hosts, which the booked window includes;
+#   warm_up_ms            the warm-up, which every booking runs before its first cell;
+#   telemetry_settle_ms   after each cell, for its last scrapes to arrive (S5 waits four scrapes);
+#   cleanup_ms            ending the trial containers and releasing the booking;
+#   trial_workspace_mib   the workspace and home of the one trial that runs at a time;
+#   cell_evidence_mib     the request records and host samples of a cell;
+#   trial_evidence_mib    the trial record and the graded output of a trial.
+[estimates]
+capacity_wait_ms = 900000
+warm_up_ms = 300000
+telemetry_settle_ms = 60000
+cleanup_ms = 300000
+trial_workspace_mib = 2048
+cell_evidence_mib = 64
+trial_evidence_mib = 8
