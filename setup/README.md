@@ -16,6 +16,7 @@ that call them.** No agent runs them.
 | `setup/apply-ruleset.sh` | `gh` logged in as a repository admin, `jq` | Once per repository |
 | `cdk synth` and the synthesis tests | Node.js 24 with npm, as `node` on the `PATH` | The version [`.node-version`](../.node-version) names; Node 22 works too, and the CDK supports no other. See [Node and the CDK CLI](#node-and-the-cdk-cli) |
 | `scripts/check.sh container-tests` | A container runtime that answers `docker info` | Only for the tests under `tests/container/`, which CI runs. `fast` and `all` do not need it |
+| The evaluation's trial image | The same container runtime, and `uv` | Only on the host an operator runs trials from. See [The evaluation's trial image](#the-evaluations-trial-image) |
 | `setup/owner-setup.sh` | The AWS CLI with the owner's credentials, `gh` logged in as a repository admin, `uv`, and the CDK CLI for its bootstrap step | The owner's one-time steps. Its `--dry-run` needs `uv` alone |
 
 No AWS credentials are needed for anything else in this repository, and none should be reachable
@@ -86,6 +87,67 @@ repository from `.node-version`:
 A version manager changes the `node` of a shell it is active in. The implement loop's sandbox finds
 `node` on the `PATH` of the host that runs it, so making Node 24 the default there is the owner's
 step.
+
+## The evaluation's trial image
+
+A trial of the evaluation ([`docs/design/agent-session-evaluation.md`](../docs/design/agent-session-evaluation.md),
+"Course quality and the grader") runs a student harness in a container of one image, which holds
+the five harnesses and the solver at the repository's pins. Its recipe is the committed files of
+[`tools/evaluate/image/`](../tools/evaluate/image/__init__.py). On a host with a container
+runtime, prepare and verify it with:
+
+```sh
+uv run --locked python tools/evaluate/image
+```
+
+The command needs nothing prepared beforehand, and each container test calls the same function
+(`evaluate.image.prepare`). It:
+
+1. checks `inventory.json` against the recipe's files and against the pins of
+   `spikes/harnesses.py` and of the group `spikes`, and stops on any difference;
+2. reuses the local image that carries the recipe's digest as a label, or else runs `docker build`
+   on the folder. The build fetches the two base images by their digests, the npm packages of
+   `package-lock.json` by their integrity hashes and the wheels of `requirements.txt` by theirs,
+   and resolves no version;
+3. verifies that image in containers with no network: `claude`, `codex`, `opencode`, `pi` and
+   `node` print their pinned versions, the two SDKs and highspy are the locked ones, and HiGHS
+   solves a small model to its known optimum;
+4. writes the local inventory, `tools/evaluate/image/inventory.local.json` (ignored by git;
+   `--record` names another file): the committed inventory plus `image`, the reference the image
+   is tagged with and the ID the container runtime reports for it.
+
+It prints `built` or `reused` with the image's reference, its ID and the versions, and exits 0
+only when every step passed. The recipe's digest says what the image was asked to be, and finds
+it again; the image's identity is the runtime's ID, which differs between two builds of one
+recipe, so that ID is what a run records. `--name` builds under another name.
+
+Where things are installed:
+
+| What | Where |
+| --- | --- |
+| The image | The local store of the container runtime, as `rhi-evaluate-trial:<the first 16 digits of the recipe's digest>`. Remove it with `docker image rm`. Nothing is installed on the host, in the working tree or in the home directory; the one file written is the local inventory |
+| Claude Code, Codex, OpenCode and Pi, with every package they bring | In the image, under `/opt/harnesses/node_modules`, installed by `npm ci` from `package-lock.json`. Their commands are in `/opt/harnesses/node_modules/.bin`, which is on the image's `PATH` |
+| Node | In the image, `/usr/local/bin/node`, copied from the official Node image at the version `spikes/harnesses.py` pins. npm is not in the image |
+| The OpenAI and Anthropic SDKs (the SDK tool loop), highspy and what they need | In the image's Python, under `/usr/local/lib/python3.13/site-packages`, installed by pip from `requirements.txt` with every hash checked |
+| The trial's user | `65534:65534`, with `HOME=/trial/home` and the working folder `/trial/work`, the two folders it can write |
+
+A bump is one change of the pins, the locks and the inventory. After changing a pin in
+`spikes/harnesses.py` (and `package.json` with it), in the group `spikes` (with `uv lock`), or a
+base image in the `Dockerfile`:
+
+```sh
+(cd tools/evaluate/image && npm install --package-lock-only --ignore-scripts --no-audit --no-fund)
+uv run --locked python tools/evaluate/image --refresh
+uv run --locked pytest tools/evaluate/tests/test_image.py
+```
+
+The first command rewrites `package-lock.json` from the npm registry and installs nothing. A
+package whose install script must run is named in `allowScripts` of `package.json`, at its
+version, and npm runs no other: today the scripts that put the native binary of Claude Code and of
+OpenCode in place. After a bump of one of the two, change its entry there too. The second rewrites `requirements.txt` from
+`uv.lock`, with no network, and `inventory.json` from the recipe. The test then checks the recipe,
+the locks and the inventory against the pins. `tests/container/test_evaluate_image.py` builds the
+image and runs it; CI's job `container-tests` runs that test.
 
 ## `git-hooks.sh`: activate the git hooks (every clone, after the green light)
 
@@ -181,7 +243,8 @@ when the script ends: it needs no `uv sync` first, and leaves no `.venv` and no 
 | Group `admin` | boto3 |
 | Group `cli` | keyring |
 | Group `spikes` | The OpenAI and Anthropic Python SDKs, with which the SDK scripts of the validation spikes under `spikes/` call the endpoint, and boto3, for `spikes/common.py`. No service imports the two SDKs, so no function's bundle and no service's image installs them. Both are built on httpx2, an HTTP client apart from the httpx the gateway's group pins, and on pydantic with its compiled core; the lock holds them, and what they need, for the spikes alone. highspy is HiGHS, an open-source linear and mixed-integer solver under the MIT licence, as a compiled wheel with no system library: the solver of the task spike S3 gives each harness (`spikes/s3_task/`), installed so that `tests/unit/spikes/test_s3_task.py` can run that task's check. It brings NumPy, also a compiled wheel. httpx, at the version of the gateway's group, is the client the load generator (`spikes/loadgen.py`) replays agent sessions through the gateway with; it installs nothing the gateway's group does not |
-| The harnesses the spikes run: Claude Code (`@anthropic-ai/claude-code`) and Codex (`@openai/codex`) | Exact versions in `spikes/harnesses.py`; installed only by a spike job that runs them (spike S3, `spikes/s3_harness_task.py` and `spikes/s3_second_session.py`), with `npm install --no-save` into a temporary folder of the job, which goes with it. That install runs the packages' install scripts: Claude Code's copies its native binary over the placeholder its command is until then. Nothing installs them on a contributor's machine |
+| The harnesses the spikes run: Claude Code (`@anthropic-ai/claude-code`), Codex (`@openai/codex`), OpenCode (`opencode-ai`) and Pi (`@earendil-works/pi-coding-agent`) | Exact versions in `spikes/harnesses.py`; installed only by a spike job that runs them (spike S3, `spikes/s3_harness_task.py` and `spikes/s3_second_session.py`), with `npm install --no-save` into a temporary folder of the job, which goes with it. That install runs the packages' install scripts: Claude Code's copies its native binary over the placeholder its command is until then. Nothing installs them on a contributor's machine |
+| The evaluation's trial image: the same four harnesses, Node, the two SDKs and highspy | The recipe in `tools/evaluate/image/`: base images by digest in its `Dockerfile`, the harnesses' packages in its `package-lock.json`, the Python libraries in its `requirements.txt` (exported from `uv.lock`), and all of it in its `inventory.json`. Installed only into the image, which `uv run --locked python tools/evaluate/image` builds into the container runtime's local store; see [The evaluation's trial image](#the-evaluations-trial-image) |
 | CDK CLI (`aws-cdk`) | Exact version and integrity hash in `package-lock.json`; installed by `npm ci --ignore-scripts` into `node_modules/`, never globally |
 | Node.js 24, the version `.node-version` names | Installed by the contributor, usually with a version manager that reads `.node-version` (mise with idiomatic version files on, fnm, nodenv, `actions/setup-node` through `node-version-file`). The CDK CLI and the synthesis tests run on it; nothing in this repository installs or enforces it |
 | pytest for the engine tests | `uv run --no-project --with pytest==8.3.5 --with pytest-xdist==3.8.0` fetches them, and Python 3.12 if needed, into uv's per-user cache |
