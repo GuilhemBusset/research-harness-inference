@@ -69,30 +69,45 @@ def identify(path: Path) -> None:
     git("config", "commit.gpgsign", "false", cwd=path)
 
 
+# git starts no maintenance in a repository of a `TempRepo`: its clones are made with this setting,
+# and its remote starts none for a push it receives (`receive.autogc`). A fetch, a commit, a merge
+# and a received push each end by starting `git maintenance run --auto`, which detaches: it is still
+# at work in the repository while the next command runs. git 2.56 has it prune worktrees by default
+# (git 2.53 did not), and `git worktree prune` takes the entry that `git worktree add` has just
+# made, and not yet marked `locked`, for an abandoned one. It deletes it, and the `add` dies
+# (`could not open '.git/worktrees/coord/locked' for writing`). The engine adds a worktree right
+# after a fetch, so on a busy machine a step of an engine run crashed now and then, in any test,
+# and left its issue waiting for a new engine version. The tests judge the engine, and nothing of
+# git's runs behind them.
+NO_MAINTENANCE = "maintenance.auto=false"
+
+
 def load_fixture() -> dict:
     return json.loads(FIXTURE.read_text())
 
 
 class TempRepo:
-    """remote.git (bare) <- work (the engine's repo) ; merger (performs squash merges)."""
+    """remote.git (bare) <- work (the engine's repo) ; merger (performs squash merges). git starts
+    no background maintenance in any of them (`NO_MAINTENANCE`)."""
 
     def __init__(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="implement-loop-"))
         self.remote = self.tmp / "remote.git"
         git("init", "-q", "--bare", "-b", "main", str(self.remote), cwd=self.tmp)
+        git("config", "receive.autogc", "false", cwd=self.remote)
         seed = self.tmp / "seed"
-        git("clone", "-q", str(self.remote), str(seed), cwd=self.tmp)
+        git("clone", "-q", "-c", NO_MAINTENANCE, str(self.remote), str(seed), cwd=self.tmp)
         identify(seed)
         (seed / "README.md").write_text("test repo\n")
         git("add", "README.md", cwd=seed)
         git("commit", "-q", "-m", "seed", cwd=seed)
         git("push", "-q", "origin", "HEAD:main", cwd=seed)
         self.work = self.tmp / "work"
-        git("clone", "-q", str(self.remote), str(self.work), cwd=self.tmp)
+        git("clone", "-q", "-c", NO_MAINTENANCE, str(self.remote), str(self.work), cwd=self.tmp)
         identify(self.work)
         git("config", "core.hooksPath", str(HOOKS), cwd=self.work)
         self.merger = self.tmp / "merger"
-        git("clone", "-q", str(self.remote), str(self.merger), cwd=self.tmp)
+        git("clone", "-q", "-c", NO_MAINTENANCE, str(self.remote), str(self.merger), cwd=self.tmp)
         identify(self.merger)
         self.loop_dir = self.tmp / "loop"
 
