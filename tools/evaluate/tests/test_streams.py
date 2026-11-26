@@ -412,6 +412,20 @@ def test_a_stream_that_reports_no_usage_is_completed_with_its_usage_missing(rout
     assert (attempt.output_tokens_per_second, attempt.eligible) == (None, False)
 
 
+@routes
+def test_an_output_count_is_the_answers_own_only_when_no_output_follows_it(route: Route) -> None:
+    counted = replay(route, (100, opening(route) + text(route)), (200, ending(route, 7)))
+    # The same count, reported before the last of the output: Responses reports it in a last event.
+    early = usage_event(route, 7) or last_event(route, 7, "response.in_progress")
+    followed = replay(route, (100, opening(route) + early + text(route)), (200, ending(route, None)))
+    silent = replay(route, (100, opening(route, usage=False) + text(route)), (200, ending(route, None)))
+
+    assert (counted.outcome, followed.outcome, silent.outcome) == (RequestOutcome.COMPLETED,) * 3
+    assert (counted.output_counted, followed.output_counted, silent.output_counted) == (True, False, False)
+    assert followed.usage is not None
+    assert followed.usage.output_tokens == 7
+
+
 def test_a_count_that_was_not_reported_is_missing_on_its_own() -> None:
     attempt = replay(MESSAGES, (100, opening(MESSAGES, usage=False) + text(MESSAGES)), (200, ending(MESSAGES, 7)))
 
