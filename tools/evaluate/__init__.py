@@ -14,4 +14,8 @@ that hold it, offline. `evaluate.cli` is the command line, which `scripts/evalua
 `evaluate.streams` reads one streamed attempt on each of the three routes: how it ended, when its
 output came, the usage it reported and its speed. It reads with the gateway's and the load
 generator's readers, so it needs `services/gateway` and `spikes` on the path as well.
+
+`evaluate.traces` freezes the conversations a replay sends, from a seed and the course fixture
+under `fixtures/replay/`, before any of them is sent: the requests and pauses of each, in the form
+the load generator's recorded-session reader reads. It needs `spikes` on the path too.
 """
