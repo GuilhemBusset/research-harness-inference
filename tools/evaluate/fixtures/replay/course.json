@@ -1,0 +1,20 @@
+{
+  "source": "tests/captures/profile-document-as-text/claude-code-pdf.json",
+  "tools": [
+    {
+      "name": "Read",
+      "description": "Read a file of the working directory.",
+      "input_schema": {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"]
+      }
+    }
+  ],
+  "call": {"type": "tool_use", "id": "toolu_01", "name": "Read", "input": {"file_path": "notes.pdf"}},
+  "result": {
+    "type": "tool_result",
+    "tool_use_id": "toolu_01",
+    "content": [{"type": "text", "text": "PDF file read: notes.pdf"}]
+  }
+}
