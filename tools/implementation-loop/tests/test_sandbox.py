@@ -750,10 +750,15 @@ class EngineGitTests(SandboxCase):
             self.ws.issue_worktree(8, "feat/eight")                       # a fetch, then a worktree
         self.assertEqual(started, [])
 
-        # Last, since what it starts may still be at work: without the engine's setting a commit
-        # starts maintenance, and the trace shows it.
+        # Without the engine's setting a commit starts maintenance, and the trace shows it. The
+        # control says so itself, whatever the launching shell's git configuration, and has git
+        # wait for that maintenance rather than leave it running after the test.
+        asked = {"GIT_CONFIG_COUNT": "3",
+                 "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "true",
+                 "GIT_CONFIG_KEY_1": "maintenance.autoDetach", "GIT_CONFIG_VALUE_1": "false",
+                 "GIT_CONFIG_KEY_2": "gc.autoDetach", "GIT_CONFIG_VALUE_2": "false"}
         (self.wt / "more.txt").write_text("z\n")
-        with traced(self.repo) as started:
+        with mock.patch.dict(os.environ, asked), traced(self.repo) as started:
             self.assertTrue(self.ws.commit_all(self.wt, "Build #7", "implementation", 7))
         self.assertTrue(started)
 

@@ -32,7 +32,10 @@ maintenance" below to the engine. A fetch, a commit and a merge each end by star
 maintenance run --auto`, which detaches. From git 2.56 it prunes worktrees, and that prune deletes
 the entry of a worktree that `git worktree add` is still creating, so the `add` dies; the engine
 adds a worktree right after a fetch. The loop's host has an older git today; this holds once it is
-upgraded. The engine's version stays 1.2.22: nothing waits for this change.
+upgraded. The supervisor's own `git pull --ff-only` of the main checkout (`supervisor.py`, before
+it launches the engine) runs in its own process, without `engine_git_env`, so it is not covered:
+that stays a follow-up for the owner. The engine's version stays 1.2.22: nothing waits for this
+change.
 
 | File | What changed |
 | --- | --- |
