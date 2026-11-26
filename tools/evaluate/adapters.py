@@ -47,7 +47,10 @@ harness. Everything else of the environment is the container's own.
   Code may use without asking, since no one is there to ask, and `delegation` reads from Claude
   Code's own output how many delegated workers it started and whether two of them were alive at
   once: from the events it prints when a worker starts and when it ends, and from the worker's
-  own messages. Workers that are alive at once are also answered at once only when the trial's
+  own messages. A step that printed more than the worker's output cap kept (`Ran.truncated`)
+  left only the beginning of that output: the workers it shows are not all there may have been,
+  so the trial has no count at all (`Trial.delegation` is `None`), never a count of what was
+  kept. Workers that are alive at once are also answered at once only when the trial's
   budget gives each answer an allowance (`forwarding.Budget`, `request_tokens`): a request with
   none holds every token the trial has left, and the forwarder keeps the next one waiting;
 - *skills* (`skills`; Claude Code): the skill tool is allowed too. Reading a PDF needs nothing more
@@ -60,12 +63,17 @@ An assignment that asks a harness for a feature it does not have here is refused
 - *completed*: every prompt was given and the harness ended each in success (for Claude Code,
   with a result that is no error);
 - *failed*, `timeout`: the worker's wall time ended a step;
-- *failed*, `malformed_tool_call`: the harness ended without completing because of tool calls it
-  could not carry out. The SDK tool loop says so itself (its exit status). Claude Code's output
-  shows it: the run did not complete, and the last tool result of its main loop is its own
-  refusal of the call (`CLAUDE_REFUSALS`). For Codex, OpenCode and Pi the adapter reads no such
-  event from what they print: there, such a trial shows as the limit it runs into or as an exit
-  in failure, and the adapter does not name it;
+- *failed*, `malformed_tool_call`: the harness ended without completing because of an answer
+  of the model it could not carry out. The SDK tool loop says so itself (its exit status).
+  Claude Code's output shows it: the run did not complete, and the last tool result of its main
+  loop is its own refusal of the call (`CLAUDE_REFUSALS`); output the cap cut shows no last
+  result, and no refusal is read from it. For Codex, OpenCode and Pi the adapter reads no such
+  event from what they print, and names the failure by what is left (`Ending.evidence`): a
+  harness that ended a prompt in failure after it asked the model for a turn, when the worker's
+  wall time did not end it, the forwarder refused it nothing at a limit and left none of its
+  turns unanswered. The endpoint gave it every answer whole and it could not go on from one.
+  The same holds for Claude Code and the SDK tool loop when they end in failure otherwise. A
+  harness that was sent such a call and went on to complete has completed;
 - *invalid*, `driver_error`: the measurement broke, not the attempt. The harness could not be
   started (the launcher could not write its profile, or there was no such command), the runtime
   failed, what a step printed could not be written or read back, or the harness ended a prompt
@@ -75,11 +83,10 @@ An assignment that asks a harness for a feature it does not have here is refused
   the same way, only a count taken when the follow-up was given does (`Adapter.trial`, `turns`);
   without one, nothing shows the follow-up reached the model, and the trial is invalid.
 
-A harness that ended in failure for another reason, after it asked the model, has no reason of
-the adapter's:
-`Ending.evidence` gives its exit status to the forwarder, which names an endpoint failure when a
-turn was left unanswered, and adds the adapter's reason where the forwarder saw none. What was
-written is still graded.
+So a trial whose harness did not complete never passes, whatever its task's folder holds and
+whatever a grader says of it: `Ending.evidence` gives the exit status to the forwarder, which
+names a limit it refused at and an endpoint failure when a turn was left unanswered, and adds
+the adapter's reason where the forwarder saw none.
 
 It keeps no text of a run: an ending is labels and an exit status, the delegation two numbers.
 """
@@ -223,7 +230,8 @@ class Delegation:
 @dataclass(frozen=True)
 class Ending:
     """How a trial's harness ended. Completed, or failed for `failure`, or invalid for `invalid`;
-    with none of the three, the harness ended in failure for a reason that is not the adapter's to name."""
+    with none of the three, the harness ended in failure and `evidence` names the reason, with what
+    the trial's forwarder observed."""
 
     completed: bool
     failure: FailureReason | None = None
@@ -236,14 +244,21 @@ class Ending:
     def evidence(self, forwarder: Forwarder) -> Evidence:
         """The trial's evidence, with this ending: the forwarder's own reading of the exit
         status, and this ending's failure where the forwarder saw none. A harness that did not
-        complete, for no reason either of them names, and that is not shown to have asked the
-        model for a turn since its last prompt, never worked on that prompt: the trial is invalid,
-        the driver's error. The turns of the prompts before it show nothing of this one."""
+        complete has a reason in any case, so that no grade makes its trial a pass. Where neither
+        of them names one:
+
+        - a harness that is not shown to have asked the model for a turn since its last prompt
+          never worked on that prompt: the trial is invalid, the driver's error. The turns of the
+          prompts before it show nothing of this one;
+        - a harness that did ask was given every answer whole, within the trial's limits, and
+          ended in failure on one: a failed attempt, `malformed_tool_call` (the module's text)."""
         observed = forwarder.evidence(invalid=self.invalid, exit_status=self.exit_status)
         failure, invalid = observed.failure or self.failure, observed.invalid
-        asked = self.turns_before is not None and observed.model_turns > self.turns_before
-        if not self.completed and failure is None and invalid is None and not asked:
-            invalid = InvalidReason.DRIVER_ERROR
+        if not self.completed and failure is None and invalid is None:
+            if self.turns_before is not None and observed.model_turns > self.turns_before:
+                failure = FailureReason.MALFORMED_TOOL_CALL
+            else:
+                invalid = InvalidReason.DRIVER_ERROR
         return replace(observed, failure=failure, invalid=invalid)
 
 
@@ -251,7 +266,8 @@ class Ending:
 class Trial:
     """A trial's steps, the first prompt's then each follow-up's that was given, and its ending.
     `delegation` is read for an assignment that delegates, and is `None` for any other, and for a
-    trial whose output could not all be read: no count of workers comes from what was not read."""
+    trial whose output could not all be read or was not all kept (a step's `Ran.truncated`): no
+    count of workers comes from what was not read."""
 
     steps: tuple[Step, ...]
     ending: Ending
@@ -500,7 +516,8 @@ class Adapter:
         forwarder has admitted so far (`forwarder.budget.model_turns`): with it, a follow-up that
         ended in failure is known to have asked the model or not (`Ending.evidence`). A runtime
         that fails, or a transcript that cannot be written or read, is the driver's error: the
-        trial has its ending all the same, and no delegation is read from it."""
+        trial has its ending all the same, and no delegation is read from it. None is read either
+        from steps the output cap cut: the workers the kept part shows are not all of them."""
         steps: list[Step] = []
         ending = Ending(completed=True)
         broken = False
@@ -514,7 +531,8 @@ class Adapter:
         except (workers.WorkerFault, OSError):
             broken, ending = True, Ending(completed=False, invalid=InvalidReason.DRIVER_ERROR)
         found = None
-        if HarnessFeature.DELEGATION in self.features and not broken:
+        whole = not broken and not any(step.ran.truncated for step in steps)
+        if HarnessFeature.DELEGATION in self.features and whole:
             # Each step is a run of Claude Code, with workers of its own.
             runs = [delegation(step.output) for step in steps]
             found = Delegation(sum(one.workers for one in runs), any(one.overlapped for one in runs))
@@ -531,6 +549,8 @@ class Adapter:
         if self.harness is Harness.CLAUDE_CODE:
             completed, refused = _claude_ended(step.output)
             succeeded = succeeded and completed is not False
+            # Of output the cap cut, the last tool result that was kept is not the run's last.
+            refused = refused and not step.ran.truncated
         elif self.harness is Harness.SDK_TOOL_LOOP:
             refused = status == MALFORMED_EXIT
         if succeeded:

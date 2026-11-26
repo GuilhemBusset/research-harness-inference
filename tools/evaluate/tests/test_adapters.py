@@ -289,8 +289,8 @@ def tool_result(text: str, *, failed: bool) -> str:
     return event("user", message={"role": "user", "content": [block]})
 
 
-def step(output: str = "", *, exit_code: int | None = 0, tmp_path: Path) -> Step:
-    return Step(workers.Ran(exit_code, exit_code is None, False, tmp_path / "transcript"), output)
+def step(output: str = "", *, exit_code: int | None = 0, truncated: bool = False, tmp_path: Path) -> Step:
+    return Step(workers.Ran(exit_code, exit_code is None, truncated, tmp_path / "transcript"), output)
 
 
 # The commands and the profiles.
@@ -511,12 +511,11 @@ def test_a_follow_up_whose_conversation_is_lost_cannot_pass_on_the_first_prompts
     assert (record.outcome, record.invalid) == (TrialOutcome.INVALID, InvalidReason.DRIVER_ERROR)
 
 
-def test_a_follow_up_that_failed_after_it_asked_the_model_is_the_graders_when_its_turns_were_counted(
-    tmp_path: Path,
-) -> None:
+def test_a_malformed_call_that_ends_a_follow_up_is_a_failed_attempt_whatever_the_grade(tmp_path: Path) -> None:
     first, second = word(), word()
-    # The follow-up is answered with a call the stand-in ends in failure on.
+    # The follow-up is answered with a call that lacks its argument: the stand-in ends in failure on it.
     broken = Phase(second, [lambda _: Raw("exec_command", "{}"), lambda _: Say("done")])
+    accepted = Grade(properties=(True,), within_limits=True)
     with bench(tmp_path, Harness.CODEX, [Conversation([chained(first, "seed.txt", "answer.txt"), broken])]) as made:
         seeded(made.worker, "seed.txt")
         prompts = [f"Do the task {first}.", f"Now also {second}."]
@@ -525,9 +524,17 @@ def test_a_follow_up_that_failed_after_it_asked_the_model_is_the_graders_when_it
         )
         evidence = trial.ending.evidence(made.forwarder)
 
+    # The first prompt's work is there, and the follow-up asked the model before it ended.
     assert made.pool.turns() == [(0, 0), (0, 1), (0, 2), (1, 0)]
+    assert (made.worker.work / "answer.txt").exists()
     assert (trial.ending.completed, trial.ending.turns_before) == (False, 3)
-    assert (evidence.model_turns, evidence.failure, evidence.invalid) == (4, None, None)
+    assert (evidence.model_turns, evidence.failure, evidence.invalid) == (
+        4,
+        FailureReason.MALFORMED_TOOL_CALL,
+        None,
+    )
+    record = evidence.trial_record(execution=0, trial=0, student=0, grade=accepted)
+    assert (record.outcome, record.failure) == (TrialOutcome.FAILED, FailureReason.MALFORMED_TOOL_CALL)
 
 
 # The delegated workers.
@@ -626,6 +633,33 @@ def test_a_transcript_that_cannot_be_read_gives_no_count_of_workers_and_an_inval
     assert trial.ending == Ending(completed=False, invalid=InvalidReason.DRIVER_ERROR)
 
 
+def test_output_the_cap_cut_gives_no_count_of_workers(tmp_path: Path) -> None:
+    first = event("system", subtype="init")
+    lines = [first, worker_started("worker-one"), worker_started("worker-two")]
+    lines += [worker_ended("worker-one"), worker_ended("worker-two"), event("result", is_error=False)]
+
+    class Capped:
+        """A worker whose command prints what Claude Code would, and whose output cap is `room`."""
+
+        def __init__(self, name: str, room: int) -> None:
+            self.transcript, self._room = tmp_path / name, room
+
+        def run(self, command: Sequence[str]) -> workers.Ran:
+            printing = [sys.executable, "-c", "import sys; print(sys.argv[1])", "\n".join(lines)]
+            done = workers.stream(printing, sink=self.transcript, limit=self._room, seconds=STEP_SECONDS)
+            return workers.Ran(done.exit_code, False, done.truncated, self.transcript)
+
+    built = adapter(Harness.CLAUDE_CODE, DELEGATION)
+    kept = built.trial(Capped("kept", 1_000_000), ["made-up prompt"])
+    cut = built.trial(Capped("cut", len(first) + 1), ["made-up prompt"])
+
+    assert (kept.steps[0].ran.truncated, kept.delegation) == (False, Delegation(workers=2, overlapped=True))
+    # The part that was kept shows no worker: that is no evidence that there was none.
+    assert (cut.steps[0].ran.truncated, cut.steps[0].output.strip()) == (True, first)
+    assert cut.delegation is None
+    assert cut.ending.completed
+
+
 # Tools that fail, and how a trial ended.
 
 
@@ -707,8 +741,11 @@ def test_a_model_that_corrects_a_malformed_call_completes(tmp_path: Path) -> Non
         seeded(made.worker, "seed.txt")
         trial = adapter(Harness.SDK_TOOL_LOOP).trial(made.worker, [f"Read it, {marker}."])
 
+        evidence = trial.ending.evidence(made.forwarder)
+
     assert trial.ending == Ending(completed=True, exit_status=0), trial.steps[-1].output
     assert made.pool.turns() == [(0, 0), (0, 1), (0, 2)]
+    assert evidence.may_pass
 
 
 def test_claude_code_that_ends_on_its_own_refusal_of_a_call_failed_for_the_call(tmp_path: Path) -> None:
@@ -727,6 +764,9 @@ def test_claude_code_that_ends_on_its_own_refusal_of_a_call_failed_for_the_call(
     assert ended(refused, failed, success, exit_code=0) == Ending(completed=True, exit_status=0)
     # A result that is an error is no completion, whatever the exit status.
     assert not ended(error, exit_code=0).completed
+    # Of output the cap cut, the last result that was kept is not the run's last: no refusal is read.
+    cut = built.ending(step(refused, exit_code=1, truncated=True, tmp_path=tmp_path))
+    assert cut == Ending(completed=False, exit_status=1)
 
 
 def test_a_step_the_wall_time_ended_is_a_timeout_and_a_harness_that_did_not_start_is_the_drivers(
@@ -739,7 +779,7 @@ def test_a_step_the_wall_time_ended_is_a_timeout_and_a_harness_that_did_not_star
     )
     not_started = built.ending(step(exit_code=127, tmp_path=tmp_path))
     assert (not_started.completed, not_started.invalid) == (False, InvalidReason.DRIVER_ERROR)
-    # An exit in failure with no reason of the adapter's: the forwarder and the grader decide.
+    # An exit in failure the step alone gives no reason for: the trial's evidence names it.
     assert built.ending(step(exit_code=1, tmp_path=tmp_path)) == Ending(completed=False, exit_status=1)
 
 
@@ -776,7 +816,7 @@ def test_a_harness_that_could_not_be_set_up_is_an_invalid_trial_whatever_the_gra
     assert (record.outcome, record.invalid) == (TrialOutcome.INVALID, InvalidReason.DRIVER_ERROR)
 
 
-def test_a_harness_that_failed_before_any_model_turn_cannot_pass(tmp_path: Path) -> None:
+def test_a_harness_that_ended_in_failure_cannot_pass_before_or_after_it_asked_the_model(tmp_path: Path) -> None:
     marker = word()
     failed = Ending(completed=False, exit_status=1)
     with bench(tmp_path, Harness.PI, [Conversation([chained(marker, "seed.txt", "answer.txt")])]) as made:
@@ -787,5 +827,6 @@ def test_a_harness_that_failed_before_any_model_turn_cannot_pass(tmp_path: Path)
 
     # With no turn asked of the model, the harness never worked on the task: the driver's error.
     assert (before.model_turns, before.invalid, before.may_pass) == (0, InvalidReason.DRIVER_ERROR, False)
-    # One that ended in failure after it worked has no reason of the adapter's: the grader decides.
-    assert (after.model_turns, after.failure, after.invalid) == (3, None, None)
+    # One that ended in failure after the endpoint answered each of its turns whole is a failed attempt.
+    assert (after.model_turns, after.failure, after.invalid) == (3, FailureReason.MALFORMED_TOOL_CALL, None)
+    assert not after.may_pass
