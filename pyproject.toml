@@ -129,7 +129,7 @@ package = false
 [tool.pytest.ini_options]
 testpaths = [
     "tools/hygiene/tests", "tools/backlog/tests", "tools/measurements/tests",
-    "tools/advisories/tests", "tests",
+    "tools/advisories/tests", "tools/evaluate/tests", "tests",
 ]
 norecursedirs = [
     "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
