@@ -2021,7 +2021,7 @@ class Engine:
                     return None
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(probe[1])
-            spec = CheckSpec(criterion="repro", command=command, cwd=cwd)
+            spec = CheckSpec(criterion="repro", command=extended_pythonpath(command), cwd=cwd)
             ev, _ = verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
                                      self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch))
         return ev
@@ -3713,6 +3713,35 @@ VERIFIER_RUN = "verifier_run"   # on an open finding: the engine's last run of i
 PROBE_TEXT = "probe_text"       # on a finding a probe witnesses: the probe's content, never committed
 RUN_OUTPUT = 1500               # the characters of a run's output a builder is given, as for a standing check
 FAILED_RUNS = 4                 # the failed commands of one verification whose output a builder is given
+
+
+# A PYTHONPATH value the engine can extend: plain characters and quoted strings, with no expansion,
+# escape or substitution, so the word ends where the pattern says. `$PYTHONPATH` is an expansion:
+# a command that names it already extends the verifier's.
+_PLAIN_VALUE = r"""(?:[^\s'"\\;&|<>()`$]|'[^']*'|"[^"\\`$]*")*"""
+_SETS_PYTHONPATH = re.compile(
+    r"^\s*(?:env(?:[ \t]+(?:-u[ \t]*|--unset[= \t][ \t]*)[A-Za-z_]\w*)*[ \t]+|export[ \t]+)?"
+    rf"(?:[A-Za-z_]\w*={_PLAIN_VALUE}[ \t]+)*PYTHONPATH=(?P<value>{_PLAIN_VALUE})(?=[\s;&|<>()]|$)")
+
+
+def extended_pythonpath(command: str) -> str:
+    """`command` with the PYTHONPATH its first simple command assigns extended by the verifier's
+    instead of replacing it. The verifier loads its result plugin through PYTHONPATH: a pytest run
+    that replaces it cannot load the plugin and fails whatever the code does (`verify._notes`), so
+    a finding with such a reproduction never closes, and its builder may not change the examiner's
+    command (#766). `[env [-u NAME]... | export] [NAME=value]... PYTHONPATH=<value>` at the head
+    of the command becomes `PYTHONPATH=<value>:"$PYTHONPATH"`; bash expands it to the verifier's
+    value when the check runs (`verify.run_check` runs the command with `bash -c`, and the sandbox
+    keeps the environment it is given). Left as written: a value with an expansion, an escape or
+    a substitution (one that names `$PYTHONPATH` already extends it), and a PYTHONPATH set anywhere
+    else in the command, where a `PYTHONPATH=` word may be an argument (`grep PYTHONPATH=src`)
+    that only a shell parser could tell from an assignment."""
+    m = _SETS_PYTHONPATH.match(command)
+    if not m:
+        return command
+    # An empty entry is the current directory, which an empty value did not ask for.
+    tail = '"$PYTHONPATH"' if m.group("value") in ("", "''", '""') else ':"$PYTHONPATH"'
+    return command[:m.end()] + tail + command[m.end():]
 
 
 def run_verdict(ran: Evidence | None) -> bool | None:
