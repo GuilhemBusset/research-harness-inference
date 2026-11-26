@@ -57,10 +57,10 @@ the pool's model does with them.
   field the reference does not give a location or the switch is dropped like any other.
 - `source` is described as the object of an image or a document. On a search result it is a
   string, which the filter keeps as it is.
-- `name`, on an item of a tool result, is no field of the reference, which names a tool
-  reference's tool in `tool_name`. vLLM reads `name` where an item has no `tool_name`, and so does
-  the request profile's entry for tool references (`rhi_gateway.profile.tool_reference_as_text`),
-  which is given the filtered body: the name is kept for it to read.
+- `name`, on a tool reference inside a tool result, is no field of the reference, which names the
+  tool in `tool_name`. vLLM reads `name` where the item has no `tool_name`, and so does the request
+  profile's entry for tool references (`rhi_gateway.profile.tool_reference_as_text`), which is
+  given the filtered body: the name is kept for it to read, on a tool reference only (`Kinds`).
 
 **Blocks this endpoint cannot serve are replaced, never refused** (section 6.2, step 4; ADR 0003,
 decision 7). A block the engine refuses stays in the conversation's history, so every later
@@ -87,7 +87,7 @@ from __future__ import annotations
 
 from typing import Any, Final
 
-from rhi_gateway.body import KEEP, Fields, Items, Limit, Shapes, Spec
+from rhi_gateway.body import KEEP, Fields, Items, Kinds, Limit, Shapes, Spec
 
 # What the engine reads where a block of each kind was. No number, no name of the deployment.
 SEARCH_RESULT_SENTENCE: Final = (
@@ -236,10 +236,14 @@ _IN_A_TOOL_RESULT: Final[dict[str, Spec]] = {
     "content": Items(Fields(_TEXT)),
     # `ToolReferenceBlockParam`
     "tool_name": KEEP,
-    # Not in the reference: where vLLM, and the request profile's entry for tool references, read
-    # the tool's name when an item has no `tool_name` (above).
-    "name": KEEP,
 }
+
+# An item of a tool result. A tool reference also keeps `name`, which is no field of the reference:
+# where vLLM, and the request profile's entry for tool references, read the tool's name when the
+# item has no `tool_name` (above). No other item keeps it.
+_TOOL_RESULT_ITEM: Final = Kinds(
+    Fields(_IN_A_TOOL_RESULT), {"tool_reference": Fields({**_IN_A_TOOL_RESULT, "name": KEEP})}
+)
 
 # `tools`, `Tool`: a tool the client defines and runs.
 _TOOL: Final = Fields(
@@ -273,7 +277,7 @@ _IN_A_MESSAGE: Final[dict[str, Spec]] = {
     "toolset_name": KEEP,  # and `ToolResultBlockParam`
     # `ToolResultBlockParam`
     "tool_use_id": KEEP,
-    "content": Items(Fields(_IN_A_TOOL_RESULT)),
+    "content": Items(_TOOL_RESULT_ITEM),
     "is_error": KEEP,
     # Beta: `BetaRequestToolAdditionBlock` and `BetaRequestToolRemovalBlock`, in a system message.
     # `tool` is a `BetaToolChangeToolReference` (`type`, `name`) or, in an addition, a
