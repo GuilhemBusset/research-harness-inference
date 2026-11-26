@@ -25,7 +25,7 @@ from evaluate.booking import Cleanup, Reason
 from rhi_admin import pools as admin_pools
 from rhi_admin import session as admin_session
 from rhi_common import sessions as rules
-from rhi_common.records import SESSION_RECORD, ScalerNote, Session
+from rhi_common.records import NOTE_RECORD, SESSION_RECORD, ScalerNote, Session
 from rhi_common.tables import POOL_STATE
 
 if TYPE_CHECKING:
@@ -56,6 +56,8 @@ ENTRY = {
     "largest_output": 4_096,
 }
 LOST = ReadTimeoutError(endpoint_url="https://dynamodb.example.com")
+# What `Deployed.unreadable` names besides a record of the table: the scaler's settings.
+SETTINGS = "settings"
 
 
 def _refused() -> ClientError:
@@ -69,8 +71,10 @@ class Deployed:
     `scaler_runs`: `hosts` in service, the rest of what a session asks for waiting. A write of the
     driver goes through `put_item`, which keeps it in `puts` and does what `faults` says of it:
     `lost` stores it and loses the answer, `retried` stores it and answers as the SDK's own retry
-    of a stored write is answered, `failed` loses it before it is stored. `before_put` and
-    `after_put` run once, around the next write. `at` holds what happens at a time of the clock.
+    of a stored write is answered, `failed` loses it before it is stored, `pending` times out
+    with the request kept in `pending`, to be stored later. `before_put` and `after_put` run once,
+    around the next write, and `during_probe` once, while the hosts' releases are read. A read of
+    what `unreadable` names times out. `at` holds what happens at a time of the clock.
     """
 
     def __init__(self, table: Any) -> None:
@@ -82,6 +86,9 @@ class Deployed:
         self.faults: list[str] = []
         self.before_put: Callable[[], None] | None = None
         self.after_put: Callable[[], None] | None = None
+        self.during_probe: Callable[[], None] | None = None
+        self.pending: list[dict[str, Any]] = []
+        self.unreadable: set[str] = set()
         self.at: list[tuple[int, Callable[[], None]]] = []
         self.sleeps: list[float] = []
 
@@ -124,6 +131,8 @@ class Deployed:
         self.table.put_item(Item=note.to_item())
 
     def get_function_configuration(self, **_: str) -> dict[str, Any]:
+        if SETTINGS in self.unreadable:
+            raise LOST
         settings = json.dumps({"pools": {POOL: {"entry": ENTRY}}})
         return {"Environment": {"Variables": {"RHI_SCALER_SETTINGS": settings}}}
 
@@ -139,10 +148,15 @@ class Deployed:
         return self.gateway
 
     def releases(self) -> list[str]:
+        during, self.during_probe = self.during_probe, None
+        if during is not None:
+            during()
         return [RELEASE] * self.hosts if self.served is None else self.served
 
     # The table.
     def get_item(self, **request: Any) -> dict[str, Any]:
+        if request["Key"]["record"] in self.unreadable:
+            raise LOST
         return self.table.get_item(**request)
 
     def put_item(self, **request: Any) -> dict[str, Any]:
@@ -151,7 +165,9 @@ class Deployed:
         if before is not None:
             before()
         fault = self.faults.pop(0) if self.faults else None
-        if fault == "failed":
+        if fault == "pending":
+            self.pending.append(request)
+        if fault in ("failed", "pending"):
             raise LOST
         answer = self.table.put_item(**request)
         after, self.after_put = self.after_put, None
@@ -361,6 +377,48 @@ def test_capacity_that_is_delayed_past_the_last_start_is_not_used_and_the_bookin
     assert stopped_under_the_saved_marker(pool, run.journal)
 
 
+def test_a_batch_is_not_admitted_once_a_slow_probe_has_passed_the_last_start(pool: Deployed, journal: Path) -> None:
+    def a_second_passes() -> None:
+        pool.now += 1
+
+    # Booked for exactly the batch and the cleanup: the batch may start now, and not a second later.
+    pool.hosts, pool.during_probe = 2, a_second_passes
+    run = capacity(pool, journal)
+
+    outcome = run.acquire(minutes=(BATCH + CLEANUP) // 60)
+
+    assert (outcome.reason, outcome.cleanup, outcome.session) == (Reason.WINDOW_TOO_SHORT, Cleanup.RELEASED, None)
+    assert pool.now == NOW + 1 and stopped_under_the_saved_marker(pool, run.journal)
+
+
+@pytest.mark.parametrize(
+    ("readable_at", "found"),
+    [(NOW + 30, (None, Cleanup.HELD, NOW + 30)), (None, (Reason.POOL_STATE_UNREADABLE, Cleanup.RELEASED, LAST_START))],
+    ids=["for a while", "throughout"],
+)
+def test_a_note_of_the_scaler_that_cannot_be_read_is_a_poll_that_is_not_ready(
+    pool: Deployed, journal: Path, readable_at: int | None, found: tuple[Reason | None, Cleanup, int]
+) -> None:
+    pool.hosts, pool.unreadable = 2, {NOTE_RECORD}
+    if readable_at is not None:
+        pool.at = [(readable_at, pool.unreadable.clear)]
+    run = capacity(pool, journal)
+
+    outcome = run.acquire(minutes=MINUTES)
+
+    assert (outcome.reason, outcome.cleanup, pool.now) == found
+    assert outcome.ready or stopped_under_the_saved_marker(pool, run.journal)
+
+
+def test_pool_limits_that_cannot_be_read_refuse_the_booking_unwritten(pool: Deployed, journal: Path) -> None:
+    pool.unreadable = {SETTINGS}
+
+    outcome = capacity(pool, journal).acquire(minutes=MINUTES)
+
+    assert (outcome.reason, outcome.cleanup) == (Reason.POOL_STATE_UNREADABLE, Cleanup.NOT_OWNED)
+    assert pool.puts == [] and pool.runs == 0
+
+
 def _cancel() -> None:
     raise KeyboardInterrupt
 
@@ -423,6 +481,18 @@ def test_a_booking_edited_during_the_wait_is_the_editor_s_from_then_on(
     assert pool.puts == [booked] and stored(pool) == dataclasses.replace(booked, **changes) and pool.runs == 1
 
 
+def test_an_edit_during_the_poll_that_finds_the_hosts_ready_ends_the_wait(pool: Deployed, journal: Path) -> None:
+    pool.hosts, pool.during_probe = 2, edit(pool, instances=1, set_by=OPERATOR)
+    run = capacity(pool, journal)
+
+    outcome = run.acquire(minutes=MINUTES)
+
+    assert (outcome.reason, outcome.cleanup, outcome.session) == (Reason.BOOKING_CHANGED, Cleanup.YIELDED, None)
+    booked = run.journal.booking
+    assert booked is not None and pool.puts == [booked]
+    assert stored(pool) == dataclasses.replace(booked, instances=1, set_by=OPERATOR)
+
+
 def test_an_edit_between_the_stop_s_read_and_its_write_is_not_written_over(pool: Deployed, journal: Path) -> None:
     pool.hosts = 2
     run = capacity(pool, journal)
@@ -470,6 +540,43 @@ def test_a_designated_session_is_checked_and_neither_stopped_nor_extended(
     # Whatever came of it: no write, the session as the operator wrote it, and no run asked of the scaler.
     assert pool.puts == [] and stored(pool) == session and pool.runs == 0
     assert run.journal.marker is None
+
+
+@pytest.mark.parametrize(
+    ("starts_at", "reason", "at"),
+    [(NOW + 60, None, NOW + 60), (LAST_START + 1, Reason.WINDOW_TOO_SHORT, NOW)],
+    ids=["starts in time for the batch", "starts too late for the batch"],
+)
+def test_a_designated_session_is_not_used_before_its_start(
+    pool: Deployed, journal: Path, starts_at: int, reason: Reason | None, at: int
+) -> None:
+    # Two hosts serve already, as warm instances do: ready, but for a session that is not active yet.
+    session = dataclasses.replace(DESIGNATED, starts_at=starts_at)
+    write(pool, session)()
+    pool.hosts = 2
+    pool.note()
+
+    outcome = capacity(pool, journal).acquire()
+
+    assert (outcome.reason, pool.now) == (reason, at)
+    assert pool.puts == [] and stored(pool) == session and pool.runs == 0
+
+
+def test_a_session_that_replaces_the_designated_one_is_neither_waited_on_nor_used(
+    pool: Deployed, journal: Path
+) -> None:
+    write(pool, DESIGNATED)()
+    pool.note()
+    theirs = Session(POOL, 2, NOW + 15, END, "user/another", NOW + 15)
+    pool.at = [(NOW + 15, write(pool, theirs))]
+    pool.hosts_at(NOW + 15, 2)
+    run = capacity(pool, journal)
+
+    outcome = run.acquire()
+
+    assert (outcome.reason, outcome.cleanup, outcome.session) == (Reason.BOOKING_CHANGED, Cleanup.NOT_OWNED, None)
+    assert run.journal.designated == DESIGNATED and pool.now == NOW + 15
+    assert pool.puts == [] and stored(pool) == theirs and pool.runs == 0
 
 
 def test_a_cancelled_wait_leaves_a_designated_session_as_it_is(pool: Deployed, journal: Path) -> None:
@@ -545,9 +652,35 @@ def test_a_booking_that_failed_adopts_nothing(pool: Deployed, journal: Path, tak
 
     outcome = run.acquire(minutes=MINUTES)
 
+    # Someone else's session shuts the unanswered write out. With no record, it may still be on its
+    # way: it is looked for until the saved deadline, and no longer.
     assert outcome.reason is (Reason.POOL_ALREADY_BOOKED if taken else Reason.BOOKING_UNCONFIRMED)
-    assert outcome.cleanup is Cleanup.NOT_OWNED and run.journal.booking is None
-    assert stored(pool) == (theirs if taken else None) and pool.runs == 0
+    assert outcome.cleanup is (Cleanup.NOT_OWNED if taken else Cleanup.UNCONFIRMED) and run.journal.booking is None
+    assert run.journal.deadline == END
+    pool.now = END - 60
+    assert capacity(pool, journal).release() is outcome.cleanup and pool.now < END
+    pool.now = END
+    assert capacity(pool, journal).release() is Cleanup.NOT_OWNED
+    assert len(pool.puts) == 1 and stored(pool) == (theirs if taken else None) and pool.runs == 0
+
+
+def test_a_booking_stored_after_its_request_timed_out_is_found_by_the_saved_record_and_stopped(
+    pool: Deployed, journal: Path
+) -> None:
+    pool.faults = ["pending"]
+    run = capacity(pool, journal)
+
+    outcome = run.acquire(minutes=MINUTES)
+
+    assert (outcome.reason, outcome.cleanup) == (Reason.BOOKING_UNCONFIRMED, Cleanup.UNCONFIRMED)
+    assert stored(pool) is None and pool.runs == 0
+    # The write is stored after the driver gave up on it. A new process finds it.
+    pool.table.put_item(**pool.pending.pop())
+    resumed = capacity(pool, journal)
+    assert held(pool) == resumed.journal.intended and resumed.journal.booking is None
+
+    assert resumed.release() is Cleanup.RELEASED
+    assert stopped_under_the_saved_marker(pool, resumed.journal) and pool.runs == 2
 
 
 @pytest.mark.parametrize(
@@ -617,6 +750,8 @@ def test_a_restart_finds_its_unchanged_booking_and_resumes_or_releases_it(
 
     assert run.reconcile() is Cleanup.HELD and pool.puts == []
     assert run.journal.booking == run.journal.intended == stored(pool)
+    # A booking that is only confirmed now is owed its run of the scaler.
+    assert pool.runs == (1 if answered else 2)
     assert run.wait().ready
     assert run.release() is Cleanup.RELEASED and stopped_under_the_saved_marker(pool, run.journal)
     assert len(pool.puts) == 1
@@ -640,3 +775,16 @@ def test_a_restart_after_the_saved_deadline_has_nothing_to_stop(pool: Deployed, 
 
     assert run.reconcile() is Cleanup.ENDED and run.release() is Cleanup.ENDED
     assert pool.puts == []
+
+
+def test_a_restart_that_selects_another_pool_is_refused_and_leaves_the_booking_releasable(
+    pool: Deployed, journal: Path
+) -> None:
+    restarted(pool, journal, answered=True)
+
+    with pytest.raises(ValueError, match="another pool"):
+        capacity(pool, journal, name="elsewhere")
+
+    assert evaluation.Journal.load(journal).cleanup is None and pool.puts == []
+    run = capacity(pool, journal)
+    assert run.release() is Cleanup.RELEASED and stopped_under_the_saved_marker(pool, run.journal)
