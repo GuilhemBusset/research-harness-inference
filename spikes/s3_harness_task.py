@@ -77,7 +77,9 @@ first such request that was accepted (a retry of a refused one among them), or t
 none was. Claude Code named the colour when its answer names it, as a word, and no other colour.
 
 **Compaction.** In a folder of its own, the job writes `FILLER_FILES` files of text, a quarter more
-than the window the pinned Claude Code reports it works with (`CLIENT_WINDOW`), and asks Claude
+than the window its Claude Code compacts at (`CLIENT_WINDOW`), the auto-compact window `rhi login`
+sets (`rhi_cli.harness.AUTO_COMPACT_WINDOW`), which the job writes in that Claude Code's settings
+through the same module (`forwarder.write_home`), and asks Claude
 Code to read them all, one at a time, then give the last word of the last. Claude Code says in its
 own output that it compacted (an event `compact_boundary`), and gives every turn of its main loop
 as an `assistant` event: the session completed its next turn when the first such event after the
@@ -232,11 +234,13 @@ COLOURS: dict[str, tuple[int, int, int]] = {
 }
 
 # Compaction: files of text, each well inside what Claude Code reads at once, together a quarter
-# more than the window the pinned Claude Code works with by default against the gateway, which it
-# reports in its result (`modelUsage`, `contextWindow`). A line of 12 words is some 16 tokens, at
-# most. The engine's own window is smaller: a session that does not compact first meets the
-# engine's refusal as it grows, which is recorded as well.
-CLIENT_WINDOW = 1_000_000
+# more than the window the job's Claude Code compacts at: the auto-compact window `rhi login` sets
+# (`rhi_cli.harness`), which `forwarder.write_home` writes in the job's Claude Code settings too.
+# The window Claude Code reports in its result (`modelUsage`, `contextWindow`) stays its model's
+# own, 1M behind the gateway. A line of 12 words is some 16 tokens, at most. A session that does
+# not compact before the engine's window meets the engine's refusal as it grows, which is
+# recorded as well.
+CLIENT_WINDOW = login_files.AUTO_COMPACT_WINDOW
 FILLER_LINES = 800
 FILLER_WORDS_A_LINE = 12
 FILLER_FILES = math.ceil(1.25 * CLIENT_WINDOW / (FILLER_LINES * (FILLER_WORDS_A_LINE + 4)))
