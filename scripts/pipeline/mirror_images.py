@@ -109,26 +109,29 @@ def parse(reference: str) -> Image:
 
 
 def instructions(dockerfile: str) -> list[str]:
-    """The instructions of `dockerfile`, each on one line: a line that ends in the escape character,
-    `\\` or the one a `# escape=` directive names, goes on on the next line, and a comment line
-    inside an instruction is left out, as Docker reads them."""
+    """The instructions of `dockerfile`, each on one line, as BuildKit's parser reads them: the
+    parser directives at the top of the file are no instruction; a line that ends in the escape
+    character, `\\` or the one a `# escape=` directive names, goes on on the next line, joined with
+    nothing in between; and a comment line or an empty line inside an instruction is left out."""
     lines = dockerfile.splitlines()
     escape = "\\"
+    directives = 0
     for line in lines:
         directive = re.fullmatch(r"\s*#\s*(\w+)\s*=\s*(\S*)\s*", line)
         if directive is None:
             break
+        directives += 1
         if directive[1].lower() == "escape" and directive[2] in ("\\", "`"):
             escape = directive[2]
     joined: list[str] = []
     pending: str | None = None
-    for line in lines:
-        if pending is not None and line.lstrip().startswith("#"):
+    for line in lines[directives:]:
+        if pending is not None and (line.lstrip().startswith("#") or not line.strip()):
             continue
         stripped = line.rstrip()
         continued = stripped.endswith(escape)
         part = stripped[: -len(escape)] if continued else line
-        pending = part if pending is None else f"{pending} {part}"
+        pending = part.lstrip() if pending is None else pending + part
         if not continued:
             joined.append(pending)
             pending = None

@@ -101,6 +101,29 @@ def test_lists_from_lines_but_scratch_and_stages_and_refuses_an_unpinned_image(t
     assert mirror_images.main({}, tmp_path) == 1
 
 
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "# escape=`\nFROM python@{pin}\n",
+        "# syntax=docker/dockerfile:1\nFROM python@\\\n{pin} AS base\n",
+        "# escape=`\nFROM python@`\n\n# a comment\n{pin}\n",
+    ],
+    ids=["after-a-directive", "within-the-reference", "escape-directive"],
+)
+def test_lists_a_pinned_base_after_a_directive_or_across_an_escaped_newline(
+    tmp_path: Path, dockerfile: str
+) -> None:
+    pin = "sha256:" + "b" * 64
+    (tmp_path / "src/rhi/pipeline").mkdir(parents=True)
+    (tmp_path / mirror_images.PIPELINE_STACK).write_text(
+        f'EMULATOR_IMAGE = "tonistiigi/binfmt@{pin}"\nBUILDKIT_IMAGE = "moby/buildkit@{pin}"\n'
+    )
+    service = tmp_path / "services/one"
+    service.mkdir(parents=True)
+    (service / "Dockerfile").write_text(dockerfile.format(pin=pin))
+    assert ("library/python", pin) in {(i.path, i.digest) for i in mirror_images.listed(tmp_path)}
+
+
 def test_a_run_copies_only_the_digests_the_mirror_lacks(images: list[mirror_images.Image]) -> None:
     held, lacking = images[:2], images[2:]
     crane = Crane()
