@@ -24,8 +24,10 @@ right runs the contract check on an instance and nothing else; but it is a right
 on GPU instances that hold their pool's secret, which no role of the pipeline has had. It is
 granted to the shared role of the spike jobs, because `SpikeJobs` gives every job one role
 (`rhi.pipeline.spikes`, "One role, one log group and one key"): every spike job may then send that
-document. That is the decision this issue asks of the owner, and the alternative, a role of the
-job's own, is a construct of its own beside `SpikeJobs`.
+document. Decided by the orchestrator on 2026-11-27: the shared role of the spike jobs sends the
+document, since the document takes no parameter and runs only the release's own contract check,
+which a role of the job's own would not make narrower in effect; the owner reverses it by editing
+this issue.
 
 **What the role gains**, and nothing else: `ssm:SendCommand` on the document
 `rhi-engine-contract` of the stage's account and region, and on the EC2 instances whose tag
@@ -64,7 +66,6 @@ Suggested branch: `feat/engine-contract-job`
 
 ## Acceptance criteria
 
-- [ ] The owner accepts that the shared role of the spike jobs may send the document `rhi-engine-contract`, which takes no parameter and runs only the release's contract check, to the instances of every pool of the configuration, rather than a role of this job's own (needs human:owner-decision).
 - [ ] `uv run --locked pytest tests/unit/spikes/test_engine_contract.py tests/synth/test_spike_jobs.py tests/policy` passes.
 - [ ] `scripts/check.sh fast` exits 0.
 - [ ] A build of `rhi-spike-engine_contract` on `main` with `RHI_SPIKE_POOL=mock`, in a session of the mock pool, succeeds and writes one `instance_check` line per instance in service, each with the four tests `passed` (needs aws:deployed-environment).
