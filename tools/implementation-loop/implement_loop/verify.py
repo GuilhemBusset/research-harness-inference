@@ -159,7 +159,7 @@ ENGINE_DIR = Path(__file__).resolve().parent.parent   # what PYTHONPATH needs fo
 # How the name of a copy of the plugin begins: a top-level module alone in a directory of its own
 # (`run_check`'s `plugin_copy`), which the second run of a reproduction loads (`Engine._reproduction`).
 # That directory exposes no `implement_loop` package, to the command or to a process it starts, and
-# the rest of the name is new on every run, so no module of the code under review can stand in for it.
+# the rest of the name is drawn for each run, so no module written before the run can stand in for it.
 PLUGIN_COPY_PREFIX = "implement_loop_result_plugin_"
 # outcome -> what it means for a check; a worse outcome of the same test wins (as in loop_pytest)
 OUTCOMES = {"passed": "passed", "xfailed": "skipped", "skipped": "skipped", "xpassed": "failed",
@@ -246,14 +246,16 @@ def _pytest_said(output: str, status: int | None) -> str:
     return ""
 
 
-def _notes(cases: dict | None, output: str) -> list[str]:
-    """Why the pytest runs of a command do not prove anything, in words."""
-    if cases is None:
-        if f'Error importing plugin "{PLUGIN}"' in output:
-            return [("pytest could not load the verifier's result plugin; if the command sets PYTHONPATH, "
-                     "extend it (PYTHONPATH=src:$PYTHONPATH) instead of replacing it")]
-        return []
+def _notes(cases: dict | None, output: str, plugin: str = PLUGIN) -> list[str]:
+    """Why the pytest runs of a command do not prove anything, in words. A pytest that could not
+    load the run's result plugin (`plugin`) ran unaccounted, whatever records the others left and
+    whatever the command made of its exit status."""
     notes = []
+    if f'Error importing plugin "{plugin}"' in output:
+        notes.append("pytest could not load the verifier's result plugin; if the command sets PYTHONPATH, "
+                     "extend it (PYTHONPATH=src:$PYTHONPATH) instead of replacing it")
+    if cases is None:
+        return notes
     if cases["failed"]:
         notes.append(f"failed tests: {cases['failed'][:5]}")
     if cases["skipped"]:
@@ -272,11 +274,16 @@ def _notes(cases: dict | None, output: str) -> list[str]:
     return notes + stopped
 
 
+def _recorder(name: str) -> bool:
+    """Whether a plugin name is one a verifier loads its result plugin by: PLUGIN, or a copy."""
+    return name == PLUGIN or name.startswith(PLUGIN_COPY_PREFIX)
+
+
 def without_plugin(addopts: str) -> str:
-    """`addopts` (a PYTEST_ADDOPTS value) without the options that load PLUGIN, read as pytest reads
-    them: split as a shell would, `-p` taking the next word, `-pNAME` joined, the name stripped.
-    Every other word is kept as it was; a value with nothing to remove, or one pytest could not
-    split either, is returned as written."""
+    """`addopts` (a PYTEST_ADDOPTS value) without the options that load a verifier's result plugin
+    (PLUGIN or a copy of it), read as pytest reads them: split as a shell would, `-p` taking the
+    next word, `-pNAME` joined, the name stripped. Every other word is kept as it was; a value with
+    nothing to remove, or one pytest could not split either, is returned as written."""
     try:
         words = shlex.split(addopts)
     except ValueError:
@@ -288,9 +295,9 @@ def without_plugin(addopts: str) -> str:
             name = next(rest, None)
             if name is None:
                 kept.append(word)
-            elif name.strip() != PLUGIN:
+            elif not _recorder(name.strip()):
                 kept += [word, name]
-        elif not (word.startswith("-p") and word[2:].strip() == PLUGIN):
+        elif not (word.startswith("-p") and _recorder(word[2:].strip())):
             kept.append(word)
     return addopts if kept == words else shlex.join(kept)
 
@@ -340,12 +347,10 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
     env.pop("LOOP_PYTEST_PID", None)   # a verification is never nested in an outer one's pytest
     env["LOOP_REPORT_DIR"] = str(report_dir)
     env["LOOP_REPO_ROOT"] = str(Path(root).resolve())
-    addopts, plugin = env.get("PYTEST_ADDOPTS", ""), PLUGIN
-    if plugin_copy is not None:
-        # A verifier run under another's pytest (the engine's own tests, run as a check) inherits
-        # its `-p PLUGIN`, which a command that replaces PYTHONPATH no longer reaches.
-        addopts, plugin = without_plugin(addopts), plugin_copy.stem
-    env["PYTEST_ADDOPTS"] = (addopts + f" -p {plugin} -p no:cacheprovider").strip()
+    # This run's recorder alone: a verifier run under another's pytest (the engine's own tests, run
+    # as a check) inherits that verifier's `-p` of its own, which this command may not reach.
+    plugin = plugin_copy.stem if plugin_copy is not None else PLUGIN
+    env["PYTEST_ADDOPTS"] = (without_plugin(env.get("PYTEST_ADDOPTS", "")) + f" -p {plugin} -p no:cacheprovider").strip()
     plugin_dirs = [ENGINE_DIR, *([plugin_copy.parent] if plugin_copy is not None else [])]
     path = [str(d) for d in plugin_dirs] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     env["PYTHONPATH"] = os.pathsep.join(path)
@@ -371,7 +376,7 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
             notes.append(f"timed out after {timeout} s")
     duration = round(time.monotonic() - start, 2)
     cases = _read_records(report_dir)
-    notes += _notes(cases, output)
+    notes += _notes(cases, output, plugin)
     ev = Evidence(criterion=spec.criterion, kind="command", command=spec.command, cwd=spec.cwd, head_sha=head_sha,
                   exit_code=code, passed=code == 0 and not notes, duration_s=duration,
                   output_tail=output[-OUTPUT_TAIL:], output_sha256=hashlib.sha256(output.encode()).hexdigest(),

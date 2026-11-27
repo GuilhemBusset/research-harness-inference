@@ -2048,7 +2048,8 @@ class Engine:
         `verify.run_check` loads it by that name when given the copy. No `implement_loop` package is
         in `root`: a test, and a process a test starts with the PYTHONPATH it inherits, import the
         code under review's own `implement_loop` if their path has one, and none if not. Nor can a
-        module of the code under review take the copy's place in a pytest: none has its name."""
+        module of the code under review take the copy's place in a pytest: none written before the
+        run has its name."""
         source = verify.ENGINE_DIR.joinpath(*verify.PLUGIN.split(".")).with_suffix(".py")
         copy = root / f"{verify.PLUGIN_COPY_PREFIX}{secrets.token_hex(8)}.py"
         shutil.copyfile(source, copy)

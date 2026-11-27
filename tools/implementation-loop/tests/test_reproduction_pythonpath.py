@@ -235,8 +235,8 @@ def test_a_project_module_named_like_the_copy_cannot_take_the_recorders_place(en
     """Codex's review of the fifth version, which loaded the copy by a fixed name: a module of that
     name earlier on a pytest's `sys.path` (here the current directory of `python -m pytest`) was
     loaded instead, and that pytest recorded nothing. The first pytest's pass was then the run's
-    only record, and the second one's skip went unseen. The copy's name is new on every run, so the
-    project cannot hold it, and both are recorded."""
+    only record, and the second one's skip went unseen. The copy's name is drawn for each run, so
+    no module written before it has that name, and both are recorded."""
     commit(wt, {"sub/implement_loop_result_plugin.py": "# not the recorder\n"})   # the fifth version's name
     probe = TWO.replace("def test_b():\n    pass", "def test_b():\n    import pytest\n    pytest.skip('unseen')")
     command = f"{REPLACES_A} && cd sub && {PY} -m pytest -q ../{B}"
@@ -261,8 +261,35 @@ def test_an_extended_run_under_another_verifiers_pytest_loads_the_copy_alone(eng
     assert (cases["passed"], cases["collected"]) == (["checks/probe_x.py::test_y"], ["checks/probe_x.py::test_y"])
 
 
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+def test_a_later_pytest_of_the_extended_run_that_cannot_load_the_copy_fails_it(engine, wt, monkeypatch):
+    """Codex's review of the sixth version: a later pytest whose path holds the code under
+    review's packaged recorder but not the copy could not load the plugin, its wrapper swallowed
+    that, and the first pytest's pass was the run's only record. A plugin that could not load was
+    heeded only when no pytest left a record; it now fails the run beside one that did."""
+    commit(wt, {"src/implement_loop/__init__.py": "", "src/implement_loop/loop_pytest.py": "# the code's own copy\n"})
+    command = f"{REPLACES_A} && (env PYTHONPATH=src {PY} -m pytest -q {B} || true)"
+    verdict, cases = second_run(engine, wt, command, TWO, monkeypatch)
+    assert verdict is True
+    assert (cases["passed"], cases["processes"]) == ([A], 1)
+
+
+@pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
+def test_a_reproduction_under_another_verifiers_second_run_gets_a_second_run_of_its_own(engine, wt, monkeypatch):
+    """Codex's review of the sixth version: the engine's own tests, run by another verifier's
+    second run, inherited that run's `-p` of its copy. A command that replaced PYTHONPATH then
+    failed on that name first, the note that pytest could not load this verifier's plugin never
+    came, and the reproduction ran only once. Every run now names only its own recorder."""
+    outer = f"{L.engine.verify.PLUGIN_COPY_PREFIX}0123456789abcdef"
+    monkeypatch.setenv("PYTEST_ADDOPTS", f"-p {outer} -p no:cacheprovider")
+    verdict, cases = second_run(engine, wt, REPLACES, PASSES, monkeypatch)
+    assert (verdict, cases["passed"]) == (False, ["checks/probe_x.py::test_x"])
+
+
 @pytest.mark.parametrize(("addopts", "kept"), [
     ("-p implement_loop.loop_pytest -p no:cacheprovider", ["-p", "no:cacheprovider"]),
+    ("-p implement_loop_result_plugin_0123456789abcdef -x", ["-x"]),
+    ("-pimplement_loop_result_plugin_0123456789abcdef", []),
     ("-pimplement_loop.loop_pytest -x", ["-x"]),
     ("-p 'implement_loop.loop_pytest ' -p other", ["-p", "other"]),   # pytest strips the name
     ("--deselect 'a -p implement_loop.loop_pytest b' -p implement_loop.loop_pytest",
@@ -271,7 +298,7 @@ def test_an_extended_run_under_another_verifiers_pytest_loads_the_copy_alone(eng
     ("-p other -p implement_loop.loop_pytest_x", ["-p", "other", "-p", "implement_loop.loop_pytest_x"]),
     ("-p -p implement_loop.loop_pytest", ["-p", "-p", "implement_loop.loop_pytest"]),   # `-p` takes the next word
 ])
-def test_only_the_options_that_load_the_plugin_by_its_package_name_are_left_out(addopts, kept):
+def test_only_the_options_that_load_a_recorder_of_the_verifiers_are_left_out(addopts, kept):
     assert shlex.split(L.engine.verify.without_plugin(addopts)) == kept
 
 
