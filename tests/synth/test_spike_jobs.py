@@ -200,6 +200,14 @@ def test_an_empty_list_gives_none(app_module: ModuleType, tmp_path: Path, templa
     assert found == sorted(f"uv run --locked python spikes/{job.script}" for job in JOBS)
 
 
+def test_the_engine_contract_job_runs_its_script(templates: dict[str, Any]) -> None:
+    (pipeline,) = [template for path, template in templates.items() if path == "RhiPipeline.template.json"]
+    (project,) = [
+        p for p in of_type(pipeline, "AWS::CodeBuild::Project").values() if p.get("Name") == "rhi-spike-engine_contract"
+    ]
+    assert runs_a_spike(project) == ["uv run --locked python spikes/engine_contract.py"]
+
+
 def test_the_first_deploy_creates_the_pipeline_and_connection_before_spike_jobs(
     app_module: ModuleType, tmp_path: Path
 ) -> None:
@@ -276,6 +284,15 @@ def test_every_job_runs_on_the_one_role_log_group_and_key(app_module: ModuleType
             ),
             (("logs:CreateLogStream", "logs:PutLogEvents"), f"<{two.log_group}.Arn>", "{}"),
             (("kms:Decrypt", "kms:DescribeKey", "kms:Encrypt", "kms:GenerateDataKey"), f"<{two.key}.Arn>", "{}"),
+            # The contract check: the one document, the instances of the configuration's pools by
+            # their tag, and what each invocation reported, which AWS grants only on every resource.
+            (("ssm:SendCommand",), here.format("ssm", "document/rhi-engine-contract"), "{}"),
+            (
+                ("ssm:SendCommand",),
+                here.format("ec2", "instance/*"),
+                json.dumps({"StringEquals": {"ssm:resourceTag/rhi-pool": ["coursework", "mock"]}}),
+            ),
+            (("ssm:ListCommandInvocations",), "*", "{}"),
         ]
     )
     # The table is the stage's pool-state table, by the logical ID recorded for it.

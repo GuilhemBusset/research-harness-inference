@@ -41,11 +41,22 @@ then adds a project and nothing else: no statement and no finding.
 - put the measurement event on the measurement bus, through `rhi.pipeline.reporter.measuring_job`;
 - use the pipeline's connection to read the repository: `codeconnections:GetConnection` and
   `codeconnections:GetConnectionToken`, what CodeBuild's user guide asks of a project's role;
-- write to the shared log group, and use the shared key.
+- write to the shared log group, and use the shared key;
+- send the document `rhi-engine-contract` (`rhi.pools.contract_check`), with `ssm:SendCommand`, on
+  that document of the stage's account and region, and on the EC2 instances whose tag `rhi-pool`
+  names a pool of the stage's configuration, under the condition `ssm:resourceTag/rhi-pool`: every
+  instance of a pool carries the tag (`rhi.pools.group`). The document takes no parameter and runs
+  only the release's own contract check, so this runs that check on a pool's instances and nothing
+  else. IAM reads the condition on each resource the call names, and the document carries no such
+  tag, so the right is two statements: the document alone, and the instances under the condition;
+- read each invocation's status and what its step printed, `ssm:ListCommandInvocations`, which
+  AWS grants only on every resource.
 
 No action of Auto Scaling, EC2 or IAM: a spike reaches a pool through the gateway, as a canary
-student, and changes nothing of one but the mock pool's session. No job can book a GPU pool: the
-session of any other pool, and the session switch, are under another partition key.
+student, and changes nothing of one but the mock pool's session; the job `engine_contract` sends
+that one document by the tag, and so names no instance and reads nothing of EC2 or Auto Scaling.
+No job can book a GPU pool: the session of any other pool, and the session switch, are under
+another partition key.
 """
 
 from __future__ import annotations
@@ -64,6 +75,8 @@ from constructs import Construct
 from rhi.observability.stack import STAGE_TAG
 from rhi.pipeline import reporter
 from rhi.pipeline.synth import UV_VERSION, config_reader, import_path
+from rhi.pools.contract_check import DOCUMENT_NAME
+from rhi.pools.group import POOL_TAG
 from rhi.stage import EndpointStage
 from rhi_common.spike_keys import SPIKE_KEYS_SECRET
 
@@ -93,6 +106,9 @@ POOL_STATE_READS = ["dynamodb:GetItem", "dynamodb:Query"]
 # the role may write, with this one action.
 MOCK_POOL = "mock"
 POOL_STATE_WRITES = ["dynamodb:PutItem"]
+# What sends the contract check to a pool's instances, and reads what each invocation printed.
+CONTRACT_SENDS = ["ssm:SendCommand"]
+CONTRACT_READS = ["ssm:ListCommandInvocations"]
 
 
 @dataclass(frozen=True)
@@ -132,6 +148,7 @@ JOBS: tuple[SpikeJob, ...] = (
     SpikeJob("s3_harness_task", "s3_harness_task.py"),
     SpikeJob("s3_second_session", "s3_second_session.py"),
     SpikeJob("dry_run_class", "dry_run_class.py"),
+    SpikeJob("engine_contract", "engine_contract.py"),
 )
 
 
@@ -274,4 +291,20 @@ class SpikeJobs(Construct):
                     conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [MOCK_POOL]}},
                 )
             )
+            # The contract check: the one document, and the instances of the configuration's pools
+            # by their tag. The condition is on a statement of its own, since the document carries
+            # no such tag.
+            document = stack.format_arn(service="ssm", resource="document", resource_name=DOCUMENT_NAME)
+            instances = stack.format_arn(service="ec2", resource="instance", resource_name="*")
+            pools = sorted(pool.name for pool in stage.config.pools)
+            statements.append(iam.PolicyStatement(actions=CONTRACT_SENDS, resources=[document]))
+            statements.append(
+                iam.PolicyStatement(
+                    actions=CONTRACT_SENDS,
+                    resources=[instances],
+                    conditions={"StringEquals": {f"ssm:resourceTag/{POOL_TAG}": pools}},
+                )
+            )
+            # Run Command grants listing invocations only on every resource.
+            statements.append(iam.PolicyStatement(actions=CONTRACT_READS, resources=["*"]))
         return statements
