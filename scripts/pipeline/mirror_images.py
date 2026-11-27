@@ -108,11 +108,41 @@ def parse(reference: str) -> Image:
     return Image(path="/".join(parts), tag=tag if colon else None, digest=digest)
 
 
+def instructions(dockerfile: str) -> list[str]:
+    """The instructions of `dockerfile`, each on one line: a line that ends in the escape character,
+    `\\` or the one a `# escape=` directive names, goes on on the next line, and a comment line
+    inside an instruction is left out, as Docker reads them."""
+    lines = dockerfile.splitlines()
+    escape = "\\"
+    for line in lines:
+        directive = re.fullmatch(r"\s*#\s*(\w+)\s*=\s*(\S*)\s*", line)
+        if directive is None:
+            break
+        if directive[1].lower() == "escape" and directive[2] in ("\\", "`"):
+            escape = directive[2]
+    joined: list[str] = []
+    pending: str | None = None
+    for line in lines:
+        if pending is not None and line.lstrip().startswith("#"):
+            continue
+        stripped = line.rstrip()
+        continued = stripped.endswith(escape)
+        part = stripped[: -len(escape)] if continued else line
+        pending = part if pending is None else f"{pending} {part}"
+        if not continued:
+            joined.append(pending)
+            pending = None
+    if pending is not None:
+        joined.append(pending)
+    return joined
+
+
 def from_images(dockerfile: str) -> list[str]:
-    """The image of each FROM line of `dockerfile`, but `scratch` and a stage of the same file."""
+    """The image of each FROM instruction of `dockerfile`, but `scratch` and a stage of the same
+    file."""
     stages: set[str] = set()
     images = []
-    for line in dockerfile.splitlines():
+    for line in instructions(dockerfile):
         match = FROM_LINE.match(line)
         if match is None:
             continue

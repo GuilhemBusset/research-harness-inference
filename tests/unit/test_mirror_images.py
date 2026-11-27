@@ -86,8 +86,8 @@ def test_lists_from_lines_but_scratch_and_stages_and_refuses_an_unpinned_image(t
     service = tmp_path / "services/one"
     service.mkdir(parents=True)
     (service / "Dockerfile").write_text(
-        f"FROM --platform=$BUILDPLATFORM python:3@{pin} AS build\nFROM build AS test\nFROM scratch\n"
-        f"from owner/tool@{pin}\n"
+        f"FROM --platform=$BUILDPLATFORM python:3@{pin} \\\n    # a comment inside the instruction\n"
+        f"    AS build\nFROM build AS test\nFROM scratch\nfrom owner/tool@{pin}\n"
     )
     assert [(i.path, i.tag) for i in mirror_images.listed(tmp_path)] == [
         ("library/python", "3"),

@@ -40,7 +40,9 @@ PULL_PUSH_DESCRIBE = {
     "ecr:PutImage",
     "ecr:DescribeImages",
 }
-UNDER_THE_PREFIX = "arn:<>:ecr:<>:<>:repository/rhi-mirror/*"
+# Partition, region and account of the deploying environment, each in its own field.
+IN_THE_DEPLOYING_ACCOUNT = "arn:<AWS::Partition>:{service}:<AWS::Region>:<AWS::AccountId>"
+UNDER_THE_PREFIX = IN_THE_DEPLOYING_ACCOUNT.format(service="ecr") + ":repository/rhi-mirror/*"
 
 
 def as_list(value: Any) -> list[Any]:
@@ -48,15 +50,15 @@ def as_list(value: Any) -> list[Any]:
 
 
 def text(value: Any) -> str:
-    """A value of the template as text, `<>` in place of each pseudo parameter and `<Name>` or
-    `<Name.Attribute>` in place of each resource."""
+    """A value of the template as text, `<Name>` in place of each pseudo parameter or resource it
+    refers to, and `<Name.Attribute>` in place of each attribute."""
     if isinstance(value, str):
         return value
     ((function, argument),) = value.items()
     if function == "Fn::Join":
         return argument[0].join(text(part) for part in argument[1])
     if function == "Ref":
-        return "<>" if argument.startswith("AWS::") else f"<{argument}>"
+        return f"<{argument}>"
     assert function == "Fn::GetAtt", value
     return f"<{'.'.join(argument)}>"
 
@@ -129,12 +131,12 @@ def test_the_mirror_s_role_reaches_the_token_and_the_repositories_under_rhi_mirr
         *((action, mirror.artifacts) for action in ("s3:GetBucket*", "s3:GetObject*", "s3:List*")),
         *((action, f"{mirror.artifacts}/*") for action in ("s3:GetBucket*", "s3:GetObject*", "s3:List*")),
         *(
-            (action, f"arn:<>:logs:<>:<>:log-group:/aws/codebuild/{mirror.own}{suffix}")
+            (action, IN_THE_DEPLOYING_ACCOUNT.format(service="logs") + f":log-group:/aws/codebuild/{mirror.own}{suffix}")
             for action in ("logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents")
             for suffix in ("", ":*")
         ),
         *(
-            (action, f"arn:<>:codebuild:<>:<>:report-group/{mirror.own}-*")
+            (action, IN_THE_DEPLOYING_ACCOUNT.format(service="codebuild") + f":report-group/{mirror.own}-*")
             for action in (
                 "codebuild:CreateReportGroup",
                 "codebuild:CreateReport",
