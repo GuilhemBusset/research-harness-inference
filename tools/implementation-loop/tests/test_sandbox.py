@@ -751,15 +751,13 @@ class EngineGitTests(SandboxCase):
         self.assertEqual(started, [])
 
         # Without the engine's setting a commit starts maintenance, and the trace shows it. The
-        # control says so itself, whatever the launching shell's git configuration, and has git
-        # wait for that maintenance rather than leave it running after the test.
-        asked = {"GIT_CONFIG_COUNT": "3",
-                 "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "true",
-                 "GIT_CONFIG_KEY_1": "maintenance.autoDetach", "GIT_CONFIG_VALUE_1": "false",
-                 "GIT_CONFIG_KEY_2": "gc.autoDetach", "GIT_CONFIG_VALUE_2": "false"}
+        # control asks for it on its own command line, which outranks whatever the launching git or
+        # shell configured, and has git wait for it rather than leave it running after the test.
         (self.wt / "more.txt").write_text("z\n")
-        with mock.patch.dict(os.environ, asked), traced(self.repo) as started:
-            self.assertTrue(self.ws.commit_all(self.wt, "Build #7", "implementation", 7))
+        git("add", "more.txt", cwd=self.wt)
+        with traced(self.repo) as started:
+            git("-c", "maintenance.auto=true", "-c", "maintenance.autoDetach=false", "-c", "gc.autoDetach=false",
+                "commit", "-q", "-m", "control", cwd=self.wt)
         self.assertTrue(started)
 
 
