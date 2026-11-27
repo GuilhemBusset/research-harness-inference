@@ -52,7 +52,9 @@ class Client:
     def __init__(self) -> None:
         self.posted: list[tuple[str, str, str, str]] = []
 
-    def post_status(self, commit: str, state: str, context: str, description: str) -> None:
+    def post_status(
+        self, commit: str, state: str, context: str, description: str, *, deadline: float | None = None
+    ) -> None:
         self.posted.append((commit, state, context, description))
 
     def last(self, commit: str, context: str) -> tuple[str, str] | None:

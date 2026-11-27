@@ -18,8 +18,9 @@ import threading
 import time
 import tomllib
 import traceback
+import urllib.parse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 import boto3
 import jwt
@@ -39,7 +40,16 @@ REPOSITORY = "octo-org/hello.world"
 COMMIT = "c0ffee" * 6 + "abcd"
 EXCHANGE = f"/app/installations/{INSTALLATION_ID}/access_tokens"
 STATUS = f"/repos/{REPOSITORY}/statuses/{COMMIT}"
-POSTED = {"state": "success", "context": "deploy/prod", "description": "Deployed"}
+LIST = f"/repos/{REPOSITORY}/commits/{COMMIT}/statuses"
+
+
+class Posted(TypedDict):
+    state: str
+    context: str
+    description: str
+
+
+POSTED: Posted = {"state": "success", "context": "deploy/prod", "description": "Deployed"}
 # What a stub says in its own words, which no error and no log may repeat.
 MARKER = "said-by-the-stub " + secrets.token_hex(8)
 
@@ -57,21 +67,57 @@ class Stub:
         self.secret_reads = 0
         self.now = float(int(time.time()))
         self.refusals: dict[str, tuple[int, Any]] = {}
+        # Answers given once each, in turn, before the path is answered as usual: status, JSON, headers.
+        self.queued: dict[str, list[tuple[int, Any, dict[str, str]]]] = {}
         self.paths: list[str] = []
+        self.calls: list[tuple[str, str]] = []
+        # When each status was asked for, on the shared clock, and each wait the client made.
+        self.attempts: list[float] = []
+        self.sleeps: list[float] = []
+        # The statuses the commit holds, newest first, and how many a page lists.
+        self.listed: list[dict[str, Any]] = []
+        self.page_size = 100
+        self.next_page: str | None = None
         self.app_tokens: list[str] = []
         self.tokens: list[str] = []
         self.statuses: list[tuple[str, Any]] = []
         self.url = ""
 
-    def answer(self, path: str, target: str | None, bearer: str, body: Any) -> tuple[int, Any]:
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def answer(
+        self, method: str, target_path: str, target: str | None, bearer: str, body: Any
+    ) -> tuple[int, Any, dict[str, str]]:
         if target == "secretsmanager.GetSecretValue":
             self.secret_reads += 1
             if self.secret is None:
-                return 400, {"__type": "ResourceNotFoundException", "Message": MARKER}
-            return 200, {"Name": body["SecretId"], "SecretString": json.dumps(self.secret)}
+                return 400, {"__type": "ResourceNotFoundException", "Message": MARKER}, {}
+            return 200, {"Name": body["SecretId"], "SecretString": json.dumps(self.secret)}, {}
+        path, _, query = target_path.partition("?")
         self.paths.append(path)
+        self.calls.append((method, path))
+        if path == STATUS:
+            self.attempts.append(self.now)
+        if self.queued.get(path):
+            return self.queued[path].pop(0)
         if path in self.refusals:
-            return self.refusals[path]
+            return (*self.refusals[path], {})
+        if method == "GET":
+            return self.page(path, query, bearer)
+        return (*self.created(path, bearer, body), {})
+
+    def page(self, path: str, query: str, bearer: str) -> tuple[int, Any, dict[str, str]]:
+        if path != LIST or not self.tokens or bearer != self.tokens[-1]:
+            return 404, {"message": "Not Found"}, {}
+        number = int(urllib.parse.parse_qs(query).get("page", ["1"])[0])
+        listed = self.listed[(number - 1) * self.page_size : number * self.page_size]
+        more = number * self.page_size < len(self.listed)
+        following = self.next_page or f"{self.url}{LIST}?per_page=100&page={number + 1}"
+        return 200, listed, {"Link": f'<{following}>; rel="next"'} if more else {}
+
+    def created(self, path: str, bearer: str, body: Any) -> tuple[int, Any]:
         if path == EXCHANGE:
             try:
                 claims = jwt.decode(
@@ -99,15 +145,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
     stub: Stub
 
     def do_POST(self) -> None:
+        self.answer("POST")
+
+    def do_GET(self) -> None:
+        self.answer("GET")
+
+    def answer(self, method: str) -> None:
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
-        status, answer = self.stub.answer(
-            self.path, self.headers.get("X-Amz-Target"), bearer, json.loads(body or b"null")
+        status, answer, headers = self.stub.answer(
+            method, self.path, self.headers.get("X-Amz-Target"), bearer, json.loads(body or b"null")
         )
         if not status:
             return  # the connection closes with no answer
         data = json.dumps(answer).encode()
         self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -132,8 +186,10 @@ def stub(key: rsa.RSAPrivateKey, caplog: pytest.LogCaptureFixture) -> Iterator[S
     yield stub
     server.shutdown()
     server.server_close()
-    # Whatever the test did, the client asked GitHub for a token or to create a status, and no more.
-    assert set(stub.paths) <= {EXCHANGE, STATUS}
+    # Whatever the test did, the client asked GitHub for a token or to create a status, and
+    # otherwise only read the commit's statuses.
+    assert {path for method, path in stub.calls if method != "GET"} <= {EXCHANGE, STATUS}
+    assert {path for method, path in stub.calls if method == "GET"} <= {LIST}
 
 
 @pytest.fixture
@@ -148,7 +204,7 @@ def client(stub: Stub, monkeypatch: pytest.MonkeyPatch) -> github.StatusClient:
         aws_access_key_id="stub",
         aws_secret_access_key="stub",
     )
-    return github.StatusClient(aws, api_url=stub.url, clock=lambda: stub.now)
+    return github.StatusClient(aws, api_url=stub.url, clock=lambda: stub.now, sleep=stub.sleep)
 
 
 def shown(error: BaseException) -> str:
@@ -248,6 +304,135 @@ def test_a_refused_call_is_reported_by_its_status_and_code_only(
         assert token not in shown(caught.value)
 
 
+def test_a_status_refused_with_a_retry_after_is_posted_again_once_it_has_passed(
+    stub: Stub, client: github.StatusClient
+) -> None:
+    stub.queued[STATUS] = [(429, {"message": MARKER}, {"Retry-After": "2"})]
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 30)
+    assert len(stub.attempts) == 2
+    assert stub.attempts[1] - stub.attempts[0] == 2
+    assert len(stub.statuses) == 1
+
+
+def test_a_wait_that_would_end_after_the_deadline_is_raised_not_waited(stub: Stub, client: github.StatusClient) -> None:
+    stub.queued[STATUS] = [(429, {"message": MARKER}, {"Retry-After": "2"})]
+    with pytest.raises(github.RefusedError) as caught:
+        client.post_status(COMMIT, **POSTED, deadline=stub.now + 1)
+    assert caught.value.status == 429
+    assert (len(stub.attempts), stub.sleeps, stub.statuses) == (1, [], [])
+
+
+@pytest.mark.parametrize(
+    ("answers", "waits"),
+    [
+        ([(429, {}, {})], [1]),
+        ([(403, {}, {"Retry-After": "3"})], [3]),
+        ([(403, {}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "+5"})], [5]),
+        ([(0, None, {})], [1]),
+        ([(502, {}, {})] * 5, [1, 2, 4, 8, 8]),
+    ],
+    ids=["429", "403-retry-after", "403-rate-limit-reset", "no-answer", "5xx-doubled"],
+)
+def test_a_temporary_refusal_is_waited_out_until_the_deadline(
+    stub: Stub, client: github.StatusClient, answers: list[tuple[int, Any, dict[str, str]]], waits: list[float]
+) -> None:
+    reset = {"X-RateLimit-Reset": str(int(stub.now) + 5)}
+    stub.queued[STATUS] = [
+        (status, answer, headers | reset if headers.get("X-RateLimit-Reset") else headers)
+        for status, answer, headers in answers
+    ]
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 60)
+    assert stub.sleeps == waits
+    assert len(stub.statuses) == 1
+
+
+def test_a_retry_after_of_0_or_a_reset_that_has_come_is_posted_again_at_once(
+    stub: Stub, client: github.StatusClient
+) -> None:
+    come = (403, {}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(stub.now))})
+    stub.queued[STATUS] = [come]
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 0.5)
+    assert (len(stub.attempts), stub.sleeps, len(stub.statuses)) == (2, [], 1)
+
+    # A retry-after of 0 is waited at once each time GitHub gives it.
+    stub.attempts.clear()
+    stub.queued[STATUS] = [(429, {}, {"Retry-After": "0"})] * 2
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 0.5)
+    assert (len(stub.attempts), stub.sleeps, len(stub.statuses)) == (3, [], 2)
+
+    # A reset that has come, not twice in a row: GitHub is not asked again and again with no wait.
+    stub.attempts.clear()
+    stub.queued[STATUS] = [come, come]
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 60)
+    assert (len(stub.attempts), stub.sleeps) == (3, [2])
+
+
+@pytest.mark.parametrize("lost", [(0, None), (502, {"message": MARKER})], ids=["no-answer", "5xx"])
+@pytest.mark.parametrize("saved", [True, False], ids=["saved", "not-saved"])
+def test_a_status_github_took_without_saying_so_is_not_posted_twice(
+    stub: Stub, client: github.StatusClient, monkeypatch: pytest.MonkeyPatch, lost: tuple[int, Any], saved: bool
+) -> None:
+    stub.listed = [{"id": 7, **POSTED}]  # the same status, posted before: older than `newer_than`
+    created = stub.created
+    answers = [lost]
+
+    def create(path: str, bearer: str, body: Any) -> tuple[int, Any]:
+        code, answer = created(path, bearer, body)
+        if path != STATUS:
+            return code, answer
+        if saved or not answers:
+            stub.listed.insert(0, {"id": stub.listed[0]["id"] + 1, **body})
+        return answers.pop(0) if answers else (code, answer)
+
+    monkeypatch.setattr(stub, "created", create)
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 60, newer_than=7)
+    assert len(stub.attempts) == (1 if saved else 2)
+    assert [one["id"] for one in stub.listed] == [8, 7]
+
+
+@pytest.mark.parametrize(
+    ("answer", "deadline"),
+    [
+        ((403, {"message": MARKER}, {}), 60),
+        ((422, {"errors": [{"code": "custom"}]}, {"Retry-After": "1"}), 60),
+        ((429, {}, {"Retry-After": "1"}), None),
+    ],
+    ids=["403-without-a-rate-limit", "422", "no-deadline"],
+)
+def test_any_other_refusal_is_raised_without_waiting(
+    stub: Stub, client: github.StatusClient, answer: tuple[int, Any, dict[str, str]], deadline: int | None
+) -> None:
+    stub.queued[STATUS] = [answer]
+    with pytest.raises(github.RefusedError) as caught:
+        client.post_status(COMMIT, **POSTED, deadline=None if deadline is None else stub.now + deadline)
+    assert caught.value.status == answer[0]
+    assert (len(stub.attempts), stub.sleeps, stub.statuses) == (1, [], [])
+
+
+def test_the_statuses_of_a_commit_are_read_from_every_page_whole(stub: Stub, client: github.StatusClient) -> None:
+    # As GitHub lists them, each with its creator's record: a page holds far more than one answer.
+    creator = {"login": "rhi-reporter[bot]", "type": "Bot", "url": "https://example.com/" + "x" * 900}
+    stub.listed = [
+        {"id": number, "context": f"measure/S5/run/{number}", "state": "success", "description": None if number == 1 else f"n={number}",
+         "creator": creator, "created_at": "2026-11-27T12:00:00Z"}
+        for number in range(150, 0, -1)
+    ]  # fmt: skip
+    assert len(json.dumps(stub.listed[:100])) > github.ANSWER_BYTES
+
+    found = client.statuses(COMMIT)
+    assert [one["id"] for one in found] == list(range(150, 0, -1))
+    assert found[-1] == {"id": 1, "context": "measure/S5/run/1", "state": "success", "description": ""}
+    assert [method for method, path in stub.calls if path == LIST] == ["GET", "GET"]
+
+
+def test_a_next_page_elsewhere_than_github_s_api_is_not_asked_for(stub: Stub, client: github.StatusClient) -> None:
+    stub.listed = [{"id": number, "context": "c", "state": "success", "description": ""} for number in range(3)]
+    stub.page_size, stub.next_page = 2, "https://example.com/elsewhere"
+    with pytest.raises(github.RefusedError):
+        client.statuses(COMMIT)
+    assert [path for _, path in stub.calls] == [EXCHANGE, LIST]
+
+
 @pytest.mark.parametrize(
     ("repository", "commit"),
     [("no-owner", COMMIT), ("octo-org/hello/../../other", COMMIT), (REPOSITORY, "main")],
@@ -267,7 +452,7 @@ def test_only_a_repository_and_a_full_sha_make_the_address(
 def test_a_commit_status_is_the_only_write() -> None:
     # The stub fixture checks, after every test above, that no other address of GitHub was asked.
     public = [name for name in vars(github.StatusClient) if not name.startswith("_")]
-    assert public == ["post_status"]
+    assert public == ["post_status", "statuses"]
 
 
 def test_the_client_adds_no_dependency() -> None:
