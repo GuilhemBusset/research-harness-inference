@@ -16,6 +16,7 @@ import itertools
 import json
 import selectors
 import threading
+import urllib.error
 import urllib.request
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -1321,7 +1322,9 @@ def _through(
     real = s8.loadgen.replay
 
     async def replay(*given: Any, **named: Any) -> list[s8.loadgen.Record]:
-        records = await real(*given, clock=loop.time, sleep=asyncio.sleep, transport=gateway, **named)
+        # The job's own wait, if it gives one, is the one the replay waits.
+        named.setdefault("sleep", asyncio.sleep)
+        records = await real(*given, clock=loop.time, transport=gateway, **named)
         replayed.extend(records)
         return records
 
@@ -1336,14 +1339,21 @@ def _through(
     monkeypatch.setattr(s8, "_wait", wait)
 
 
+@pytest.mark.parametrize("held_up", [0, 5])
 def test_the_held_load_stays_under_half_the_per_address_rule_until_both_instances_serve(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, held_up: float
 ) -> None:
+    # `held_up`: seconds for which the job's event loop runs nothing, once the gateway holds 30
+    # requests, so that the streams' waits that end then all end late, at once.
     assert s8.RATE_WINDOW_SECONDS == _RateRule.RATE_WINDOW
     replayed: list[s8.loadgen.Record] = []
 
     async def work(loop: _VirtualLoop) -> tuple[dict[str, str], _RateRule, float]:
-        gateway = _RateRule(loop.time, PER_ADDRESS)
+        def hold_up(number: int, request: httpx.Request) -> None:
+            if number == 30:
+                loop.now += held_up
+
+        gateway = _RateRule(loop.time, PER_ADDRESS, hold_up)
         _through(monkeypatch, loop, gateway, replayed)
         # Both serve 600 seconds after the load's first request.
         pool = _Serving(lambda: bool(gateway.arrivals) and loop.time() >= gateway.arrivals[0] + 600)
@@ -1455,6 +1465,23 @@ class _CutLate(httpx.AsyncByteStream):
         yield b""
 
 
+def test_a_stream_in_flight_when_a_held_stream_ends_is_counted_when_it_ends_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def work(loop: _VirtualLoop) -> str:
+        # The first request's connection fails a minute later; the second, sent meanwhile, is refused.
+        answers = {1: lambda: httpx.Response(200, stream=_CutLate()), 2: lambda: httpx.Response(403, text=MARKER)}
+        gateway = _RateRule(loop.time, PER_ADDRESS, lambda number, request: answers[number]())
+        _through(monkeypatch, loop, gateway, [])
+        run = dataclasses.replace(_held_run(_Serving(lambda: False)), target_concurrency=1)
+        with pytest.raises(RuntimeError) as failed:
+            await run.two_instances()
+        return str(failed.value)
+
+    line = _on_virtual_time(work)
+    assert "403 (1)" in line and "read_error (1)" in line and MARKER not in line
+
+
 def test_a_request_that_fails_after_both_instances_serve_is_no_early_end(monkeypatch: pytest.MonkeyPatch) -> None:
     async def work(loop: _VirtualLoop) -> dict[str, str]:
         cut: list[float] = []
@@ -1477,11 +1504,12 @@ def test_a_request_that_fails_after_both_instances_serve_is_no_early_end(monkeyp
     assert _on_virtual_time(work) == BOTH
 
 
-def test_a_held_stream_s_end_seen_during_the_last_observation_outweighs_the_wait_s_timeout(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("observation", ["timed out", "failed"])
+def test_a_held_stream_s_end_seen_during_the_last_observation_outweighs_how_the_wait_ended(
+    monkeypatch: pytest.MonkeyPatch, observation: str
 ) -> None:
-    # The pool's last observation, before the wait's deadline, is read while a held stream is
-    # answered 403: the observation shows nothing serving, and the deadline has passed once it returns.
+    # The pool's last observation is read while a held stream is answered 403: either it shows
+    # nothing serving and the wait's deadline has passed once it returns, or the workspace fails it.
     async def work() -> str:
         loop = asyncio.get_running_loop()
         observing, recorded = asyncio.Event(), threading.Event()
@@ -1491,6 +1519,8 @@ def test_a_held_stream_s_end_seen_during_the_last_observation_outweighs_the_wait
                 loop.call_soon_threadsafe(observing.set)
                 if not recorded.wait(5):
                     raise AssertionError("the held stream was not answered")
+                if observation == "failed":
+                    raise urllib.error.URLError(MARKER)
                 return {}
 
         async def answer(request: httpx.Request) -> httpx.Response:
