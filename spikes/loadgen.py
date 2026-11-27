@@ -477,8 +477,10 @@ def cause_of(data: Mapping[str, Any]) -> str | None:
     for holder in holders:
         if isinstance(holder, dict):
             for field in ("type", "code"):
-                if holder.get(field) in _CAUSES:
-                    return holder[field]
+                # Only a name can be a cause: an object or a list in its place is not one.
+                value = holder.get(field)
+                if isinstance(value, str) and value in _CAUSES:
+                    return value
     return None
 
 
