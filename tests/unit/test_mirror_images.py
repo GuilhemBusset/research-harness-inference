@@ -107,10 +107,11 @@ def test_lists_from_lines_but_scratch_and_stages_and_refuses_an_unpinned_image(t
         "# escape=`\nFROM python@{pin}\n",
         "# syntax=docker/dockerfile:1\nFROM python@\\\n{pin} AS base\n",
         "# escape=`\nFROM python@`\n\n# a comment\n{pin}\n",
+        "# syntax=docker/dockerfile:1\n\n# a comment that ends in the escape character \\\nFROM python@{pin}\n",
     ],
-    ids=["after-a-directive", "within-the-reference", "escape-directive"],
+    ids=["after-a-directive", "within-the-reference", "escape-directive", "after-a-comment-ending-in-escape"],
 )
-def test_lists_a_pinned_base_after_a_directive_or_across_an_escaped_newline(
+def test_lists_a_pinned_base_after_a_directive_a_comment_or_across_an_escaped_newline(
     tmp_path: Path, dockerfile: str
 ) -> None:
     pin = "sha256:" + "b" * 64

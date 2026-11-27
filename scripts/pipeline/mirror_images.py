@@ -112,7 +112,8 @@ def instructions(dockerfile: str) -> list[str]:
     """The instructions of `dockerfile`, each on one line, as BuildKit's parser reads them: the
     parser directives at the top of the file are no instruction; a line that ends in the escape
     character, `\\` or the one a `# escape=` directive names, goes on on the next line, joined with
-    nothing in between; and a comment line or an empty line inside an instruction is left out."""
+    nothing in between; and a comment line or an empty line is left out, inside an instruction or
+    not, so a comment that ends in the escape character continues nothing."""
     lines = dockerfile.splitlines()
     escape = "\\"
     directives = 0
@@ -126,7 +127,7 @@ def instructions(dockerfile: str) -> list[str]:
     joined: list[str] = []
     pending: str | None = None
     for line in lines[directives:]:
-        if pending is not None and (line.lstrip().startswith("#") or not line.strip()):
+        if line.lstrip().startswith("#") or not line.strip():
             continue
         stripped = line.rstrip()
         continued = stripped.endswith(escape)
