@@ -326,5 +326,12 @@ def test_each_job_has_its_entrys_timeout(templates: dict[str, Any]) -> None:
     projects = of_type(pipeline, "AWS::CodeBuild::Project").values()
     timeouts = {project["Name"]: project["TimeoutInMinutes"] for project in projects if runs_a_spike(project)}
     assert timeouts == {job.project_name: job.timeout_hours * 60 for job in JOBS}
+    # Each script is given its build's minutes, so that a job that waits ends within them.
+    given = {
+        project["Name"]: {v["Name"]: v["Value"] for v in project["Environment"]["EnvironmentVariables"]}
+        for project in projects
+        if runs_a_spike(project)
+    }
+    assert {name: int(variables["RHI_SPIKE_BUILD_MINUTES"]) for name, variables in given.items()} == timeouts
     with pytest.raises(ValueError, match="timeout"):
         SpikeJob("long_spike", "long_spike.py", timeout_hours=37)

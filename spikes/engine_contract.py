@@ -20,13 +20,24 @@ of EC2 or Auto Scaling: Run Command finds the instances by the tag.
 now. Otherwise it writes `job_failed` with the reason and sends nothing.
 
 **The wait.** The run's minutes start when the session check admits the run, and the send and
-every read of the invocations are taken out of them. Run Command resolves the tag into
-invocations, one for each instance, and lists them as it does (`ListCommandInvocations`), so an
-invocation may appear at any time after the command was sent, and nothing the role may read says
-how many instances the tag reaches. So the job reads the list every `POLL_SECONDS` until the run's
-minutes end, and records each instance's last listing read within them: a page of the list that
-comes back once they have ended is not taken, and an invocation that has not ended by then does
-not pass. When a read fails, the job records what it read until then, and then the error.
+every read of the invocations are taken out of them: no request to Systems Manager starts once they
+have ended, the send none at their end, so none is made after the session the check read has ended.
+Run Command resolves the tag into invocations, one for each instance, and lists them as it does
+(`ListCommandInvocations`), so an invocation may appear at any time after the command was sent,
+and nothing the role may read says how many instances the tag reaches. So the job reads the list
+every `POLL_SECONDS` until the run's minutes end, and records each instance's last listing read
+within them: a page of the list that comes back once they have ended is not taken, and an
+invocation that has not ended by then does not pass. A listing the end of the run's minutes cut
+after a page that said more follow is incomplete: what it read is recorded, and the job fails with
+`IncompleteListing`. When a read fails, the job records what it read until then, and then the
+error.
+
+**Within the build.** A build ends at its project's timeout, which the project gives the job as
+`RHI_SPIKE_BUILD_MINUTES` (`rhi.pipeline.spikes`), counted from CodeBuild's
+`CODEBUILD_START_TIME`, or from the job's own start outside a build. A run whose minutes, with
+`BUILD_MARGIN_SECONDS` to write what it read, would end after that is refused before anything is
+read or sent (`RunOutlastsBuild`); one admitted later than that allows still ends its wait in time.
+A run whose minutes ended before the command could be sent fails with `RunElapsed`, nothing sent.
 
 **What is recorded**, one JSON object a line on standard output, which the spike jobs' log group
 keeps. Every line has `at`, its UTC time, and `kind`:
@@ -57,6 +68,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import boto3
+import botocore.config
 import botocore.exceptions
 
 import common
@@ -87,6 +99,37 @@ OTHER = "other"
 POLL_SECONDS = 10
 # What Run Command answers for a command it does not list yet.
 NOT_LISTED_YET = "InvalidCommandId"
+# What CodeBuild gives a build: the minutes its project lets it run (`rhi.pipeline.spikes`), and
+# the time it started, in milliseconds since the epoch.
+BUILD_MINUTES_VARIABLE = "RHI_SPIKE_BUILD_MINUTES"
+BUILD_START_VARIABLE = "CODEBUILD_START_TIME"
+# Seconds kept, at the end of a build, for a request started at the end of the run's minutes to
+# come back, bounded by `SSM_CLIENT`, and for the lines to be written.
+BUILD_MARGIN_SECONDS = 300
+# Each request to Systems Manager ends within about two minutes, its retries included.
+SSM_CLIENT = botocore.config.Config(
+    connect_timeout=10, read_timeout=30, retries={"mode": "standard", "total_max_attempts": 3}
+)
+
+
+class RunOutlastsBuild(Exception):
+    """The run's minutes would end after the build does."""
+
+
+class RunElapsed(Exception):
+    """The run's minutes ended before the command could be sent."""
+
+
+class IncompleteListing(Exception):
+    """The run's minutes ended within a listing of the invocations that said more follow."""
+
+
+class Listing(StrEnum):
+    """How one listing of the invocations ended."""
+
+    WHOLE = "whole"  # every page, within the run's minutes
+    LATE = "late"  # nothing of it taken: the listing before it stands
+    CUT = "cut"  # some pages taken, and one more known that was not
 
 
 class Line(StrEnum):
@@ -142,24 +185,28 @@ def output_of(invocation: Mapping[str, Any]) -> str:
 
 def read_invocations(
     ssm: Any, command_id: str, held: dict[str, Mapping[str, Any]], *, deadline: float, now: Callable[[], float]
-) -> bool:
+) -> Listing:
     """Reads every invocation of the command Run Command lists now into `held`, by instance, page by
-    page, an instance first held keeping its place; none for a command it does not list yet. A page
-    that comes back after `deadline` is not taken: False then, True otherwise."""
+    page, an instance first held keeping its place; none for a command it does not list yet. No
+    request starts after `deadline`, and a page that comes back after it is not taken: LATE when
+    that stops the first page, CUT when it stops a later one, WHOLE otherwise."""
     asked: dict[str, Any] = {"CommandId": command_id, "Details": True}
     while True:
+        stopped = Listing.CUT if "NextToken" in asked else Listing.LATE
+        if now() > deadline:
+            return stopped
         try:
             page = ssm.list_command_invocations(**asked)
         except botocore.exceptions.ClientError as error:
             if error.response.get("Error", {}).get("Code") == NOT_LISTED_YET and "NextToken" not in asked:
-                return now() <= deadline
+                return Listing.WHOLE if now() <= deadline else Listing.LATE
             raise
         if now() > deadline:
-            return False
+            return stopped
         for invocation in page.get("CommandInvocations", []):
             held[str(invocation.get("InstanceId"))] = invocation
         if not page.get("NextToken"):
-            return True
+            return Listing.WHOLE
         asked["NextToken"] = page["NextToken"]
 
 
@@ -171,9 +218,12 @@ def check(
     deadline: float,
     now: Callable[[], float],
     sleep: Callable[[float], None],
-) -> None:
+) -> Listing:
     """Sends the document to the pool's instances, by the tag, and reads its invocations into
-    `held` until `deadline` (module docstring, "The wait")."""
+    `held` until `deadline` (module docstring, "The wait"); how the last listing ended. `RunElapsed`,
+    nothing sent, once `deadline` has come."""
+    if now() >= deadline:
+        raise RunElapsed
     sent = ssm.send_command(
         DocumentName=DOCUMENT,
         Targets=[{"Key": f"tag:{POOL_TAG}", "Values": [pool]}],
@@ -183,7 +233,13 @@ def check(
         TimeoutSeconds=max(30, int(deadline - now())),
     )
     command_id = sent["Command"]["CommandId"]
-    while read_invocations(ssm, command_id, held, deadline=deadline, now=now) and now() < deadline:
+    last = Listing.LATE
+    while True:
+        listing = read_invocations(ssm, command_id, held, deadline=deadline, now=now)
+        if listing is not Listing.LATE:
+            last = listing
+        if listing is not Listing.WHOLE or now() >= deadline:
+            return last
         sleep(min(POLL_SECONDS, deadline - now()))
 
 
@@ -211,7 +267,12 @@ def run_job(
     """The job, from its environment and credentials. `common.SessionRefused`, with nothing sent,
     when the pool's session does not carry the run. `ssm` and `table` are a Systems Manager client
     and the pool-state table of the AWS SDK, made with the job's own credentials unless given."""
+    started = now()
     needs = common.needs_of(environ)
+    # The latest the run may end: early enough that the build outlives what the job then writes.
+    ends_by = build_end(environ, started) - BUILD_MARGIN_SECONDS
+    if started + needs.run_minutes * 60 > ends_by:
+        raise RunOutlastsBuild
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
     settings = config.read_ssm()
     pools = [pool for pool in settings.pools if pool.name == name]
@@ -233,16 +294,30 @@ def run_job(
         session_max_hours=settings.session_max_hours,
         now=admitting,
     )
-    deadline = admitted[-1] + needs.run_minutes * 60
+    deadline = min(admitted[-1] + needs.run_minutes * 60, ends_by)
     lines.write(Line.JOB, pool=name, engine=pool.engine)
     held: dict[str, Mapping[str, Any]] = {}
+    client = boto3.client("ssm", config=SSM_CLIENT) if ssm is None else ssm
     try:
-        check(boto3.client("ssm") if ssm is None else ssm, name, held, deadline=deadline, now=now, sleep=sleep)
+        listing = check(client, name, held, deadline=deadline, now=now, sleep=sleep)
     except Exception:
         # What was read before the error is recorded all the same; the error then fails the job.
         record(lines, held.values(), instances=needs.instances)
         raise
-    return record(lines, held.values(), instances=needs.instances)
+    passed = record(lines, held.values(), instances=needs.instances)
+    if listing is Listing.CUT:
+        raise IncompleteListing
+    return passed
+
+
+def build_end(environ: Mapping[str, str], started: float) -> float:
+    """When the build ends, in seconds since the epoch: its start, CodeBuild's or `started`, and
+    the minutes its project lets it run; never, outside a build that gives them."""
+    minutes = environ.get(BUILD_MINUTES_VARIABLE)
+    if minutes is None:
+        return float("inf")
+    start = environ.get(BUILD_START_VARIABLE)
+    return (started if start is None else int(start) / 1000) + int(minutes) * 60
 
 
 def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = print, **given: Any) -> int:

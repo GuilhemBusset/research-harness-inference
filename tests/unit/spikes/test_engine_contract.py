@@ -190,6 +190,82 @@ def test_the_run_s_minutes_start_when_the_session_admits_it(slow: str, pool_stat
     assert status == 0
 
 
+class CutShort(RunCommand):
+    """Run Command listing three invocations, whose second page comes back after the run's minute."""
+
+    def __init__(self, clock: Clock) -> None:
+        super().__init__([(FIRST, "Success", PASSING), (SECOND, "Success", PASSING), ("third", "Failed", "")])
+        self.clock = clock
+
+    def list_command_invocations(self, **asked: Any) -> dict[str, Any]:
+        self.clock.sleep(61 if "NextToken" in asked else 0)
+        return super().list_command_invocations(**asked)
+
+
+def test_a_listing_the_run_s_minutes_cut_short_fails_the_job(pool_state: Any) -> None:
+    clock = Clock()
+    status, lines, _ = ran(pool_state, CutShort(clock), 2, clock, RHI_SPIKE_RUN_MINUTES="1")
+    # The first page is recorded, and the page known to follow it, not read in time, fails the job.
+    assert status == 1
+    assert checks(lines) == [(1, "Success", ALL_PASSED, 0), (2, "Success", ALL_PASSED, 0)]
+    assert (lines[-1]["kind"], lines[-1]["error"]) == ("job_failed", "IncompleteListing")
+
+
+class Timed(RunCommand):
+    """Run Command that records when each request starts, and takes `send` seconds to answer the send."""
+
+    def __init__(self, clock: Clock, send: float) -> None:
+        super().__init__([(FIRST, "Success", PASSING)])
+        self.clock, self.send, self.started = clock, send, []
+
+    def send_command(self, **sent: Any) -> dict[str, Any]:
+        self.started.append(self.clock())
+        self.clock.sleep(self.send)
+        return super().send_command(**sent)
+
+    def list_command_invocations(self, **asked: Any) -> dict[str, Any]:
+        self.started.append(self.clock())
+        return super().list_command_invocations(**asked)
+
+
+@pytest.mark.parametrize("late", ["before the send", "in the send"])
+def test_no_request_starts_once_the_run_s_minutes_have_ended(late: str, pool_state: Any) -> None:
+    # A one-minute session and run, whose minute ends before the send, or while it is answered.
+    clock = Clock()
+    ssm = Timed(clock, send=61 if late == "in the send" else 0)
+    pool_state.book(minutes=1, now=int(T0))
+    written: list[str] = []
+
+    def out(line: str) -> None:
+        written.append(line)
+        clock.sleep(61 if late == "before the send" and json.loads(line)["kind"] == "job" else 0)
+
+    environ = pool_state.environ | {"RHI_SPIKE_RUN_MINUTES": "1"}
+    assert job.main(environ, out=out, ssm=ssm, table=pool_state, now=clock, sleep=clock.sleep) == 1
+    assert all(started <= T0 + 60 for started in ssm.started)
+    lines = [json.loads(line) for line in written]
+    assert checks(lines) == []
+    if late == "before the send":
+        assert ssm.sent == [] and (lines[-1]["kind"], lines[-1]["error"]) == ("job_failed", "RunElapsed")
+
+
+@pytest.mark.parametrize(
+    ("built_minutes_ago", "run_minutes", "fits"), [(0, 540, False), (400, 76, False), (400, 60, True)]
+)
+def test_a_run_must_end_within_its_build(built_minutes_ago: int, run_minutes: int, fits: bool, pool_state: Any) -> None:
+    # A build of 480 minutes, which keeps five for the job to write what it read.
+    build = {"RHI_SPIKE_BUILD_MINUTES": "480", "CODEBUILD_START_TIME": str(int((T0 - built_minutes_ago * 60) * 1000))}
+    clock = Clock()
+    ssm = RunCommand([(FIRST, "Success", PASSING)])
+    status, lines, _ = ran(pool_state, ssm, 1, clock, RHI_SPIKE_RUN_MINUTES=str(run_minutes), **build)
+    if fits:
+        assert status == 0 and clock() <= T0 + (480 - built_minutes_ago - 5) * 60
+    else:
+        assert status == 1 and ssm.sent == []
+        (line,) = lines
+        assert (line["kind"], line["error"]) == ("job_failed", "RunOutlastsBuild")
+
+
 class Failing(RunCommand):
     """Run Command whose listing fails from its second call on, with a text no line may carry."""
 

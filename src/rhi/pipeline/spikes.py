@@ -15,7 +15,8 @@ schedule, no rule and no pipeline action starts it. It runs CodeBuild's standard
 privileged, installs a pinned uv and the locked environment, and runs its script with the
 repository's package roots on the import path (`rhi.pipeline.synth.import_path`), so a spike
 imports `common` and `rhi_common` by name. The commit it runs on reaches the script as
-`CODEBUILD_RESOLVED_SOURCE_VERSION`, and the measurement bus as `RHI_MEASUREMENT_BUS`.
+`CODEBUILD_RESOLVED_SOURCE_VERSION`, the measurement bus as `RHI_MEASUREMENT_BUS`, and the
+minutes its build may run, its timeout, as `RHI_SPIKE_BUILD_MINUTES`.
 
 **One role, one log group and one key, for every job.** cdk-nag acknowledges each finding by its
 own id, which carries the logical ID of the resource it is on. CodeBuild's construct adds, for each
@@ -98,6 +99,9 @@ LOG_RETENTION = logs.RetentionDays.ONE_YEAR
 # longer than CodeBuild's default hour. A job that needs more gives its own, within CodeBuild's limit.
 TIMEOUT_HOURS = 8
 MAX_TIMEOUT_HOURS = 36
+# The minutes a build of the job may run, its timeout, given to its script: a job that waits can end
+# its wait while the build still runs (`spikes/engine_contract.py`).
+BUILD_MINUTES_VARIABLE = "RHI_SPIKE_BUILD_MINUTES"
 # What CodeBuild's user guide asks of a project's role to read a repository through a connection.
 CONNECTION_ACTIONS = ["codeconnections:GetConnection", "codeconnections:GetConnectionToken"]
 # What CodeBuild does with a project's key: encrypt and decrypt what it stores of a build.
@@ -241,7 +245,8 @@ class SpikeJobs(Construct):
                     build_image=codebuild.LinuxBuildImage.STANDARD_7_0, privileged=False
                 ),
                 environment_variables={
-                    variable: codebuild.BuildEnvironmentVariable(value=value) for variable, value in environment.items()
+                    variable: codebuild.BuildEnvironmentVariable(value=value)
+                    for variable, value in (environment | {BUILD_MINUTES_VARIABLE: str(job.timeout_hours * 60)}).items()
                 },
                 encryption_key=self.key,  # ty: ignore[invalid-argument-type] - as above
                 logging=codebuild.LoggingOptions(
