@@ -52,7 +52,7 @@ keeps (`Lines`). Every line has `at`, its UTC time, and `kind`:
 | `harness_run` | For each harness: when its run started and ended, its turns, its exit status, the check's exit status, its version, and the build the pool served as its lifecycle agents report it |
 | `refused_request` | For each Claude Code run, each request the gateway or the engine refused, side queries and token counts included: its time, route and status, and its cause |
 | `image_step` | Whether an image Claude Code read with a tool reached the pool inside a tool result, how that request was answered, and whether Claude Code named what it shows |
-| `compaction` | Whether a Claude Code session driven past its window compacted, and whether it completed its next turn |
+| `compaction` | Whether a Claude Code session driven past its window compacted, and whether it completed its next turn; the auto-compact window it was given, or `null` |
 | `replay` | The replay of the recorded Claude Code session: its times and its requests |
 | `engine_counters` | The engine's input and cached input token counters, at the replay's start and at its end |
 | `step_failed` | A step that raised, or a reading of the workspace that failed: its name and the type of the error |
@@ -77,11 +77,22 @@ colour fills it. The request that carries the image inside a tool result is the 
 first such request that was accepted (a retry of a refused one among them), or the first sent when
 none was. Claude Code named the colour when its answer names it, as a word, and no other colour.
 
-**Compaction.** In a folder of its own, the job writes `FILLER_FILES` files of text, a quarter more
-than the window its Claude Code compacts at (`CLIENT_WINDOW`), the auto-compact window `rhi login`
+**Compaction.** In a folder of its own, the job writes files of text (`filler_files`), a quarter
+more than the window its Claude Code compacts at (`CLIENT_WINDOW`), the auto-compact window `rhi login`
 sets (`rhi_cli.harness.AUTO_COMPACT_WINDOW`), which the job writes in that Claude Code's settings
 through the same module (`forwarder.write_home`), and asks Claude
-Code to read them all, one at a time, then give the last word of the last. Claude Code says in its
+Code to read them all, one at a time, then give the last word of the last. With that window, Claude
+Code compacts at 200,000 tokens, below the coursework pool's context of 262,144: the engine never
+refuses one of its turns as too long, and the gateway's `context_length_exceeded` is never met. With
+`RHI_S3_COMPACT_WINDOW=none`, the settings of this step's Claude Code hold everything `rhi login`
+writes but `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, and its command's environment holds no such variable:
+Claude Code then compacts only near the 1M window it gives its own `claude-` names behind a custom
+base URL, so the session grows past the pool's context first, and the engine refuses the turn. With
+no window of its own to size the files from, the step writes them a quarter more than the pool's own
+context, its `context_length` in the deployed configuration (`rhi_common.pool_config.Pool`). The task
+and image steps keep the window `rhi login` sets whatever the variable holds, so that their lines
+stay comparable with earlier runs; the line's `auto_compact_window` is the window this step's Claude
+Code was given, `null` when it ran with none. Claude Code says in its
 own output that it compacted (an event `compact_boundary`), and gives every turn of its main loop
 as an `assistant` event: the session completed its next turn when the first such event after the
 compaction is no error, and the session went on after it or did not end in an error. The line also
@@ -128,6 +139,7 @@ runs with none of the job's credentials, nor the variables that say where CodeBu
 | `RHI_SPIKE_INSTANCES` | The instances the job needs in service: `1` unless given |
 | `RHI_SPIKE_RUN_MINUTES` | How long the job lasts, in minutes, which the session must outlast. Required |
 | `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
+| `RHI_S3_COMPACT_WINDOW` | Unset, the compaction step's Claude Code has the auto-compact window `rhi login` sets; `none`, it has none, and its files are sized from the pool's context. Any other value stops the job before it sends anything |
 
 **In a booked session.** The job starts no machine: the owner books a session of the pool first,
 and before it sends anything the job checks it (`common.require_session`): the session is active,
@@ -190,6 +202,9 @@ ENDPOINT_VARIABLE = "RHI_SPIKE_ENDPOINT"
 WORKSPACE_URL_VARIABLE = "RHI_SPIKE_WORKSPACE_URL"
 POOL_VARIABLE = "RHI_SPIKE_POOL"
 DEFAULT_POOL = "coursework"
+# Unset, the compaction step's Claude Code has the auto-compact window `rhi login` sets; `NO_WINDOW`, none.
+COMPACT_WINDOW_VARIABLE = "RHI_S3_COMPACT_WINDOW"
+NO_WINDOW = "none"
 
 # What the SDK script is given, besides the SDK's own variables.
 PROMPT_VARIABLE = "RHI_S3_PROMPT"
@@ -236,7 +251,8 @@ COLOURS: dict[str, tuple[int, int, int]] = {
 
 # Compaction: files of text, each well inside what Claude Code reads at once, together a quarter
 # more than the window the job's Claude Code compacts at: the auto-compact window `rhi login` sets
-# (`rhi_cli.harness`), which `forwarder.write_home` writes in the job's Claude Code settings too.
+# (`rhi_cli.harness`), which `forwarder.write_home` writes in the job's Claude Code settings too, or,
+# for a step run with none, the pool's context.
 # The window Claude Code reports in its result (`modelUsage`, `contextWindow`) stays its model's
 # own, 1M behind the gateway. A line of 12 words is some 16 tokens, at most. A session that does
 # not compact before the engine's window meets the engine's refusal as it grows, which is
@@ -244,7 +260,7 @@ COLOURS: dict[str, tuple[int, int, int]] = {
 CLIENT_WINDOW = login_files.AUTO_COMPACT_WINDOW
 FILLER_LINES = 800
 FILLER_WORDS_A_LINE = 12
-FILLER_FILES = math.ceil(1.25 * CLIENT_WINDOW / (FILLER_LINES * (FILLER_WORDS_A_LINE + 4)))
+WINDOW_SETTING = "CLAUDE_CODE_AUTO_COMPACT_WINDOW"
 _FILLER = (
     "the", "and", "for", "are", "but", "not", "you", "all", "any", "can", "had", "her", "was",
     "one", "our", "out", "day", "get", "has", "him", "his", "how", "man", "new", "now", "old",
@@ -924,12 +940,18 @@ def filler_name(number: int) -> str:
     return f"part-{number:03d}.txt"
 
 
-def write_filler(folder: Path, word: str, rng: random.Random) -> None:
-    """The files the compaction step reads: text of common words, the last file ending with `word`."""
+def filler_files(window: int) -> int:
+    """How many files of text hold a quarter more than `window` tokens, a line being its words and
+    four tokens more."""
+    return math.ceil(1.25 * window / (FILLER_LINES * (FILLER_WORDS_A_LINE + 4)))
+
+
+def write_filler(folder: Path, word: str, rng: random.Random, files: int) -> None:
+    """The `files` files the compaction step reads: text of common words, the last file ending with `word`."""
     folder.mkdir(parents=True, exist_ok=True)
-    for number in range(1, FILLER_FILES + 1):
+    for number in range(1, files + 1):
         lines: list[str] = [" ".join(rng.choices(_FILLER, k=FILLER_WORDS_A_LINE)) for _ in range(FILLER_LINES)]
-        if number == FILLER_FILES:
+        if number == files:
             lines.append(f"The last word is {word}")
         (folder / filler_name(number)).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -945,12 +967,30 @@ def image_prompt(marker: str) -> str:
     )
 
 
-def compaction_prompt(marker: str) -> str:
+def compaction_prompt(marker: str, files: int) -> str:
     return (
-        f"Read the files {filler_name(1)} to {filler_name(FILLER_FILES)} in this folder with your Read tool, "
+        f"Read the files {filler_name(1)} to {filler_name(files)} in this folder with your Read tool, "
         "one at a time and in order, each one whole. When you have read them all, answer with the last "
-        f"word of {filler_name(FILLER_FILES)} and nothing else. Run reference: {marker}"
+        f"word of {filler_name(files)} and nothing else. Run reference: {marker}"
     )
+
+
+def compact_window_of(environ: Mapping[str, str]) -> bool:
+    """Whether the compaction step's Claude Code has the auto-compact window `rhi login` sets: it
+    has, unless `COMPACT_WINDOW_VARIABLE` is `NO_WINDOW`. ValueError for any other value."""
+    given = environ.get(COMPACT_WINDOW_VARIABLE)
+    if given is not None and given != NO_WINDOW:
+        raise ValueError(f"{COMPACT_WINDOW_VARIABLE} is unset or {NO_WINDOW}")
+    return given is None
+
+
+def without_window(home: Path) -> None:
+    """Takes the auto-compact window out of the Claude Code settings `forwarder.write_home` wrote in
+    `home`, and nothing else."""
+    path = home / ".claude" / "settings.json"
+    settings = json.loads(path.read_text(encoding="utf-8"))
+    settings["env"].pop(WINDOW_SETTING)
+    path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def check_environment(folder: Path) -> dict[str, str]:
@@ -1022,7 +1062,9 @@ def install_harnesses(folder: Path) -> tuple[dict[str, Path], dict[str, str]]:
 class Job:
     """The job: the task given to each harness against the pool `pool` (served by `engine`), through
     the gateway at `endpoint`, as the canary students of `keys`; the pool's state read through `gateway`,
-    the workspace read through `workspace`; every line written to `lines`."""
+    the workspace read through `workspace`; every line written to `lines`. The compaction step's
+    Claude Code has the auto-compact window `rhi login` sets when `compact_window`, and none
+    otherwise, its files then sized from the pool's `context_length`."""
 
     def __init__(
         self,
@@ -1042,9 +1084,19 @@ class Job:
         wall: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         rng: random.Random | None = None,
+        compact_window: bool = True,
+        context_length: int | None = None,
     ) -> None:
         if len(keys) < len(Harness) + 1:
             raise ValueError("spike S3 needs a canary student for each harness and one for the replay")
+        # The window the compaction step compacts at, which its files hold a quarter more than.
+        if compact_window:
+            self.filler_window = CLIENT_WINDOW
+        elif context_length is None:
+            raise ValueError("a compaction step with no window is sized from the pool's context")
+        else:
+            self.filler_window = context_length
+        self.compact_window = compact_window
         self.names = metric_names(engine)
         self.pool, self.engine, self.endpoint, self.keys = pool, engine, endpoint, tuple(keys)
         self.gateway, self.workspace, self.lines, self.work = gateway, workspace, lines, work
@@ -1089,13 +1141,16 @@ class Job:
         except ValueError:
             return None
 
-    def session(self, harness: Harness, step: Step, folder: Path, prompt: str) -> Session:
-        """Runs `harness` once on `folder` with `prompt`, through a forwarder of its own."""
+    def session(self, harness: Harness, step: Step, folder: Path, prompt: str, *, window: bool = True) -> Session:
+        """Runs `harness` once on `folder` with `prompt`, through a forwarder of its own; Claude Code
+        without its auto-compact window when not `window`."""
         home = Path(tempfile.mkdtemp(prefix=f"{harness}-{step}-", dir=self.work))
         key = self.key_of(harness)
         with forwarder.Forwarder(self.endpoint, self.pool, self.wall) as own:
             if harness in HOME_OF:
                 forwarder.write_home(home, HOME_OF[harness], own.url, self.pool, key)
+            if harness is Harness.CLAUDE_CODE and not window:
+                without_window(home)
             command = command_of(
                 harness,
                 home=home,
@@ -1166,11 +1221,14 @@ class Job:
         self._refusals(session)
 
     def compaction(self) -> None:
-        """Claude Code driven past its window, in a session of its own."""
+        """Claude Code driven past its window, in a session of its own: the auto-compact window `rhi
+        login` sets, or, with none, the pool's context."""
         folder = self.work / "compaction"
         word = f"rhi{self.rng.getrandbits(24):06x}"
-        write_filler(folder, word, self.rng)
-        session = self.session(Harness.CLAUDE_CODE, Step.COMPACTION, folder, compaction_prompt(self._marker()))
+        files = filler_files(self.filler_window)
+        write_filler(folder, word, self.rng, files)
+        prompt = compaction_prompt(self._marker(), files)
+        session = self.session(Harness.CLAUDE_CODE, Step.COMPACTION, folder, prompt, window=self.compact_window)
         self.lines.write(
             Line.COMPACTION,
             harness=Harness.CLAUDE_CODE.value,
@@ -1179,6 +1237,7 @@ class Job:
             ended_at=utc(session.ended_at),
             exit_status=session.ran.exit_code,
             stopped=session.ran.stopped,
+            auto_compact_window=CLIENT_WINDOW if self.compact_window else None,
             **compaction_of(session, word),
         )
         self._refusals(session)
@@ -1375,7 +1434,9 @@ def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = p
 
 def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
     """The job, from its environment and credentials; 1 when a step failed. `common.SessionRefused`,
-    with nothing sent to the gateway, when the pool's session does not carry the run."""
+    with nothing sent to the gateway, when the pool's session does not carry the run; ValueError,
+    before anything is read or sent, for a `COMPACT_WINDOW_VARIABLE` that is neither unset nor `NO_WINDOW`."""
+    compact_window = compact_window_of(environ)
     needs = common.needs_of(environ)
     endpoint = common.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
     name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
@@ -1406,6 +1467,8 @@ def run_job(environ: Mapping[str, str], out: Callable[[str], None]) -> int:
             workspace=workspace,
             lines=lines,
             work=Path(work),
+            compact_window=compact_window,
+            context_length=pool.context_length,
         ).run()
     return 1 if failures else 0
 
