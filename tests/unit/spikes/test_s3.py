@@ -32,6 +32,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 import common
+import forwarder
 import loadgen
 import s3_harness_task as s3
 from rhi_cli import harness as login_files
@@ -216,7 +217,7 @@ def claude_code(command: s3.Command) -> s3.Ran:
         )
         return s3.Ran(0, printed({"type": "result", "num_turns": 2, "result": colour.title()}))
     if s3.filler_name(1) in prompt:
-        word = (folder / s3.filler_name(s3.FILLER_FILES)).read_text(encoding="utf-8").split()[-1]
+        word = max(folder.glob("part-*.txt")).read_text(encoding="utf-8").split()[-1]
         send(command, "/v1/messages", {"tools": tools, "stream": True, "messages": messages})
         boundary = {
             "type": "system",
@@ -292,6 +293,10 @@ class Ready:
         return "ready"
 
 
+def installed(folder: Path) -> tuple[dict[str, Path], dict[str, str]]:
+    return {name: folder / name for name in ("claude_code", "codex", "opencode", "pi")}, VERSIONS
+
+
 def ran_job(tmp_path: Path, gateway: str, launch: s3.Launch) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
     """The job, run once: its lines as written and as read, its keys, and what the replay was given."""
     clock, written, replayed = Clock(), [], {}
@@ -312,7 +317,7 @@ def ran_job(tmp_path: Path, gateway: str, launch: s3.Launch) -> tuple[list[dict[
         workspace=Workspace(),
         lines=s3.Lines(keys, wall=clock, out=written.append),
         work=tmp_path,
-        install=lambda folder: ({name: folder / name for name in ("claude_code", "codex", "opencode", "pi")}, VERSIONS),
+        install=installed,
         launch=launch,
         replay=replay,
         wall=clock,
@@ -481,12 +486,15 @@ def test_the_image_is_recorded_by_its_accepted_retry_and_named_only_by_its_colou
         assert (row["accepted"], row["status"], row["named"]) == (True, 200, named)
 
 
+def estimated_tokens(folder: Path) -> int:
+    """The filler's tokens by the module's estimate: a line is at most its words and four tokens more."""
+    return sum(4 + len(line.split()) for path in folder.glob("part-*.txt") for line in path.read_text().splitlines())
+
+
 def test_the_compaction_files_hold_more_than_the_window_rhi_login_sets(tmp_path: Path) -> None:
     assert s3.CLIENT_WINDOW == login_files.AUTO_COMPACT_WINDOW
-    s3.write_filler(tmp_path, "rhiabc123", Random(1))
-    # A line is at most its words and four tokens more.
-    estimate = sum(4 + len(line.split()) for path in tmp_path.glob("*.txt") for line in path.read_text().splitlines())
-    assert estimate > s3.CLIENT_WINDOW
+    s3.write_filler(tmp_path, "rhiabc123", Random(1), s3.filler_files(s3.CLIENT_WINDOW))
+    assert estimated_tokens(tmp_path) > s3.CLIENT_WINDOW
 
 
 def test_a_turn_after_compaction_counts_as_completed_only_when_it_succeeded() -> None:
@@ -666,6 +674,8 @@ def test_the_check_runs_without_the_build_s_credential_environment(
     assert s3.run_check(tmp_path) == 0
 
 
+# The pool's context in the deployed configuration the tests give.
+CONTEXT_LENGTH = 262_144
 ENVIRON = {
     "AWS_REGION": "us-east-1",
     "RHI_SPIKE_ENDPOINT": "https://example.com",
@@ -676,7 +686,7 @@ ENVIRON = {
 @pytest.fixture
 def deployed(monkeypatch: pytest.MonkeyPatch) -> None:
     """The deployed configuration, as much of it as the job reads."""
-    pool = SimpleNamespace(name="coursework", engine="vllm")
+    pool = SimpleNamespace(name="coursework", engine="vllm", context_length=CONTEXT_LENGTH)
     monkeypatch.setattr(s3.config, "read_ssm", lambda: SimpleNamespace(pools=[pool], session_max_hours=12))
 
 
@@ -743,6 +753,67 @@ def test_the_job_refused_by_its_session_sends_nothing_and_fails_with_the_reason(
     assert s3.main(ENVIRON | pool_state.environ | given, out=written.append) == 1
     (line,) = [json.loads(one) for one in written]
     assert (line["kind"], line["reason"]) == ("job_failed", reason)
+    assert (gateway_requests, started) == ([], [])
+
+
+@pytest.mark.usefixtures("deployed")
+@pytest.mark.parametrize("given", [{}, {s3.COMPACT_WINDOW_VARIABLE: s3.NO_WINDOW}])
+def test_the_compaction_step_alone_runs_without_the_window_when_told_and_its_filler_follows(
+    given: dict[str, str], tmp_path: Path, gateway: str, launch: s3.Launch, pool_state: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # fmt: skip
+    clock, seen = Clock(), {}
+    keys = SimpleNamespace(students=tuple(generate_key() for _ in range(KEYS)))
+    monkeypatch.setattr(s3.common, "canary_keys", lambda: keys)
+
+    def recorded(command: s3.Command) -> s3.Ran:
+        if command.harness is s3.Harness.CLAUDE_CODE:
+            home = Path(command.environment["HOME"])
+            # What `rhi login` writes for this forwarder, as the reference of what the home holds.
+            login = tmp_path / f"login-{len(seen)}"
+            forwarder.write_home(login, forwarder.Client.CLAUDE_CODE, command.endpoint, "coursework", "a-key")
+            seen[home.name.split("-")[1]] = (
+                json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8")),
+                json.loads((login / ".claude" / "settings.json").read_text(encoding="utf-8")),
+                dict(command.environment),
+                estimated_tokens(command.folder),
+            )
+        return launch(command)
+
+    async def replay(load: loadgen.Load, keys: Sequence[str], endpoint: str, *, at_once: int) -> list[loadgen.Record]:
+        return []
+
+    real = s3.Job
+    doubles: dict[str, Any] = {"gateway": Ready(), "workspace": Workspace(), "endpoint": gateway, "install": installed}
+    doubles |= {"launch": recorded, "replay": replay, "wall": clock, "sleep": clock.sleep, "rng": Random(7)}
+    monkeypatch.setattr(s3, "Job", lambda **given: real(**(given | doubles)))
+    pool_state.book()
+    written: list[str] = []
+    assert s3.main(ENVIRON | pool_state.environ | given, out=written.append) == 0
+
+    windowless = bool(given)
+    assert set(seen) == {"task", "image", "compaction"}
+    for step, (settings, login, environment, _) in seen.items():
+        # No Claude Code command sets the window in its environment: it comes from the settings alone.
+        assert not any("AUTO_COMPACT" in name for name in environment)
+        if step == "compaction" and windowless:
+            login["env"].pop(s3.WINDOW_SETTING)
+        assert settings == login
+        assert (s3.WINDOW_SETTING in settings["env"]) == (step != "compaction" or not windowless)
+    window = CONTEXT_LENGTH if windowless else s3.CLIENT_WINDOW
+    assert seen["compaction"][3] >= 1.25 * window
+    (line,) = [json.loads(one) for one in written if '"compaction"' in one]
+    assert line["auto_compact_window"] == (None if windowless else login_files.AUTO_COMPACT_WINDOW)
+
+
+@pytest.mark.usefixtures("deployed")
+def test_an_unknown_compaction_window_stops_the_job_before_it_sends_anything(
+    pool_state: Any, gateway_requests: list[tuple[str, str]], started: list[s3.Job]
+) -> None:
+    pool_state.book()
+    written: list[str] = []
+    assert s3.main(ENVIRON | pool_state.environ | {s3.COMPACT_WINDOW_VARIABLE: "200000"}, out=written.append) == 1
+    assert [json.loads(one)["kind"] for one in written] == ["job_failed"]
     assert (gateway_requests, started) == ([], [])
 
 
