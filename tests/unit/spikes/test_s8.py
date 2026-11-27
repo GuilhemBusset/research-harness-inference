@@ -15,6 +15,7 @@ import io
 import itertools
 import json
 import selectors
+import threading
 import urllib.request
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -1363,11 +1364,22 @@ def test_the_held_load_stays_under_half_the_per_address_rule_until_both_instance
         assert max(r.sent_at or 0 for r in replayed if r.session == stream) >= began + 600 - s8.POLL_SECONDS
 
 
-def test_the_smallest_half_limit_still_holds_one_request_a_stream() -> None:
-    # 16 requests in any 300 seconds for 16 streams: each sends once, and again after the window.
-    assert s8.held_pause(32, 16) > s8.RATE_WINDOW_SECONDS
-    with pytest.raises(ValueError, match="per-address"):
-        s8.held_pause(31, 16)
+def test_a_limit_under_one_request_a_stream_staggers_the_streams_and_holds_the_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Half of 30 is 15 requests in any 300 seconds, for 16 streams: they start at different times.
+    per_address = 30
+
+    async def work(loop: _VirtualLoop) -> tuple[dict[str, str], _RateRule]:
+        gateway = _RateRule(loop.time, per_address)
+        _through(monkeypatch, loop, gateway, [])
+        pool = _Serving(lambda: bool(gateway.arrivals) and loop.time() >= gateway.arrivals[0] + 600)
+        run = dataclasses.replace(_held_run(pool), per_address=per_address)
+        return await run.two_instances(), gateway
+
+    found, gateway = _on_virtual_time(work)
+    assert found == BOTH and gateway.refused == 0
+    assert 0 < gateway.most_in_a_window() <= per_address // 2
 
 
 def _read_error(request: httpx.Request) -> httpx.Response:
@@ -1409,11 +1421,21 @@ def test_a_held_stream_that_ends_stops_the_load_and_fails_the_run_naming_how(
     assert len(gateway.arrivals) == 40 and max(gateway.arrivals) == gateway.arrivals[39]
 
 
+REFUSALS = {
+    "text": lambda request: httpx.Response(403, text=f"refused {MARKER}"),
+    # An error object whose type is no name of the gateway's causes: its status is what is named.
+    "unknown error object": lambda request: httpx.Response(403, json={"error": {"type": {"message": MARKER}}}),
+}
+
+
+@pytest.mark.parametrize("refusal", list(REFUSALS))
 def test_a_measured_student_s_request_not_answered_200_fails_the_run_naming_its_status(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, refusal: str
 ) -> None:
     async def work(loop: _VirtualLoop) -> str:
-        _through(monkeypatch, loop, _RateRule(loop.time, PER_ADDRESS, lambda number, request: FAULTS["403"](request)), [])
+        _through(
+            monkeypatch, loop, _RateRule(loop.time, PER_ADDRESS, lambda number, request: REFUSALS[refusal](request)), []
+        )
         keys = [generate_key(), generate_key()]
         run = s8.Run(_Pool(), "https://gateway.example.com", keys, 3, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
         with pytest.raises(RuntimeError) as failed:
@@ -1453,3 +1475,44 @@ def test_a_request_that_fails_after_both_instances_serve_is_no_early_end(monkeyp
         return found
 
     assert _on_virtual_time(work) == BOTH
+
+
+def test_a_held_stream_s_end_seen_during_the_last_observation_outweighs_the_wait_s_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pool's last observation, before the wait's deadline, is read while a held stream is
+    # answered 403: the observation shows nothing serving, and the deadline has passed once it returns.
+    async def work() -> str:
+        loop = asyncio.get_running_loop()
+        observing, recorded = asyncio.Event(), threading.Event()
+
+        class Pool(_Serving):
+            def serving(self) -> dict[str, str]:
+                loop.call_soon_threadsafe(observing.set)
+                if not recorded.wait(5):
+                    raise AssertionError("the held stream was not answered")
+                return {}
+
+        async def answer(request: httpx.Request) -> httpx.Response:
+            await observing.wait()
+            return httpx.Response(403, text=f"refused {MARKER}")
+
+        real = s8.loadgen.replay
+
+        async def replay(*given: Any, on_record: Callable[[s8.loadgen.Record], None], **named: Any) -> list:
+            def noted(record: s8.loadgen.Record) -> None:
+                on_record(record)
+                recorded.set()
+
+            return await real(*given, transport=httpx.MockTransport(answer), on_record=noted, **named)
+
+        monkeypatch.setattr(s8.loadgen, "replay", replay)
+        monkeypatch.setattr(s8, "IN_SERVICE_WAIT_SECONDS", 1)
+        monkeypatch.setattr(s8, "time", SimpleNamespace(monotonic=lambda: 2 if recorded.is_set() else 0))
+        run = dataclasses.replace(_held_run(Pool(lambda: False)), target_concurrency=1)
+        with pytest.raises(RuntimeError) as failed:
+            await run.two_instances()
+        return str(failed.value)
+
+    line = asyncio.run(work())
+    assert "403 (" in line and MARKER not in line

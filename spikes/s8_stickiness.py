@@ -35,9 +35,10 @@ nothing else: the scaler alone moves the instances (section 5.1).
    stream after another, as the canary students after the first two, until the workspace shows
    the two in service both streaming answers. All of them come from the job's one address, which
    the web ACL's per-address rate rule counts over 300 seconds (`rate_limits.per_address`;
-   section 17): each stream pauses between its requests (`held_pause`), so that no 300 seconds hold
-   more than half of that limit of the load's requests, and the other half is left to the measured
-   students' requests that follow within the same window. It records how many zones the two are
+   section 17): the streams pause between their requests, which take turns spaced evenly across
+   all of them (`Spacing`), so that no 300 seconds hold more than half of that limit of the load's
+   requests whatever the number of streams, and the other half is left to the measured students'
+   requests that follow within the same window. It records how many zones the two are
    in, by the label `zone` the node's collector adds to every series; an instance whose series has
    no zone label is not a zone, and the load is held until both have one. Then it stops the load
    and waits until the workspace shows nothing running or waiting on the pool. A held stream that
@@ -661,31 +662,46 @@ def booked(table: Any, pool: str, *, minutes: int, max_instances: int, session_m
 # The load and the students' requests.
 
 
-def held_pause(per_address: int, streams: int) -> float:
-    """Seconds each of `streams` held streams pauses before each of its requests after its first, so
-    that no `RATE_WINDOW_SECONDS` hold more than half of `per_address` of the load's requests: a
-    stream's requests start at least the pause apart, so a window holds at most `each` of them,
-    `each` streams' share of the half. ValueError when the half holds less than one request a stream."""
-    each = (per_address // 2) // streams
-    if each < 1:
-        raise ValueError(f"half the per-address rate limit holds less than one request for each of {streams} streams")
-    # Over the window's share of one request, so that `each` starts, never `each + 1`, fit in it.
-    return RATE_WINDOW_SECONDS / each + 1.0
+@dataclass
+class Spacing:
+    """The turns of the held load's requests, shared by all its streams: each request, whichever
+    stream sends it, starts at least `gap` seconds of `clock` after the one before it. A turn is
+    taken when its stream is ready to send, so the streams start at different times and a stream
+    waits for its turn when the others hold the next ones."""
+
+    gap: float
+    clock: Callable[[], float]
+    _last: float | None = field(default=None, init=False, repr=False)
+
+    @classmethod
+    def under(cls, per_address: int, clock: Callable[[], float]) -> Spacing:
+        """The spacing under which no `RATE_WINDOW_SECONDS` hold more than half of `per_address`
+        requests: over the window's share of one, so that the half fits in a window, never one more."""
+        half = per_address // 2
+        if half < 1:
+            raise ValueError("half the per-address rate limit holds no request")
+        return cls(RATE_WINDOW_SECONDS / half * 1.001 + 0.001, clock)
+
+    def wait(self) -> float:
+        """Takes the next turn: the seconds until it."""
+        now = self.clock()
+        turn = now if self._last is None else max(now, self._last + self.gap)
+        self._last = turn
+        return turn - now
 
 
 @dataclass(frozen=True)
 class HeldStream:
-    """A session that sends one short stream after another, `pause` seconds apart, until `stop` is set."""
+    """A session that sends one short stream after another, each at its turn of `spacing`, until
+    `stop` is set."""
 
     request: loadgen.Request
     stop: asyncio.Event
-    pause: float = 0.0
+    spacing: Spacing
 
     def requests(self) -> Generator[tuple[float, loadgen.Request], str]:
-        pause = 0.0
         while not self.stop.is_set():
-            yield pause, self.request
-            pause = self.pause
+            yield self.spacing.wait(), self.request
 
 
 def _session(model: str, requests: int, seed: int) -> loadgen.SyntheticSession:
@@ -835,27 +851,30 @@ class Run:
         load_keys = self.keys[len(STUDENTS) :]
         if len(load_keys) < holders:
             raise ValueError(f"the load needs {holders} canary students besides the {len(STUDENTS)} measured")
-        pause = held_pause(self.per_address, streams)
+        # The replay waits its pauses on the event loop's clock: the turns are read on the same one.
+        spacing = Spacing.under(self.per_address, asyncio.get_running_loop().time)
         await _wait(lambda: self.holds(INSTANCES), IN_SERVICE_WAIT_SECONDS, "the session's two instances in service")
         stop = asyncio.Event()
+        # Set once the job stops the load: what ends a stream after that is not an early end.
+        halted = asyncio.Event()
         request = _first_request(self.pool.name)
-        # A stream already pausing when the load stops sends nothing more: the replay reads `sending`
-        # once the pause has passed.
+        # A stream already waiting for its turn when the load stops sends nothing more: the replay
+        # reads `sending` once the pause has passed.
         load = loadgen.Load(
-            tuple(HeldStream(request, stop, pause) for _ in range(streams)),
+            tuple(HeldStream(request, stop, spacing) for _ in range(streams)),
             sessions_per_student=STREAMS_PER_STUDENT,
             sending=lambda: not stop.is_set(),
         )
         found: dict[str, str] = {}
-        # The requests at which a held stream ended before the job found two instances serving.
+        # The requests at which a held stream ended before the job stopped the load.
         ended: list[loadgen.Record] = []
 
         def on_record(record: loadgen.Record) -> None:
-            if not _answered(record) and not found:
+            if not _answered(record) and not halted.is_set():
                 ended.append(record)
                 stop.set()
 
-        print(f"holding {streams} streams as {holders} students, each pausing {pause:.1f} seconds between requests")
+        print(f"holding {streams} streams as {holders} students, {spacing.gap:.2f} seconds between requests")
         held = asyncio.create_task(
             loadgen.replay(load, load_keys, self.endpoint, at_once=streams, keep_failures=True, on_record=on_record)
         )
@@ -887,13 +906,20 @@ class Run:
             found.update(zoned)
             return True
 
+        timed_out: TimeoutError | None = None
         try:
             await _wait(two, IN_SERVICE_WAIT_SECONDS, "two instances serving")
+        except TimeoutError as error:
+            # A held stream may have ended while the last observation was read: that end is reported.
+            timed_out = error
         finally:
+            halted.set()
             stop.set()
             await held
         if ended:
             raise RuntimeError(ended_line(ended))
+        if timed_out is not None:
+            raise timed_out
         if not found:
             raise RuntimeError("the load ended before two instances served")
         await _wait(lambda: self.pool.busy() == 0, LOAD_END_WAIT_SECONDS, "the load to end")
