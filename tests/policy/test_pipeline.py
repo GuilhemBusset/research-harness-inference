@@ -205,7 +205,8 @@ if TYPE_CHECKING:
 # The reviewed list: the pipeline of `src/rhi/pipeline/stack.py`.
 REVIEWED: Reviewed = [
     ("Source", [("GitHub", "Source/AWS/CodeStarSourceConnection")]),
-    ("Build", [("Synth", "Build/AWS/CodeBuild")]),
+    # Before the synthesis, which depends on it: the copy of the pinned images into the mirror.
+    ("Build", [("Mirror", "Build/AWS/CodeBuild"), ("Synth", "Build/AWS/CodeBuild")]),
     ("UpdatePipeline", [("SelfMutate", "Build/AWS/CodeBuild")]),
     (
         "Rhi",

@@ -98,7 +98,8 @@ def test_one_source_on_main_from_the_stacks_connection(templates: dict[str, dict
 def test_the_self_update_follows_the_synth_step(templates: dict[str, dict[str, Any]]) -> None:
     template = templates[PIPELINE_TEMPLATE]
     actions = actions_of(the_pipeline(templates))
-    (synth,) = actions["Build"]
+    # The stage Build holds the mirror's step, then the synthesis.
+    (synth,) = [action for action in actions["Build"] if action["Name"] == "Synth"]
     commands = commands_of(template, synth)
     assert any("cdk synth --lookups=false" in command for command in commands)
     assert [action["Name"] for action in actions["UpdatePipeline"]] == ["SelfMutate"]
