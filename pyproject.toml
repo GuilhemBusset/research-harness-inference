@@ -97,6 +97,17 @@ lifecycle = [
     "prometheus-client==0.26.0",
 ]
 admin = ["boto3==1.44.3"]
+# Not a service: the libraries of the contract suite of tests/contract, which the release carries
+# to every instance (src/rhi/pools/release.py), where it runs against the node's own engine
+# (services/engine/contract/run.sh). Each at the pin of every other group that names it, dev's
+# pytest among them. dev holds every one of them already, so it does not include this group.
+contract = [
+    "pytest==8.3.5",
+    "httpx==0.28.1",
+    "prometheus-client==0.26.0",
+    "starlette==1.10.0",
+    "uvicorn==0.54.0",
+]
 # client/pyproject.toml, from which students install the CLI, declares the same requirement.
 cli = ["keyring==25.7.0"]
 # Not a service: what the spikes under spikes/ import (system design, section 12). The OpenAI and
