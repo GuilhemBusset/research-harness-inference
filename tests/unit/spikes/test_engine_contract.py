@@ -10,6 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
+import botocore
+import botocore.awsrequest
+import botocore.config
+import botocore.exceptions
+import botocore.session
 import pytest
 
 import engine_contract as job
@@ -308,3 +313,82 @@ def test_the_vocabulary_is_the_contract_script_s() -> None:
     script = (Path(__file__).resolve().parents[3] / "services/engine/contract/run.sh").read_text(encoding="utf-8")
     (tests,) = re.findall(r"^tests=\(([^)]*)\)$", script, flags=re.MULTILINE)
     assert tuple(tests.split()) == job.TESTS
+
+
+def test_time_spent_before_the_session_admits_the_run_never_shortens_it(
+    pool_state: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The build has room for a two-minute run when the job starts, and reading the configuration
+    # takes 40 seconds of it: the run no longer fits once admitted, and is refused, nothing sent.
+    clock = Clock()
+    pool = SimpleNamespace(name="coursework", engine="vllm")
+
+    def read_ssm() -> SimpleNamespace:
+        clock.sleep(40)
+        return SimpleNamespace(pools=[pool], session_max_hours=12)
+
+    monkeypatch.setattr(job.config, "read_ssm", read_ssm)
+    build = {"RHI_SPIKE_BUILD_MINUTES": "480", "CODEBUILD_START_TIME": str(int((T0 - 473 * 60) * 1000))}
+    ssm = RunCommand([(FIRST, "Success", PASSING)])
+    status, lines, _ = ran(pool_state, ssm, 1, clock, RHI_SPIKE_RUN_MINUTES="2", **build)
+    assert status == 1 and ssm.sent == []
+    (line,) = lines
+    assert (line["kind"], line["error"]) == ("job_failed", "RunOutlastsBuild")
+
+
+class Body:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def stream(self, **_: Any) -> Any:
+        yield self.body
+
+
+class LostReply:
+    """Systems Manager behind an SDK client, in process: it accepts each send, but the reply to the
+    first never comes back; the first command's check fails, any later one's passes."""
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.reads = 0
+
+    def client(self, config: Any) -> Any:
+        session = botocore.session.get_session()
+        merged = config.merge(botocore.config.Config(signature_version=botocore.UNSIGNED))
+        client = session.create_client("ssm", region_name="us-east-1", config=merged)
+        client.meta.events.register("before-send.ssm", self.answer)
+        return client
+
+    def answer(self, request: Any, **_: Any) -> Any:
+        operation = request.headers["X-Amz-Target"].split(b".")[-1]
+        if operation == b"SendCommand":
+            self.commands.append(f"command-{len(self.commands)}")
+            if len(self.commands) == 1:
+                raise botocore.exceptions.ReadTimeoutError(endpoint_url=request.url)
+            body: dict[str, Any] = {"Command": {"CommandId": self.commands[-1]}}
+        else:
+            self.reads += 1
+            first = json.loads(request.body)["CommandId"] == self.commands[0]
+            output = PASSING.replace("test_health passed", "test_health failed") if first else PASSING
+            status = "Failed" if first else "Success"
+            body = {
+                "CommandInvocations": [{"InstanceId": FIRST, "Status": status, "CommandPlugins": [{"Output": output}]}]
+            }
+        return botocore.awsrequest.AWSResponse(request.url, 200, {}, Body(json.dumps(body).encode()))
+
+
+@pytest.mark.parametrize("client", ["the job's own", "one that retries"])
+def test_a_send_whose_reply_was_lost_fails_the_job(
+    client: str, pool_state: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ssm = LostReply()
+    monkeypatch.setattr(job.boto3, "client", lambda service, config: ssm.client(config))
+    given = ssm.client(job.SSM_CLIENT) if client == "one that retries" else None
+    status, lines, _ = ran(pool_state, given, instances=1)
+    assert status == 1 and checks(lines) == [] and ssm.reads == 0
+    if client == "the job's own":
+        # Sent once: the check runs once, and the lost reply is the error that fails the job.
+        assert len(ssm.commands) == 1 and lines[-1]["error"] == "ReadTimeoutError"
+    else:
+        # Sent again by the SDK: the job reads neither command, and fails.
+        assert len(ssm.commands) == 2 and lines[-1]["error"] == "AmbiguousSend"

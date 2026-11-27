@@ -36,8 +36,14 @@ error.
 `RHI_SPIKE_BUILD_MINUTES` (`rhi.pipeline.spikes`), counted from CodeBuild's
 `CODEBUILD_START_TIME`, or from the job's own start outside a build. A run whose minutes, with
 `BUILD_MARGIN_SECONDS` to write what it read, would end after that is refused before anything is
-read or sent (`RunOutlastsBuild`); one admitted later than that allows still ends its wait in time.
-A run whose minutes ended before the command could be sent fails with `RunElapsed`, nothing sent.
+sent (`RunOutlastsBuild`): when the job starts, and again when the session check admits it, so that
+time spent before the admission never shortens the run's minutes. A run whose minutes ended before
+the command could be sent fails with `RunElapsed`, nothing sent.
+
+**One send.** The command is sent once, by a client that does not retry the send: a send whose
+reply was lost may have started the check all the same, and a second command would leave the
+first one's invocations unread. Such a send fails the job with the error's type. A send the SDK
+did retry, on a client given to the job, fails it with `AmbiguousSend`, before anything is read.
 
 **What is recorded**, one JSON object a line on standard output, which the spike jobs' log group
 keeps. Every line has `at`, its UTC time, and `kind`:
@@ -106,10 +112,12 @@ BUILD_START_VARIABLE = "CODEBUILD_START_TIME"
 # Seconds kept, at the end of a build, for a request started at the end of the run's minutes to
 # come back, bounded by `SSM_CLIENT`, and for the lines to be written.
 BUILD_MARGIN_SECONDS = 300
-# Each request to Systems Manager ends within about two minutes, its retries included.
+# Each request to Systems Manager ends within about two minutes, its retries included. The send
+# is never retried (module docstring, "One send").
 SSM_CLIENT = botocore.config.Config(
     connect_timeout=10, read_timeout=30, retries={"mode": "standard", "total_max_attempts": 3}
 )
+SEND_CLIENT = SSM_CLIENT.merge(botocore.config.Config(retries={"mode": "standard", "total_max_attempts": 1}))
 
 
 class RunOutlastsBuild(Exception):
@@ -118,6 +126,10 @@ class RunOutlastsBuild(Exception):
 
 class RunElapsed(Exception):
     """The run's minutes ended before the command could be sent."""
+
+
+class AmbiguousSend(Exception):
+    """The SDK sent the command more than once, so the command it answered may not be the only one."""
 
 
 class IncompleteListing(Exception):
@@ -218,13 +230,15 @@ def check(
     deadline: float,
     now: Callable[[], float],
     sleep: Callable[[float], None],
+    sender: Any = None,
 ) -> Listing:
-    """Sends the document to the pool's instances, by the tag, and reads its invocations into
-    `held` until `deadline` (module docstring, "The wait"); how the last listing ended. `RunElapsed`,
-    nothing sent, once `deadline` has come."""
+    """Sends the document to the pool's instances, by the tag, once, with `sender` (`ssm` unless
+    given), and reads its invocations into `held` with `ssm` until `deadline` (module docstring,
+    "The wait"); how the last listing ended. `RunElapsed`, nothing sent, once `deadline` has come;
+    `AmbiguousSend`, nothing read, when the SDK sent the command more than once."""
     if now() >= deadline:
         raise RunElapsed
-    sent = ssm.send_command(
+    sent = (ssm if sender is None else sender).send_command(
         DocumentName=DOCUMENT,
         Targets=[{"Key": f"tag:{POOL_TAG}", "Values": [pool]}],
         MaxConcurrency="100%",
@@ -232,6 +246,8 @@ def check(
         # How long an instance may take to start the check: no longer than the run has left.
         TimeoutSeconds=max(30, int(deadline - now())),
     )
+    if sent.get("ResponseMetadata", {}).get("RetryAttempts", 0):
+        raise AmbiguousSend
     command_id = sent["Command"]["CommandId"]
     last = Listing.LATE
     while True:
@@ -294,12 +310,15 @@ def run_job(
         session_max_hours=settings.session_max_hours,
         now=admitting,
     )
-    deadline = min(admitted[-1] + needs.run_minutes * 60, ends_by)
+    deadline = admitted[-1] + needs.run_minutes * 60
+    if deadline > ends_by:
+        raise RunOutlastsBuild
     lines.write(Line.JOB, pool=name, engine=pool.engine)
     held: dict[str, Mapping[str, Any]] = {}
-    client = boto3.client("ssm", config=SSM_CLIENT) if ssm is None else ssm
+    reader = boto3.client("ssm", config=SSM_CLIENT) if ssm is None else ssm
+    sender = boto3.client("ssm", config=SEND_CLIENT) if ssm is None else ssm
     try:
-        listing = check(client, name, held, deadline=deadline, now=now, sleep=sleep)
+        listing = check(reader, name, held, deadline=deadline, now=now, sleep=sleep, sender=sender)
     except Exception:
         # What was read before the error is recorded all the same; the error then fails the job.
         record(lines, held.values(), instances=needs.instances)
