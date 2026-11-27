@@ -25,6 +25,23 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
+## The engine's own git runs none of git's background maintenance (2026-11-27)
+
+A local patch, not in upstream, that extends "The tests' repositories run none of git's background
+maintenance" below to the engine. A fetch, a commit and a merge each end by starting `git
+maintenance run --auto`, which detaches. From git 2.56 it prunes worktrees, and that prune deletes
+the entry of a worktree that `git worktree add` is still creating, so the `add` dies; the engine
+adds a worktree right after a fetch. The loop's host has an older git today; this holds once it is
+upgraded. The supervisor's own `git pull --ff-only` of the main checkout (`supervisor.py`, before
+it launches the engine) runs in its own process, without `engine_git_env`, so it is not covered:
+that stays a follow-up for the owner. The engine's version stays 1.2.22: nothing waits for this
+change.
+
+| File | What changed |
+| --- | --- |
+| `implement_loop/sandbox.py` | `ENGINE_GIT_CONFIG` also sets `maintenance.auto` to false, so every git process of a run (`engine_git_env`) starts no maintenance, whatever the repository's configuration says. |
+| `tests/test_sandbox.py` | With the repository asking for maintenance, the engine's commit, fetch and merge, and the worktree it adds after a fetch, start none, read from git's own trace (`test_temp_repo.traced`), which shows one for a commit made without the engine's setting. |
+
 ## A reproduction that cannot load the verifier's plugin runs again with it (2026-11-26)
 
 A local patch, not in upstream. The verifier loads its pytest result plugin through
