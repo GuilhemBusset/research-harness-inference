@@ -249,11 +249,15 @@ CONFIGURES_THE_BUILDKIT = re.compile(
     rf"""printf '\[registry\."%s"\]\\n  mirrors = \["%s"\]\\n' "\${MIRRORED_REGISTRY}" """
     rf'"{MIRROR}" > {BUILDKIT_CONFIG}'
 )
+# The registry's host, read from the caller's account and CodeBuild's region: every other command
+# that reads it runs after this one (`finds_the_registry_first`).
+REGISTRY_VARIABLE = "RHI_REGISTRY"
+FINDS_THE_REGISTRY = re.compile(
+    r'export RHI_REGISTRY="\$\(aws sts get-caller-identity --query Account --output text\)'
+    r'\.dkr\.ecr\.\$AWS_REGION\.amazonaws\.com"'
+)
 INSTALLS_THE_IMAGE_BUILDER = [
-    re.compile(
-        r'export RHI_REGISTRY="\$\(aws sts get-caller-identity --query Account --output text\)'
-        r'\.dkr\.ecr\.\$AWS_REGION\.amazonaws\.com"'
-    ),
+    FINDS_THE_REGISTRY,
     re.compile(r'aws ecr get-login-password \| docker login --username AWS --password-stdin "\$RHI_REGISTRY"'),
     re.compile(rf'docker run --privileged --rm "{MIRROR}/tonistiigi/binfmt{DIGEST}" --install arm64'),
     re.compile(
@@ -587,7 +591,24 @@ def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> 
             any(install.fullmatch(command) for install in installs) for command in commands if command not in publishing
         )
         and (not configures or mirrors_docker_hub(action, template))
+        and finds_the_registry_first(build_spec_of(action, template))
     )
+
+
+def finds_the_registry_first(build_spec: Any) -> bool:
+    """Whether every command that reads the registry's host (`REGISTRY_VARIABLE`) runs after the
+    command that finds it (`FINDS_THE_REGISTRY`), so that none reads a value set before: each is
+    among the install phase's commands, which CodeBuild runs in their order before any other
+    phase, after the first that finds it."""
+    phases = json.loads(build_spec)["phases"]
+    commands = commands_of(build_spec) or []
+    reading = [command for command in commands if REGISTRY_VARIABLE in command and not FINDS_THE_REGISTRY.fullmatch(command)]
+    if not reading:
+        return True
+    install = phases.get("install", {}).get("commands", [])
+    found = next((at for at, command in enumerate(install) if FINDS_THE_REGISTRY.fullmatch(command)), None)
+    after = [] if found is None else [command for command in install[found + 1 :] if REGISTRY_VARIABLE in command]
+    return sorted(reading) == sorted(command for command in after if not FINDS_THE_REGISTRY.fullmatch(command))
 
 
 def mirrors_docker_hub(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
@@ -2027,6 +2048,14 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             a_publisher_that_installs([IMAGE_BUILDER[CONFIGURES_THE_BUILDER].replace('"$RHI_REGISTRY', '"example.com')]),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that configures a mirror outside the deploying account's registry",
+        ),
+        pytest.param(
+            a_publisher_that_installs(
+                [IMAGE_BUILDER[CONFIGURES_THE_BUILDER], *IMAGE_BUILDER[:CONFIGURES_THE_BUILDER], IMAGE_BUILDER[CREATES_THE_BUILDER]],
+                variables={**IMAGE_BUILDER_VARIABLES, "RHI_REGISTRY": "example.com"},
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures the mirror before it finds the deploying account's registry",
         ),
         pytest.param(
             a_publisher_that_installs(IMAGE_BUILDER, variables={"RHI_MIRRORED_REGISTRY": "example.com"}),

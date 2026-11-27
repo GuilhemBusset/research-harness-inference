@@ -119,15 +119,36 @@ TAKES_AN_IMAGE = [
     *(["docker", "container", verb] for verb in ("run", "create")),
     ["docker", "image", "pull"],
 ]
+# The Docker commands that name no image among their words: the login names a registry, and the
+# creation of a builder names its image in an `image=` option.
+NAMES_NO_IMAGE = [["docker", "login"], ["docker", "buildx", "create"]]
+
+
+def words_of(command: str) -> list[str]:
+    """A command's words as the shell reads them, its operators (`|`, `&&`, `;`, `>`, ...) apart."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
 
 
 def images_of(words: list[str]) -> list[str]:
-    """The container images a command names: what a Docker command of `TAKES_AN_IMAGE` starts,
-    creates or pulls (options written as one word), and an `image=` option."""
+    """The container images a command names: an `image=` option, and in each simple command of
+    Docker's, what one of `TAKES_AN_IMAGE` starts, creates or pulls (options written as one word),
+    and, in any other but those of `NAMES_NO_IMAGE` (a manifest's lookup, a tag, a push), each of
+    its words: what this does not know how to read is taken to name an image."""
     found = [part.split("=", 1)[1] for word in words for part in word.split(",") if part.startswith("image=")]
-    for verb in TAKES_AN_IMAGE:
-        if words[: len(verb)] == verb:
-            found += [next(word for word in words[len(verb) :] if not word.startswith("-"))]
+    simple: list[list[str]] = [[]]
+    for word in words:
+        if word and set(word) <= set("();<>|&"):
+            simple.append([])
+        else:
+            simple[-1].append(word)
+    for command in simple:
+        if command[:1] != ["docker"] or any(command[: len(verb)] == verb for verb in NAMES_NO_IMAGE):
+            continue
+        verb = next((verb for verb in TAKES_AN_IMAGE if command[: len(verb)] == verb), ["docker"])
+        arguments = [word for word in command[len(verb) :] if not word.startswith("-")]
+        found += arguments[:1] if verb in TAKES_AN_IMAGE else arguments
     return found
 
 
@@ -137,7 +158,7 @@ def unpinned(commands: list[str]) -> list[str]:
     checksum, a package without an exact version."""
     found = []
     for command in commands:
-        words = shlex.split(command)
+        words = words_of(command)
         found += [image for image in images_of(words) if not DIGEST.search(image)]
         for url in [word for word in words if word.startswith(("https://", "http://"))]:
             written = words[words.index("-o") + 1] if "-o" in words else url.rsplit("/", 1)[-1]
@@ -180,7 +201,7 @@ def test_each_image_project_installs_the_emulator_and_the_builder_from_the_mirro
     for number, project in enumerate(projects):
         spec = build_spec(project)
         install, build = spec["phases"]["install"]["commands"], spec["phases"]["build"]["commands"]
-        words = [shlex.split(command) for command in install]
+        words = [words_of(command) for command in install]
         # The registry's host, read on the build host: the caller's account and CodeBuild's region.
         (finds,) = [at for at, w in enumerate(words) if w[:1] == ["export"] and w[1].startswith("RHI_REGISTRY=")]
         # The login to that registry, with the project's own role.
@@ -193,9 +214,12 @@ def test_each_image_project_installs_the_emulator_and_the_builder_from_the_mirro
         # The builder's configuration: one mirror, for Docker Hub, the mirror's path in the registry.
         (configures,) = [at for at, w in enumerate(words) if w[:1] == ["printf"] and "mirrors" in w[1]]
         written = words[configures][words[configures].index(">") + 1]
+        # Written once the registry's host is known, and run here in the order CodeBuild runs them.
+        assert finds < configures
         folder = tmp_path / str(number)
-        folder.mkdir()
-        commands = [install[finds], install[configures].replace(written, str(folder / "buildkitd.toml"))]
+        folder.mkdir(exist_ok=True)
+        to_folder = {configures: install[configures].replace(written, str(folder / "buildkitd.toml"))}
+        commands = [to_folder.get(at, install[at]) for at in sorted((finds, configures))]
         assert in_the_shell(commands, spec["env"]["variables"], folder) == REGISTRY
         configuration = tomllib.loads((folder / "buildkitd.toml").read_text(encoding="utf-8"))
         assert configuration == {"registry": {"docker.io": {"mirrors": [f"{REGISTRY}/rhi-mirror"]}}}
@@ -219,7 +243,7 @@ def test_each_image_project_installs_the_emulator_and_the_builder_from_the_mirro
 
 def test_no_command_of_an_image_project_names_an_image_on_docker_hub(template: dict[str, Any]) -> None:
     commands = [command for project in image_projects(template) for command in commands_of(project)]
-    images = [image.replace("$RHI_REGISTRY", REGISTRY) for c in commands for image in images_of(shlex.split(c))]
+    images = [image.replace("$RHI_REGISTRY", REGISTRY) for c in commands for image in images_of(words_of(c))]
     assert len(images) == 4
     assert not [image for image in images if on_docker_hub(image)]
     # CodeBuild writes each command it runs to the build's log: none names Docker Hub's hosts.
@@ -246,6 +270,8 @@ def test_an_image_on_docker_hub_is_found(image: str, expected: bool) -> None:
         pytest.param("finally", "docker pull docker.io/library/python", id="a pull in a finally block"),
         pytest.param("commands", "docker image pull python", id="a pull under the image group"),
         pytest.param("commands", "docker container run --rm python", id="a run under the container group"),
+        pytest.param("commands", "docker manifest inspect python:3.13-slim", id="a manifest's lookup"),
+        pytest.param("commands", "true && docker pull python", id="a pull after an operator"),
     ],
 )
 def test_a_command_that_names_an_image_on_docker_hub_is_found(
@@ -260,11 +286,36 @@ def test_a_command_that_names_an_image_on_docker_hub_is_found(
         test_no_command_of_an_image_project_names_an_image_on_docker_hub(changed)
 
 
+def configured_first(template: dict[str, Any]) -> dict[str, Any]:
+    """`template` with the builder's configuration of its first image project written before the
+    registry's host is found, while the build's variables already name another registry."""
+    changed = copy.deepcopy(template)
+    project = image_projects(changed)[0]
+    spec = build_spec(project)
+    install = spec["phases"]["install"]["commands"]
+    (configures,) = [command for command in install if command.startswith("printf ")]
+    install.remove(configures)
+    install.insert(0, configures)
+    spec["env"]["variables"]["RHI_REGISTRY"] = "example.com"
+    project["Source"]["BuildSpec"] = json.dumps(spec)
+    return changed
+
+
+def test_a_configuration_written_before_the_registry_is_known_is_found(
+    template: dict[str, Any], tmp_path: Path
+) -> None:
+    with pytest.raises(AssertionError):
+        test_each_image_project_installs_the_emulator_and_the_builder_from_the_mirror_and_builds_with_them(
+            configured_first(template), tmp_path
+        )
+
+
 def test_the_pipeline_policy_leaves_out_an_image_project_only_while_its_mirror_is_for_docker_hub(
     template: dict[str, Any],
 ) -> None:
     """The policy of `tests/policy/test_pipeline.py` leaves out each image project as the stack
-    writes it, and lists one whose builder's configuration mirrors another registry."""
+    writes it, and lists one whose builder's configuration mirrors another registry, or is
+    written before the project finds the deploying account's registry."""
     policy = runpy.run_path(str(Path(__file__).resolve().parents[1] / "policy" / "test_pipeline.py"))
     (pipeline,) = [r["Properties"] for r in template["Resources"].values() if r["Type"] == "AWS::CodePipeline::Pipeline"]
     (stage,) = [stage for stage in pipeline["Stages"] if stage["Name"] == ASSET_STAGE]
@@ -278,6 +329,10 @@ def test_the_pipeline_policy_leaves_out_an_image_project_only_while_its_mirror_i
         spec["env"]["variables"]["RHI_MIRRORED_REGISTRY"] = "example.com"
         project["Source"]["BuildSpec"] = json.dumps(spec)
         assert not policy["publishes_assets"](action, changed)
+    changed = configured_first(template)
+    reordered = [a for a in stage["Actions"] if policy["build_spec_of"](a, changed) != policy["build_spec_of"](a, template)]
+    assert len(reordered) == 1
+    assert not policy["publishes_assets"](reordered[0], changed)
 
 
 def test_the_file_project_is_left_as_cdk_pipelines_writes_it(template: dict[str, Any]) -> None:
