@@ -1,6 +1,7 @@
 """The pipeline deploys the stage, from `main` only (system design, section 8.2).
 
-CodePipeline V2 in queued execution, so that each commit has its own execution. The source is a
+CodePipeline V2 in superseded execution: a newer merge overtakes an execution that waits between
+stages, and the reporter gives the overtaken commit the newer one's verdict. The source is a
 connection the stack creates, on `main`, for the repository the configuration names. The synth
 step synthesizes the app (its own tests are in test_pipeline_synth.py), and the self-update follows
 it. The stage's stacks are deployed only by the pipeline, after the copy of the weights, and with no
@@ -64,10 +65,10 @@ def test_the_app_is_the_pipeline_stack_and_its_stage(templates: dict[str, dict[s
     assert stacks and stacks == deployed
 
 
-def test_the_pipeline_is_v2_and_queued(templates: dict[str, dict[str, Any]]) -> None:
+def test_the_pipeline_is_v2_and_superseded(templates: dict[str, dict[str, Any]]) -> None:
     pipeline = the_pipeline(templates)
     assert pipeline["PipelineType"] == "V2"
-    assert pipeline["ExecutionMode"] == "QUEUED"
+    assert pipeline["ExecutionMode"] == "SUPERSEDED"
 
 
 def test_one_source_on_main_from_the_stacks_connection(templates: dict[str, dict[str, Any]]) -> None:

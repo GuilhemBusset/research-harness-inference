@@ -140,6 +140,12 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
    its new shape, so that one runs through. `<execution>` below is the execution whose actions of
    the stage `Rhi` ran, whichever it is.
 
+   **A newer merge.** The pipeline runs in superseded mode: a newer merge can supersede an
+   execution waiting between stages, the one you started with **Release change** included, which
+   then ends `Superseded` in the history above without reaching the stage `Rhi`. The newer
+   execution synthesizes from SSM again, so it deploys its own commit and the configuration SSM
+   holds, the flag included: it is then `<execution>`, and you need not start another.
+
    The stage's stacks deploy in the order parking needs (`src/rhi/stage.py`): the stacks that
    import from others drop their imports first, then the network stack removes the load balancer
    and the NAT gateway. The gateway's tasks drain before they stop, for up to 30 minutes (section
@@ -176,7 +182,10 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
    Then start an execution with **Release change**, and find `<execution>` as in step 1: the
    pipeline updates itself again, since the weekly canary and the verification's tests come back,
-   and the execution you started may end at the self-update with none started after it.
+   and the execution you started may end at the self-update with none started after it. As in
+   step 1, a newer merge can also supersede the execution you started while it waits between
+   stages: the newer one deploys its commit and the configuration SSM holds, and is then
+   `<execution>`.
 
    **No approval.** Unparking adds back the roles, policies and security group rules that parking
    removed. The pipeline holds no approval (system design, section 8.4, control 6), so the
