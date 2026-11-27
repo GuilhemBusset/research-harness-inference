@@ -33,10 +33,11 @@ reference inside a tool result), and its `Tool` object.
 **What is not listed**, and is therefore dropped like a field nobody has heard of:
 
 - what speaks to Anthropic's own service, which this endpoint does not have: `container`,
-  `diagnostics`, `inference_geo`, `service_tier` and `speed`; the tools Anthropic defines or runs
-  (every kind of `tools` entry but `Tool`), and what only a citation of a web search result has
-  (`CitationWebSearchResultLocationParam`: `encrypted_index` and `url`). The blocks that carry
-  those tools' calls and results never reach the allow-list: they are replaced (below);
+  `diagnostics`, `inference_geo`, `service_tier` and `speed`, and what only a citation of a web
+  search result has (`CitationWebSearchResultLocationParam`: `encrypted_index` and `url`). A
+  `tools` entry of a tool Anthropic defines or runs is not dropped: it refuses the request
+  (below), and the blocks that carry those tools' calls and results never reach the allow-list:
+  they are replaced (below);
 - the rest of the beta reference: `context_management`, which Claude Code sends with every
   request and the engine does not read, `mcp_servers`, `fallbacks`, `compaction`, `thread`, a
   system message's `clear_at` and `output_config`, the references to an MCP server's tools;
@@ -80,6 +81,23 @@ content of each message and the content of each tool result in it are looked at.
 keeps its place and its content, a content written as one string is left as sent, and an image
 given by URL, or any other reference that is not inline data, is still refused by the media rule.
 
+**A request that declares one of Anthropic's own tools is refused** (section 6.2, step 4), with
+the cause `request_refused`, by `refuse_anthropic_tools`, which `blocks_as_text` runs first: for
+every pool, on both Messages routes, before the allow-list and before anything is forwarded. Such
+a request has an entry in its top-level `tools` whose `type` is present, is not null and is not
+`custom`: a tool Anthropic's service runs (web search, web fetch, code execution) or one Anthropic
+defines for the client (`bash_*`, `text_editor_*`). An entry whose `type` is `custom`, is null or
+is absent is a `Tool`, and is kept as the allow-list describes it. The blocks of those tools in
+the history are still replaced, as above. The request is refused and not rewritten because no
+engine behind this gateway runs those tools, the engine refuses the entry (vLLM 0.33 requires an
+`input_schema`, which these entries do not have, and answers 400 before it runs anything `[E28]`),
+and a request with the entry dropped would be answered as if the tool had run: the model would
+answer a web search from memory, and Claude Code would hand that answer to the session as the
+search's results. This keeps ADR 0003, decision 7: a `tools` entry is in no history, and Claude
+Code runs its web search as a request of its own, whose refusal it gives the model as the tool's
+error while the session goes on. Only the top-level `tools` is read: a tool definition inside a
+system message's tool addition is history, and is left to the allow-list.
+
 Nothing here reads configuration, the environment or the network.
 """
 
@@ -87,7 +105,14 @@ from __future__ import annotations
 
 from typing import Any, Final
 
+from rhi_common.causes import Cause
 from rhi_gateway.body import KEEP, Fields, Items, Kinds, Limit, Shapes, Spec
+from rhi_gateway.errors import GatewayError
+
+# The refusal of a request that declares one of Anthropic's own tools, for the gateway's own use.
+ANTHROPIC_TOOL_REFUSAL: Final = "the tools declare a tool that Anthropic defines or runs"
+# The one `type` of a `tools` entry that is a `Tool`, besides none.
+_CUSTOM_TOOL = "custom"
 
 # What the engine reads where a block of each kind was. No number, no name of the deployment.
 SEARCH_RESULT_SENTENCE: Final = (
@@ -153,8 +178,25 @@ def _blocks(content: object) -> object:
     return replaced
 
 
+def refuse_anthropic_tools(body: dict[str, Any]) -> None:
+    """Refuse a body whose top-level `tools` holds an entry whose `type` is present, not null and not `custom`.
+
+    A `tools` value that is not an array, and an entry that is not an object, are left to the allow-list.
+    """
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return
+    for entry in tools:
+        if isinstance(entry, dict) and entry.get("type") not in (None, _CUSTOM_TOOL):
+            raise GatewayError(Cause.REQUEST_REFUSED, ANTHROPIC_TOOL_REFUSAL)
+
+
 def blocks_as_text(body: dict[str, Any]) -> dict[str, Any]:
-    """The body with every block this endpoint cannot serve, in a message or in a tool result, replaced in its place."""
+    """The body with every block this endpoint cannot serve, in a message or in a tool result, replaced in its place.
+
+    A body that declares one of Anthropic's own tools is refused first (`refuse_anthropic_tools`).
+    """
+    refuse_anthropic_tools(body)
     conversation = body.get("messages")
     if not isinstance(conversation, list):
         return body

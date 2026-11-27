@@ -16,8 +16,9 @@ rewrites a few fields and sends its own serialization of the result. The order i
 4. **Replace what the format cannot serve**: the replacement the caller gives for its wire
    format gets the parsed body and returns the body the next steps read. Messages gives one
    (`rhi_gateway.formats.messages.blocks_as_text`): a block no engine behind this gateway can
-   read becomes a line of text, before the allow-list or the media rule could drop or refuse it.
-   A filter given no replacement applies none.
+   read becomes a line of text, before the allow-list or the media rule could drop or refuse it,
+   and a request that declares one of Anthropic's own tools is refused. A filter given no
+   replacement applies none.
 5. **Keep the allow-list**: at each level it describes, a field it does not name is dropped. A
    number it marks with a `Limit` is clamped to that limit of the pool.
 6. **Refuse a media reference that is not inline data** (below).
