@@ -144,7 +144,12 @@ Rules hold those two, and every action:
   table; read the spikes' one secret, `rhi/spike-keys`; query the workspace of a stage a pipeline deploys, by the condition on its tag
   alone, as the verification's role does; put events on the measurement bus; use the connection of
   its own template; write to the log group its project names and use the key its project is
-  encrypted with. So no action of Auto Scaling, EC2 or IAM, and no other secret. A wildcard
+  encrypted with; send the contract check (section 4.1), `ssm:SendCommand` on the document
+  `rhi-engine-contract` of the deploying account and region and on its instances, a statement
+  that names an instance only under the condition `ON_A_POOL`, alone, whose values are the tags
+  `rhi-pool` the launch templates of a stack a pipeline deploys give their instances; and read the
+  invocations, `ssm:ListCommandInvocations`, which AWS grants only on every resource. So no action
+  of Auto Scaling, EC2 or IAM, and no other secret. A wildcard
   action, `NotAction`, `NotResource` and a managed policy the template does not hold are taken as
   reaching more;
 - the weekly GPU canary, the CodeBuild project named `rhi-gpu-canary` (sections 8.2, step 6, and
@@ -457,11 +462,17 @@ STARTS_INSTANCES = "a role other than the promotion job's that may start an inst
 # spikes' one secret, the construct ID of the pool-state table, which its logical ID begins with
 # after its parents' (`src/rhi/pools/tables.py`), and the actions a spike job's role may be allowed,
 # each with the kind of resource it may be allowed on. `MOCK_POOL_ITEMS` is the pool-state table
-# again, for the one write: only under the condition `OF_THE_MOCK_POOL`.
+# again, for the one write: only under the condition `OF_THE_MOCK_POOL`. `CONTRACT_CHECK` is the
+# document `rhi-engine-contract` and the instances, which a statement names only under the
+# condition on the tag `rhi-pool` (`ON_A_POOL`).
 RUNS_A_SPIKE = re.compile(r"(^|\s)spikes/[\w./-]+")
 SPIKE_SECRET = "rhi/spike-keys"
 POOL_STATE = "PoolState"
 MOCK_POOL_ITEMS = "mock pool's items"
+CONTRACT_CHECK = "contract check"
+CONTRACT_DOCUMENT = "rhi-engine-contract"
+POOL_TAG = "rhi-pool"
+ON_A_POOL = "StringEquals"
 SPIKES_MAY = {
     "ssm:GetParametersByPath": "configuration",
     "dynamodb:GetItem": "pool-state",
@@ -478,6 +489,8 @@ SPIKES_MAY = {
     "kms:DescribeKey": "key",
     "kms:Encrypt": "key",
     "kms:GenerateDataKey": "key",
+    "ssm:SendCommand": CONTRACT_CHECK,
+    "ssm:ListCommandInvocations": "every resource",
 }
 SPIKE_STARTED = "a spike job that something other than the owner may start"
 # The weekly GPU canary: its project's and its schedule's one name, what starts its build, and
@@ -517,7 +530,8 @@ CANARY_MORE = (
 SPIKES_MORE = (
     "a spike job's role that may do more than read the configuration, the pool-state records and the spikes'"
     " secret, write the mock pool's items of the pool-state table, query its stage's workspace, send a"
-    " measurement, read the repository and write its logs"
+    " measurement, read the repository, write its logs, and send the contract check to the instances of"
+    " a pool by their tag and read its invocations"
 )
 
 
@@ -1417,6 +1431,39 @@ def stage_tags(templates: Templates) -> set[str]:
     return set().union(*map(workspace_tags, deployed)) - set().union(*map(workspace_tags, elsewhere))
 
 
+def pool_tags(templates: Templates) -> set[str]:
+    """The values of the tag `rhi-pool` the launch templates of the stacks the pipelines of
+    `templates` deploy give the instances they launch."""
+    deployed = [
+        template
+        for _, _, pipeline, _ in resources(templates, "AWS::CodePipeline::Pipeline")
+        for _, actions in stages_of(pipeline)
+        for template in deployed_by(actions, templates)
+    ]
+    return {
+        tag.get("Value")
+        for template in deployed
+        for _, _, launch_template, _ in resources({"": template}, "AWS::EC2::LaunchTemplate")
+        for specification in as_list(launch_template.get("LaunchTemplateData", {}).get("TagSpecifications", []))
+        if isinstance(specification, dict) and specification.get("ResourceType") == "instance"
+        for tag in as_list(specification.get("Tags", []))
+        if isinstance(tag, dict) and tag.get("Key") == POOL_TAG and isinstance(tag.get("Value"), str)
+    }
+
+
+def on_a_pool(condition: Any, pools: set[str]) -> bool:
+    """Whether a statement's condition admits only instances whose tag `rhi-pool` is one of
+    `pools`: `ON_A_POOL` on the key `ssm:resourceTag/rhi-pool` alone, with one value or more, each
+    one of them."""
+    if not isinstance(condition, dict) or list(condition) != [ON_A_POOL]:
+        return False
+    (keys,) = condition.values()
+    if not isinstance(keys, dict) or list(keys) != [f"ssm:resourceTag/{POOL_TAG}"]:
+        return False
+    values = as_list(keys[f"ssm:resourceTag/{POOL_TAG}"])
+    return bool(values) and all(isinstance(value, str) and value in pools for value in values)
+
+
 def spike_resources(
     templates: Templates, template: Mapping[str, Any], project: str
 ) -> dict[str, list[re.Pattern[str]]]:
@@ -1441,20 +1488,32 @@ def spike_resources(
         "connection": [re.compile(rf"\$\{{{re.escape(found)}\.ConnectionArn\}}") for found in connections],
         "logs": [re.compile(rf"\$\{{{re.escape(own_logs)}\.Arn\}}")] if isinstance(own_logs, str) else [],
         "key": [re.compile(rf"\$\{{{re.escape(own_key)}\.Arn\}}")] if isinstance(own_key, str) else [],
+        CONTRACT_CHECK: [
+            re.compile(rf"{PARTITION}:ssm:{HERE}:document/{re.escape(CONTRACT_DOCUMENT)}"),
+            re.compile(rf"{PARTITION}:ec2:{HERE}:instance/\*"),
+        ],
+        "every resource": [re.compile(r"\*")],
     }
 
 
-def spikes_more(statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]], tags: set[str]) -> bool:
+def spikes_more(
+    statement: Mapping[str, Any], allowed: Mapping[str, list[re.Pattern[str]]], tags: set[str], pools: set[str]
+) -> bool:
     """Whether an allowed statement of a spike job's role reaches an action it is not given, a
     resource beyond those of the action's kind, where it writes items of the pool-state table, any
-    item but the mock pool's: its condition must be `OF_THE_MOCK_POOL`, alone, or, where it queries
-    workspaces, any workspace but its stage's: its condition must be the one that admits a workspace
-    by the stage's tag, alone."""
+    item but the mock pool's: its condition must be `OF_THE_MOCK_POOL`, alone; where it sends the
+    contract check to instances, any instance but a pool's of `pools`: its condition must be
+    `on_a_pool`'s; or, where it queries workspaces, any workspace but its stage's: its condition
+    must be the one that admits a workspace by the stage's tag, alone."""
     if reports_more(statement, allowed, SPIKES_MAY):
         return True
     named = {action.lower() for action in as_list(statement.get("Action", []))}
     writes = {action.lower() for action, kind in SPIKES_MAY.items() if kind == MOCK_POOL_ITEMS}
     if named & writes and not of_the_mock_pool(statement.get("Condition")):
+        return True
+    sends = {action.lower() for action, kind in SPIKES_MAY.items() if kind == CONTRACT_CHECK}
+    instances = [arn for arn in map(arn_text, as_list(statement.get("Resource", []))) if arn and ":ec2:" in arn]
+    if named & sends and instances and not on_a_pool(statement.get("Condition"), pools):
         return True
     queries = {action.lower() for action, kind in SPIKES_MAY.items() if kind == "workspaces"}
     if not named & queries:
@@ -1495,12 +1554,12 @@ def spike_breaches(templates: Templates) -> list[tuple[str, str, str]]:
         for path, logical_id, properties, _ in resources(templates, kind):
             if starts_one(properties.get(key), path):
                 found.append((path, logical_id, SPIKE_STARTED))
-    tags = stage_tags(templates)
+    tags, pools = stage_tags(templates), pool_tags(templates)
     for path, project, _, role in jobs:
         template = templates[path]
         allowed = spike_resources(templates, template, project)
         statements = statements_of(template, role) if role is not None else None
-        if statements is None or any(spikes_more(statement, allowed, tags) for statement in statements):
+        if statements is None or any(spikes_more(statement, allowed, tags, pools) for statement in statements):
             found.append((path, role or project, SPIKES_MORE))
     return found
 
@@ -3176,14 +3235,11 @@ def test_refuses_another_writer_of_the_images_and_a_trigger_of_the_job(
 TWO_SPIKES = (("first_spike", "first_spike.py"), ("second_spike", "second_spike.py"))
 
 
-@pytest.fixture(scope="module")
-def two_spikes(cdk: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
-    """The templates of the app of `app.py`, from the example configuration, with the two spike
-    jobs of `TWO_SPIKES` in place of the app's list, synthesized under cdk-nag."""
+def spike_app(cdk: ModuleType, outdir: Path, settings: Any, jobs: list[Any] | None = None) -> dict[str, dict[str, Any]]:
+    """The templates of the app of `app.py` for the configuration `settings`, with the spike jobs
+    of `jobs` in place of the app's list unless it is None, synthesized under cdk-nag."""
     import importlib.util
 
-    from rhi import config
-    from rhi.pipeline.spikes import SpikeJob
     from rhi.pipeline.stack import PipelineStack
     from rhi.stage import EndpointStage
 
@@ -3193,18 +3249,28 @@ def two_spikes(cdk: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dic
     app_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(app_module)
     context = json.loads((repo / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
-    outdir = tmp_path_factory.mktemp("spikes")
     app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
-    example = config.load({"RHI_CONFIG": "example"})
-    stage = EndpointStage(app, "Rhi", config=example)
+    stage = EndpointStage(app, "Rhi", config=settings)
     app_module.add_nag(app)
-    jobs = [SpikeJob(name, script) for name, script in TWO_SPIKES]
-    PipelineStack(app, "RhiPipeline", config=example, stage=stage, spike_jobs=jobs)
+    given = {} if jobs is None else {"spike_jobs": jobs}
+    PipelineStack(app, "RhiPipeline", config=settings, stage=stage, **given)
     out = Path(app.synth().directory)
     return {
         path.relative_to(out).as_posix(): json.loads(path.read_text(encoding="utf-8"))
         for path in sorted(out.rglob("*.template.json"))
     }
+
+
+@pytest.fixture(scope="module")
+def two_spikes(cdk: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
+    """The templates of the app of `app.py`, from the example configuration, with the two spike
+    jobs of `TWO_SPIKES` in place of the app's list, synthesized under cdk-nag."""
+    from rhi import config
+    from rhi.pipeline.spikes import SpikeJob
+
+    example = config.load({"RHI_CONFIG": "example"})
+    jobs = [SpikeJob(name, script) for name, script in TWO_SPIKES]
+    return spike_app(cdk, tmp_path_factory.mktemp("spikes"), example, jobs)
 
 
 def found_spikes(templates: Templates) -> list[tuple[str, str, str | None, str | None]]:
@@ -3228,7 +3294,28 @@ def test_two_spike_jobs_keep_the_rules(two_spikes: dict[str, dict[str, Any]]) ->
     # The rules found what the role may read: the stage's pool-state table and its workspace's tag.
     assert pool_state_tables(two_spikes) and stage_tags(two_spikes) == {"Rhi"}
     assert all(spike_resources(two_spikes, two_spikes[path], project)["logs"] for _, project, _, _ in found)
+    # And the pools whose instances it may send the contract check to, by the tag they launch with.
+    assert pool_tags(two_spikes) == {"coursework", "mock"}
     assert breaches(two_spikes) == []
+
+
+@pytest.mark.parametrize("stage", ["parked", "no pool"])
+def test_a_stage_that_launches_no_instance_keeps_the_rules(stage: str, cdk: ModuleType, tmp_path: Path) -> None:
+    # Parked, the stage keeps its pools in the configuration and holds no launch template; with no
+    # pool, there is none to name. Either way the role names no instance, and keeps the rules.
+    import tomllib
+
+    from rhi import config
+
+    raw = tomllib.loads((Path(__file__).resolve().parents[2] / "config.example.toml").read_text(encoding="utf-8"))
+    if stage == "parked":
+        raw["parked"] = True
+    else:
+        raw["pools"] = {}
+        raw.pop("default_pool", None)
+    built = spike_app(cdk, tmp_path, config.parse(raw, "example"))
+    assert pool_tags(built) == set()
+    assert spike_breaches(built) == []
 
 
 def the_spike_role(templates: Templates) -> tuple[Mapping[str, Any], dict[str, Any]]:
@@ -3321,6 +3408,11 @@ def here(service: str, resource: str) -> str:
     return HERE_ARN.replace("{}", service, 1).replace("{}", resource, 1)
 
 
+def on_pools(*pools: str) -> dict[str, Any]:
+    """The condition on the tag `rhi-pool` that admits the instances of `pools`."""
+    return {ON_A_POOL: {f"ssm:resourceTag/{POOL_TAG}": list(pools)}}
+
+
 # The stage's pool-state table, as the spike jobs' role names it.
 POOL_STATE_TABLE = here("dynamodb", "table/Rhi-Pools-TablesPoolState68A872F7-*")
 
@@ -3386,6 +3478,26 @@ POOL_STATE_TABLE = here("dynamodb", "table/Rhi-Pools-TablesPoolState68A872F7-*")
         pytest.param(
             a_statement("ssm:GetParametersByPath", here("ssm", "parameter/rhi/*")), {SPIKES_MORE}, id="other parameters"
         ),
+        pytest.param(
+            a_statement("ssm:SendCommand", here("ec2", "instance/*")),
+            {SPIKES_MORE},
+            id="sending the contract check to every instance",
+        ),
+        pytest.param(
+            a_statement("ssm:SendCommand", here("ec2", "instance/*"), on_pools("coursework", "another")),
+            {SPIKES_MORE},
+            id="sending it to an instance of no pool",
+        ),
+        pytest.param(
+            a_statement("ssm:SendCommand", here("ssm", "document/AWS-RunShellScript")),
+            {SPIKES_MORE},
+            id="sending another document",
+        ),
+        pytest.param(
+            a_statement("ssm:SendCommand", "*", on_pools("coursework")), {SPIKES_MORE}, id="sending on every resource"
+        ),
+        pytest.param(a_statement("ssm:GetCommandInvocation", "*"), {SPIKES_MORE}, id="another action of Run Command"),
+        pytest.param(a_statement("ec2:DescribeInstances", "*"), {SPIKES_MORE}, id="describing the instances"),
     ],
 )
 def test_each_rule_on_the_spike_jobs_refuses_its_breach(

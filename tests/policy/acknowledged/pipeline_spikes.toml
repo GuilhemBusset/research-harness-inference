@@ -24,7 +24,18 @@
 #   only: every job's logs.
 # - kms:Decrypt, kms:DescribeKey, kms:Encrypt and kms:GenerateDataKey on the shared key only: what
 #   CodeBuild encrypts of a build, with the key every job is encrypted with.
-# Nothing of Auto Scaling, EC2 or IAM, and no report group: a project declares none.
+# - ssm:SendCommand on document/rhi-engine-contract of the deploying account and region only: the
+#   job engine_contract sends the contract check (`rhi.pools.contract_check`), a document with no
+#   parameter that runs only the release's own script.
+# - ssm:SendCommand on instance/* of the deploying account and region, under the condition that
+#   the instance's tag rhi-pool names a pool of the stage's configuration: the instances the check
+#   runs on, found by the tag every instance of a pool launches with. A statement of its own, since
+#   the document carries no such tag.
+# - ssm:ListCommandInvocations on every resource, the only way AWS grants it: the status of each
+#   invocation of the check and what its step printed.
+#   A stage that launches no instance, parked or with no pool, gives the role none of these three.
+# Nothing of Auto Scaling or IAM, and no action of EC2: the job sends by the tag and reads no
+# instance. No report group: a project declares none.
 #
 # What the AWS Solutions pack finds on a project is fixed, never acknowledged here, since an
 # acknowledgement would carry that project's logical ID: every project is encrypted with the
@@ -35,3 +46,8 @@
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ssm:<AWS::Region>:<AWS::AccountId>:parameter/rhi/config/*]" = "A spike reads the configuration by path, as the synth step does, and the path holds one parameter for each key, whose names change with the configuration."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:aps:<AWS::Region>:<AWS::AccountId>:workspace/*]" = "A spike queries the stage's workspace, whose ID is only chosen when the stage is deployed; the statement's condition admits only the workspace tagged with the stage's name."
 "AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:dynamodb:<AWS::Region>:<AWS::AccountId>:table/Rhi-Pools-TablesPoolState68A872F7-*]" = "A spike reads the stage's pool-state table, whose name CloudFormation ends with a suffix it generates when the table is created; the pattern holds the stack's name and the table's logical ID, so it matches that one table."
+"AwsSolutions-IAM5[Resource::arn:<AWS::Partition>:ec2:<AWS::Region>:<AWS::AccountId>:instance/*]" = "The contract check runs on the instances of the configuration's pools, whose IDs EC2 chooses as each one launches; the statement's condition admits only an instance whose tag rhi-pool names one of those pools, and the document it may send runs the release's contract check and nothing else."
+"AwsSolutions-IAM5[Resource::*]" = "The job reads the status and output of the contract check's invocations with ssm:ListCommandInvocations, which AWS grants only on every resource, listed with its reason in the wildcard_actions table of this module."
+
+[wildcard_actions]
+"ssm:ListCommandInvocations" = "Run Command grants listing a command's invocations only on every resource, and the job reads with it each invocation of the contract check it sent: its status and what its step printed."
