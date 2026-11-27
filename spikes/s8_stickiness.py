@@ -33,10 +33,19 @@ nothing else: the scaler alone moves the instances (section 5.1).
    writes, and answers its launch's warm-up, before its launch completes and it enters service.
    Then it holds twice the pool's `target_concurrency` of streams open, each sending one short
    stream after another, as the canary students after the first two, until the workspace shows
-   the two in service both streaming answers. It records how many zones the two are in, by the
-   label `zone` the node's collector adds to every series; an instance whose series has no zone
-   label is not a zone, and the load is held until both have one. Then it stops the load and waits
-   until the workspace shows nothing running or waiting on the pool.
+   the two in service both streaming answers. All of them come from the job's one address, which
+   the web ACL's per-address rate rule counts over 300 seconds (`rate_limits.per_address`;
+   section 17): each stream pauses between its requests (`held_pause`), so that no 300 seconds hold
+   more than half of that limit of the load's requests, and the other half is left to the measured
+   students' requests that follow within the same window. It records how many zones the two are
+   in, by the label `zone` the node's collector adds to every series; an instance whose series has
+   no zone label is not a zone, and the load is held until both have one. Then it stops the load
+   and waits until the workspace shows nothing running or waiting on the pool. A held stream that
+   ends before then, at a request not answered 200, stops the load, and the run fails with one line
+   that names each way a held stream ended, its status, the gateway's cause or the fixed kind of
+   its connection's failure (`loadgen.Failure`), with how many streams ended that way: never the
+   text of an answer or of an error. A measured student's request not answered 200 fails the run
+   the same way, with a line that names its status, cause or kind.
 2. **Before the departure.** The first two canary students send their first requests at once, so
    that least-outstanding routing places them on different instances: whichever instance leaves,
    one of them has to move. Then each student in turn sends the number of requests it is given, one
@@ -142,8 +151,10 @@ they reached, changes nothing the run measured: when the remaining instance stil
 at the phase's end, the numbers and their verdict stand. At its end the job finds such a session
 already ended, and has nothing to stop.
 
-The pool's `target_concurrency` and `max_instances` and the bound `session_max_hours` come from the
-deployed configuration (`rhi.config.read_ssm`), and the region from CodeBuild's `AWS_REGION`. The
+The pool's `target_concurrency` and `max_instances`, the bound `session_max_hours`, and the
+per-address rate limit `rate_limits.per_address`, under half of which the held load is spaced (step
+1), come from the deployed configuration (`rhi.config.read_ssm`), and the region from CodeBuild's
+`AWS_REGION`. The
 job's role may write the mock pool's records of the pool-state table and no other pool's
 (`rhi.pipeline.spikes`): given another pool, the booking is refused by the role, and nothing is
 sent. The canary students need keys for the two measured students and enough others to hold the
@@ -229,6 +240,9 @@ DEPARTURE_WAIT_SECONDS = 20 * 60
 SPLIT_RECHECK_SECONDS = 5 * 60
 # How many times a phase is measured before a disturbed one stops the run.
 ATTEMPTS = 3
+# Seconds. The web ACL's rate rules count each source address's requests over this window
+# (`rhi.network.waf.WINDOW_SECONDS`): the held load is spaced under half the per-address limit in it.
+RATE_WINDOW_SECONDS = 300
 # The sizes of the requests: small, since only where each lands matters.
 START_TOKENS = 200
 TURN_INPUT_TOKENS = 50
@@ -647,16 +661,31 @@ def booked(table: Any, pool: str, *, minutes: int, max_instances: int, session_m
 # The load and the students' requests.
 
 
+def held_pause(per_address: int, streams: int) -> float:
+    """Seconds each of `streams` held streams pauses before each of its requests after its first, so
+    that no `RATE_WINDOW_SECONDS` hold more than half of `per_address` of the load's requests: a
+    stream's requests start at least the pause apart, so a window holds at most `each` of them,
+    `each` streams' share of the half. ValueError when the half holds less than one request a stream."""
+    each = (per_address // 2) // streams
+    if each < 1:
+        raise ValueError(f"half the per-address rate limit holds less than one request for each of {streams} streams")
+    # Over the window's share of one request, so that `each` starts, never `each + 1`, fit in it.
+    return RATE_WINDOW_SECONDS / each + 1.0
+
+
 @dataclass(frozen=True)
 class HeldStream:
-    """A session that sends one short stream after another, until `stop` is set."""
+    """A session that sends one short stream after another, `pause` seconds apart, until `stop` is set."""
 
     request: loadgen.Request
     stop: asyncio.Event
+    pause: float = 0.0
 
     def requests(self) -> Generator[tuple[float, loadgen.Request], str]:
+        pause = 0.0
         while not self.stop.is_set():
-            yield 0.0, self.request
+            yield pause, self.request
+            pause = self.pause
 
 
 def _session(model: str, requests: int, seed: int) -> loadgen.SyntheticSession:
@@ -712,9 +741,36 @@ def _first_request(model: str) -> loadgen.Request:
     return next(_session(model, 1, 0).requests())[1]
 
 
+def _answered(record: loadgen.Record) -> bool:
+    """Whether a request was answered 200 to its end: no failure, and no cause of the gateway's."""
+    return record.status == HTTPStatus.OK and record.failure is None and record.cause is None
+
+
+def way_of(record: loadgen.Record) -> str:
+    """How a request not answered ended, from fixed vocabularies only: the kind of its connection's
+    failure (`loadgen.Failure`), else the gateway's cause (`rhi_common.causes.Cause`), else its
+    status. Never the text of the answer or of an error."""
+    if record.failure is not None:
+        return record.failure.value
+    if record.cause is not None:
+        return record.cause
+    return "no status" if record.status is None else str(record.status)
+
+
+def ended_line(ended: Sequence[loadgen.Record]) -> str:
+    """The line of a load whose held streams ended at the requests `ended`: each way, with how many
+    streams ended that way."""
+    ways = Counter(way_of(record) for record in ended)
+    listed = ", ".join(f"{way} ({count})" for way, count in sorted(ways.items()))
+    return f"the load ended before two instances served: held streams ended with {listed}"
+
+
 def _all_answered(records: Sequence[loadgen.Record], expected: int) -> None:
-    if len(records) != expected or any(record.status != HTTPStatus.OK for record in records):
-        raise RuntimeError("a request of a measured student was not answered 200")
+    for record in records:
+        if not _answered(record):
+            raise RuntimeError(f"a request of a measured student was not answered 200: it ended with {way_of(record)}")
+    if len(records) != expected:
+        raise RuntimeError(f"a measured student's replay sent {len(records)} of its {expected} requests")
 
 
 async def _wait(condition: Callable[[], bool], seconds: float, what: str) -> None:
@@ -734,6 +790,8 @@ class Run:
     keys: Sequence[str]
     requests: int
     target_concurrency: int
+    # The web ACL's per-address rate limit, in requests per `RATE_WINDOW_SECONDS`.
+    per_address: int
     # The seed of each new conversation: no two attempts send the same text, and no two runs.
     _conversations: Iterator[int] = field(
         default_factory=lambda: itertools.count(secrets.randbits(48)), init=False, repr=False
@@ -769,25 +827,43 @@ class Run:
 
     async def two_instances(self) -> dict[str, str]:
         """Waits, sending nothing, until the session's two instances are in service, then holds the
-        load until both serve, and returns them with their zones once it has ended."""
+        load, spaced under half the per-address rate limit, until both serve, and returns them with
+        their zones once it has ended. A held stream that ends before then stops the load, and fails
+        the run with a line that names each way a held stream ended (`ended_line`)."""
         streams = 2 * self.target_concurrency
         holders = math.ceil(streams / STREAMS_PER_STUDENT)
         load_keys = self.keys[len(STUDENTS) :]
         if len(load_keys) < holders:
             raise ValueError(f"the load needs {holders} canary students besides the {len(STUDENTS)} measured")
+        pause = held_pause(self.per_address, streams)
         await _wait(lambda: self.holds(INSTANCES), IN_SERVICE_WAIT_SECONDS, "the session's two instances in service")
         stop = asyncio.Event()
         request = _first_request(self.pool.name)
+        # A stream already pausing when the load stops sends nothing more: the replay reads `sending`
+        # once the pause has passed.
         load = loadgen.Load(
-            tuple(HeldStream(request, stop) for _ in range(streams)), sessions_per_student=STREAMS_PER_STUDENT
+            tuple(HeldStream(request, stop, pause) for _ in range(streams)),
+            sessions_per_student=STREAMS_PER_STUDENT,
+            sending=lambda: not stop.is_set(),
         )
-        print(f"holding {streams} streams as {holders} students")
-        held = asyncio.create_task(loadgen.replay(load, load_keys, self.endpoint, at_once=streams))
         found: dict[str, str] = {}
+        # The requests at which a held stream ended before the job found two instances serving.
+        ended: list[loadgen.Record] = []
+
+        def on_record(record: loadgen.Record) -> None:
+            if not _answered(record) and not found:
+                ended.append(record)
+                stop.set()
+
+        print(f"holding {streams} streams as {holders} students, each pausing {pause:.1f} seconds between requests")
+        held = asyncio.create_task(
+            loadgen.replay(load, load_keys, self.endpoint, at_once=streams, keep_failures=True, on_record=on_record)
+        )
 
         def two() -> bool:
-            if held.done():
-                raise RuntimeError("the load ended before two instances served: a held stream was refused")
+            # A held stream ended, or the replay did: the wait ends, and the job reads why.
+            if ended or held.done():
+                return True
             # One observation: the instances serving now and present now, never an earlier one's.
             serving = self.pool.serving()
             try:
@@ -816,6 +892,10 @@ class Run:
         finally:
             stop.set()
             await held
+        if ended:
+            raise RuntimeError(ended_line(ended))
+        if not found:
+            raise RuntimeError("the load ended before two instances served")
         await _wait(lambda: self.pool.busy() == 0, LOAD_END_WAIT_SECONDS, "the load to end")
         return found
 
@@ -823,7 +903,10 @@ class Run:
         """Sends one student's requests of `session` one after another, and reads what each instance
         served; with the records of its requests."""
         start = time.time()
-        records = await loadgen.replay(loadgen.Load((session,)), [self.keys[number - 1]], self.endpoint, at_once=1)
+        # A connection that fails is kept as a record of its fixed kind, never raised with its text.
+        records = await loadgen.replay(
+            loadgen.Load((session,)), [self.keys[number - 1]], self.endpoint, at_once=1, keep_failures=True
+        )
         _all_answered(records, self.requests)
         await asyncio.sleep(SETTLE_SECONDS)
         served = await asyncio.to_thread(self.pool.served, start, time.time())
@@ -841,7 +924,7 @@ class Run:
         start = time.time()
         keys = [self.keys[student - 1] for student in STUDENTS]
         load = loadgen.Load(tuple(Opening(opened[student]) for student in STUDENTS))
-        openings = await loadgen.replay(load, keys, self.endpoint, at_once=len(STUDENTS))
+        openings = await loadgen.replay(load, keys, self.endpoint, at_once=len(STUDENTS), keep_failures=True)
         _all_answered(openings, len(STUDENTS))
         await asyncio.sleep(SETTLE_SECONDS)
         window = await asyncio.to_thread(self.pool.served, start, time.time())
@@ -983,7 +1066,14 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
         if requests < 1:
             raise ValueError("each student sends one request or more")
         keys = common.canary_keys().students
-        run = Run(Pool(name, workspace, table), endpoint, keys, requests, pool.target_concurrency)
+        run = Run(
+            Pool(name, workspace, table),
+            endpoint,
+            keys,
+            requests,
+            pool.target_concurrency,
+            deployed.rate_limits.per_address,
+        )
         return run.in_session(
             minutes=minutes, max_instances=pool.max_instances, session_max_hours=deployed.session_max_hours
         )
