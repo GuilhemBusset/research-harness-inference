@@ -24,7 +24,8 @@ from constructs import Construct
 DOCUMENT_NAME = "rhi-engine-contract"
 SCRIPT = "/opt/rhi/release/contract/run.sh"
 # How long the step may run: the four tests, each request waiting up to two minutes for the
-# engine's next bytes (tests/contract/conftest.py, READ_SECONDS), with room to spare.
+# engine's next bytes (tests/contract/conftest.py, READ_SECONDS), with room to spare. The plugin
+# `aws:runShellScript` takes it as a string of decimal digits, so the content carries it so.
 TIMEOUT_SECONDS = 900
 
 
@@ -37,7 +38,7 @@ def content() -> dict[str, object]:
             {
                 "action": "aws:runShellScript",
                 "name": "contract",
-                "inputs": {"runCommand": [f"bash {SCRIPT}"], "timeoutSeconds": TIMEOUT_SECONDS},
+                "inputs": {"runCommand": [f"bash {SCRIPT}"], "timeoutSeconds": str(TIMEOUT_SECONDS)},
             }
         ],
     }

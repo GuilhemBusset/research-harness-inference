@@ -39,4 +39,8 @@ def test_one_command_document_runs_the_release_s_contract_script(pools: dict[str
     (step,) = content["mainSteps"]
     assert step["action"] == "aws:runShellScript"
     assert step["inputs"]["runCommand"] == ["bash /opt/rhi/release/contract/run.sh"]
-    assert step["inputs"]["timeoutSeconds"] == TIMEOUT_SECONDS > 0
+    # The plugin's input `timeoutSeconds` is a string of decimal digits, not a number.
+    timeout = step["inputs"]["timeoutSeconds"]
+    assert isinstance(timeout, str)
+    assert timeout.isdigit()
+    assert int(timeout) == TIMEOUT_SECONDS > 0
