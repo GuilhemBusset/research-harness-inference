@@ -28,19 +28,22 @@ in that order with `rhi_reporter.github`.
   reports under each of them, as one of their actions, so that a failure there ends the stage's
   `deploy/<stage>` status as a failure, and its success never reads as a deployment's. The own
   events of those steps' stages post nothing: their actions say it all.
-- An execution's own event, at its start and at its end, gives the statuses of the commits a
-  self-update left without an execution (`rhi_reporter.superseded`): those this execution covers,
-  and its own commit when this execution was cancelled and a later one covers it. They are read
-  from the pipeline's executions, newest first, down to the first execution older than this one
-  that ended with a verdict. Under each stage, such a commit is pending, naming the covering
+- An execution's own event, at its start and at its end, gives the statuses of the commits left
+  without an execution that deploys them (`rhi_reporter.superseded`): an execution ends
+  `Superseded` when a newer one overtakes it while it waits between stages, not only when the
+  pipeline updates itself, and an update cancels the others. They are those this execution
+  covers, and its own commit when this execution was cancelled or superseded and a later one
+  covers it. They are read from the pipeline's executions, newest first, down to the first
+  execution older than this one that ended with a verdict. Under each stage, such a commit is pending, naming the covering
   commit, while the covering execution runs, and gets its final state once it has ended, with
   the state of its verification when that ran.
-- An event of a stage or an action of an execution that a self-update cancelled (the execution
-  ended `Cancelled` or `Superseded`, or the event's own state is `CANCELED`, which CodePipeline
-  gives only when an update of the pipeline cancels an execution) posts none of its own: its
-  commit's verdict is the covering execution's. It posts that commit's superseded statuses again,
-  as the execution's own end does, so that a cancellation that arrives late, after the covering
-  execution has ended, leaves its verdict as it stands.
+- An event of a stage or an action of an execution that was cancelled or superseded (the
+  execution ended `Cancelled` or `Superseded`, by a self-update or overtaken by a newer one, or
+  the event's own state is `CANCELED`, which CodePipeline gives only when an update of the
+  pipeline cancels an execution) posts none of its own: its commit's verdict is the covering
+  execution's. It posts that commit's superseded statuses again, as the execution's own end does,
+  so that a cancellation that arrives late, after the covering execution has ended, leaves its
+  verdict as it stands.
 - When the pipeline's executions cannot be read for a superseded commit, the function fails after
   logging `NO_EXECUTIONS`, so that the event is invoked again: returning would leave the commit
   pending for good.

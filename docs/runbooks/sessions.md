@@ -100,12 +100,18 @@ Do these the day before the class.
    CodePipeline console, and note the execution ID the console shows for it. Check that execution
    itself, by its ID, from here on: an edit of SSM changes no commit, so a `deploy/<stage>` or a
    `verify/<stage>` status on the latest commit can be an earlier run's, and only this execution
-   says what happened to the edit. The new value is deployed once every deployment action of the
-   stage has succeeded in it, and it is verified once the stage's action Verify has succeeded too
-   and its log shows that the smoke tests ran: Verify also succeeds when it has nothing to test,
-   the endpoint having no HTTPS listener or the canary no key yet, and its log then has the line
-   `verify: no test was run:` with the reason. An execution that failed, or was stopped, is the
-   runbook [bad deployment](bad-deployment.md).
+   says what happened to the edit. The pipeline runs in superseded mode: a newer merge can
+   supersede an execution waiting between stages, the one you started with **Release change**
+   included, for instance while it waits in front of the stage `Rhi` for a session to end. That
+   execution then ends `Superseded` in the pipeline's execution history, and the newer one, which
+   synthesizes from SSM again, deploys its own commit and the configuration SSM holds, your edit
+   included: from then on, check the newer execution by its ID instead. The new value is deployed
+   once every deployment action of the stage has succeeded in the execution you check, and it is
+   verified once the stage's action Verify has succeeded too and its log shows that the smoke
+   tests ran: Verify also succeeds when it has nothing to test, the endpoint having no HTTPS
+   listener or the canary no key yet, and its log then has the line `verify: no test was run:`
+   with the reason. An execution that failed, or was stopped, is the runbook
+   [bad deployment](bad-deployment.md).
 
 3. **Every change has landed, and no deployment is under way.** A deployment waits while a session
    is active on any pool (section 5.6), so that a release changes nothing under a class. The wait
@@ -115,7 +121,11 @@ Do these the day before the class.
    one, and keeps what it started with; one of the gateway drains its tasks. A session that is
    booked and has not started holds nothing. So, before a session starts, no execution is in
    progress on the pipeline's page in the CodePipeline console; if one is, wait for it to end. And
-   what is merged or edited while a session is active is deployed only after its end.
+   what is merged or edited while a session is active is deployed only after its end: the
+   execution in the hold deploys its own commit, then the newest merge's execution deploys its
+   commit and the configuration SSM holds. Each newer merge supersedes the one that waited in
+   front of the stage `Rhi` before it, so the merges in between get no deployment of their own:
+   their commits take the verdict of the newest one's execution.
 
 4. **What is booked already.** A pool has one session at a time, and `session start` is refused
    while one is booked or active: `set_by` says who booked it, an admin or one of the pipeline's
