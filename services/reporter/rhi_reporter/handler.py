@@ -469,10 +469,21 @@ def _measurement(event: Mapping[str, Any], *, aws: Aws, client: Any, deadline: f
     measurement, label, _ = measure.context_parts(statuses[0].context)
     held = 0
     try:
-        rest = measure.still_to_post(statuses, client.statuses(statuses[0].commit, deadline=deadline))
+        listed = client.statuses(statuses[0].commit, deadline=deadline)
+        rest = measure.still_to_post(statuses, listed)
         held = len(statuses) - len(rest)
+        # A status GitHub took without saying so is not posted twice: each of this invocation's is
+        # newer than every status the commit held when it began.
+        newest = max((one["id"] for one in listed if type(one.get("id")) is int), default=0)
         for status in rest:
-            _post(client, status, deadline=deadline)
+            client.post_status(
+                status.commit,
+                status.state.value,
+                status.context,
+                status.description,
+                deadline=deadline,
+                newer_than=newest,
+            )
             held += 1
     except (github.RefusedError, github.CredentialError):
         # Fixed text, and names of the measure module's own shapes: nothing GitHub or AWS said.

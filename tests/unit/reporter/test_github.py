@@ -346,6 +346,42 @@ def test_a_temporary_refusal_is_waited_out_until_the_deadline(
     assert len(stub.statuses) == 1
 
 
+def test_a_rate_limit_reset_that_has_come_is_posted_again_at_once(stub: Stub, client: github.StatusClient) -> None:
+    come = (403, {}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(stub.now))})
+    stub.queued[STATUS] = [come]
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 0.5)
+    assert (len(stub.attempts), stub.sleeps, len(stub.statuses)) == (2, [], 1)
+
+    # Not twice in a row: GitHub is not asked again and again with no wait.
+    stub.attempts.clear()
+    stub.queued[STATUS] = [come, come]
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 60)
+    assert (len(stub.attempts), stub.sleeps) == (3, [2])
+
+
+@pytest.mark.parametrize("lost", [(0, None), (502, {"message": MARKER})], ids=["no-answer", "5xx"])
+@pytest.mark.parametrize("saved", [True, False], ids=["saved", "not-saved"])
+def test_a_status_github_took_without_saying_so_is_not_posted_twice(
+    stub: Stub, client: github.StatusClient, monkeypatch: pytest.MonkeyPatch, lost: tuple[int, Any], saved: bool
+) -> None:
+    stub.listed = [{"id": 7, **POSTED}]  # the same status, posted before: older than `newer_than`
+    created = stub.created
+    answers = [lost]
+
+    def create(path: str, bearer: str, body: Any) -> tuple[int, Any]:
+        code, answer = created(path, bearer, body)
+        if path != STATUS:
+            return code, answer
+        if saved or not answers:
+            stub.listed.insert(0, {"id": stub.listed[0]["id"] + 1, **body})
+        return answers.pop(0) if answers else (code, answer)
+
+    monkeypatch.setattr(stub, "created", create)
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 60, newer_than=7)
+    assert len(stub.attempts) == (1 if saved else 2)
+    assert [one["id"] for one in stub.listed] == [8, 7]
+
+
 @pytest.mark.parametrize(
     ("answer", "deadline"),
     [

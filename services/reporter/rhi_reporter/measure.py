@@ -42,7 +42,7 @@ checks a job's own call: whatever either refuses raises ValueError, and no statu
 
 **A posting cut short.** `still_to_post` says which of a run's statuses a commit does not hold
 yet: those of the parts its newest posting lacks, when every part that posting holds is the run's
-own, and every one of them otherwise. The reporter reads it before it posts, and so completes a
+own and none is held twice, and every one of them otherwise. The reporter reads it before it posts, and so completes a
 posting that stopped part-way rather than begin another.
 """
 
@@ -297,14 +297,15 @@ def newest_posting(listed: Iterable[Mapping[str, object]], measurement: str, lab
 def still_to_post(statuses: Sequence[CommitStatus], listed: Iterable[Mapping[str, object]]) -> list[CommitStatus]:
     """Of `statuses`, one run's in the order of their parts, those its commit does not hold yet,
     in order: when every status of the run label's newest posting among `listed` (`newest_posting`)
-    is equal, in state and description, to the status of `statuses` of its part, the statuses of the
-    other parts; otherwise all of them, from part 1."""
+    is equal, in state and description, to the status of `statuses` of its part, and no part is held
+    twice, the statuses of the other parts; otherwise all of them, from part 1."""
     if not statuses:
         return []
     measurement, label, _ = context_parts(statuses[0].context)
     held = newest_posting(listed, measurement, label)
     own = {part: (str(status.state), status.description) for part, status in enumerate(statuses, start=1)}
-    if any(own.get(part) != (state, description) for part, state, description in held):
-        return list(statuses)
     parts = {part for part, _, _ in held}
+    # A part held twice is a posting the record cannot read whole: it is not completed.
+    if len(parts) < len(held) or any(own.get(part) != (state, description) for part, state, description in held):
+        return list(statuses)
     return [status for part, status in enumerate(statuses, start=1) if part not in parts]

@@ -26,8 +26,11 @@ remain, then a new one is asked for.
 **Temporary refusals.** A call given a deadline, a time on the client's clock, is made again while
 GitHub's answer is one it asks to be waited out: 429, a 403 that carries `retry-after` or an
 `x-ratelimit-remaining` of 0 (a secondary rate limit), a 5xx, or no answer at all. The next attempt
-begins after the seconds `retry-after` gives, else at the time `x-ratelimit-reset` gives, else
-after `FIRST_WAIT_SECONDS`, doubled at each attempt up to `LONGEST_WAIT_SECONDS`. Any other refusal,
+begins after the seconds `retry-after` gives, else at the time `x-ratelimit-reset` gives, at once
+when that time has come (once in a row: then the doubling wait), else after `FIRST_WAIT_SECONDS`,
+doubled at each attempt up to `LONGEST_WAIT_SECONDS`. GitHub may have taken a status it did not
+answer, or answered with a 5xx: a post given the id the commit's statuses had reached reads them
+before it posts again, and stops when the status is there (`post_status`). Any other refusal,
 any refusal of a call given no deadline, and one whose next attempt would begin after the deadline
 raise `RefusedError` at once, without waiting: a longer wait is left to whoever invokes the caller
 again. No attempt begins after the deadline.
@@ -160,16 +163,25 @@ def _waited_out(status: int | None, headers: Message | None) -> bool:
     return headers.get("retry-after") is not None or (headers.get("x-ratelimit-remaining") or "").strip() == "0"
 
 
+def _doubled(attempt: int) -> float:
+    return min(FIRST_WAIT_SECONDS * 2 ** (attempt - 1), LONGEST_WAIT_SECONDS)
+
+
 def _wait_of(headers: Message | None, now: float, attempt: int) -> float:
     """The seconds before the next attempt, the `attempt`-th made again: what `retry-after` gives,
-    else until the time `x-ratelimit-reset` gives when it is still to come, else the doubling wait."""
+    else until the time `x-ratelimit-reset` gives, none once it has come, else the doubling wait."""
     after = _seconds(headers.get("retry-after")) if headers is not None else None
     if after is not None:
         return float(after)
     reset = _seconds(headers.get("x-ratelimit-reset")) if headers is not None else None
-    if reset is not None and reset > now:
-        return reset - now
-    return min(FIRST_WAIT_SECONDS * 2 ** (attempt - 1), LONGEST_WAIT_SECONDS)
+    if reset is not None:
+        return max(reset - now, 0.0)
+    return _doubled(attempt)
+
+
+def _unanswered(status: int | None) -> bool:
+    """Whether GitHub may have taken a call it gave no answer of acceptance to: no answer, a 5xx."""
+    return status is None or 500 <= status < 600
 
 
 def _status_of(item: object) -> dict[str, Any] | None:
@@ -246,16 +258,35 @@ class StatusClient:
         self._token_expiry = 0.0
 
     def post_status(
-        self, commit: str, state: str, context: str, description: str, *, deadline: float | None = None
+        self,
+        commit: str,
+        state: str,
+        context: str,
+        description: str,
+        *,
+        deadline: float | None = None,
+        newer_than: int | None = None,
     ) -> None:
         """Creates one status on the commit, a full SHA, waiting out GitHub's temporary refusals
         until `deadline`, a time on the client's clock, when one is given. Raises `CredentialError`
         when the App's credential cannot be used, `RefusedError` when GitHub does not accept a call,
-        and `ValueError` for a repository that is not owner/name or a commit that is not a full SHA."""
+        and `ValueError` for a repository that is not owner/name or a commit that is not a full SHA.
+
+        GitHub may have taken a status it gave no answer to, or a 5xx. Given `newer_than`, a
+        status id, the client reads the commit's statuses before it posts that status again, and
+        posts nothing more when the commit holds a status of the same context, state and description
+        with a greater id: a status that must be on the commit once is not posted twice."""
         repository = _repository_of(commit)
         body = {"state": state, "context": context, "description": description}
         url = f"{self._api_url}/repos/{repository}/statuses/{commit}"
-        self._call("POST", url, self._installation_token(deadline), body, deadline=deadline)
+
+        def taken() -> bool:
+            return newer_than is not None and any(
+                one["id"] > newer_than and all(one[key] == body[key] for key in body)
+                for one in self.statuses(commit, deadline=deadline)
+            )
+
+        self._call("POST", url, self._installation_token(deadline), body, deadline=deadline, taken=taken)
 
     def statuses(self, commit: str, *, deadline: float | None = None) -> list[dict[str, Any]]:
         """Every status of the commit, a full SHA, from every page GitHub lists, newest first, each
@@ -318,10 +349,14 @@ class StatusClient:
         *,
         deadline: float | None,
         limit: int = ANSWER_BYTES,
-    ) -> tuple[int, Any, Message | None]:
+        taken: Callable[[], bool] | None = None,
+    ) -> tuple[int | None, Any, Message | None]:
         """One call to GitHub's API, made again while GitHub asks to wait and `deadline` allows
-        (the module's docstring). Returns the status, the JSON and the headers of an accepted call."""
+        (the module's docstring). Returns the status, the JSON and the headers of an accepted call,
+        or of the last attempt when, after one GitHub may have taken (`_unanswered`), `taken` says
+        it did. A wait of none is made once in a row: the next is the doubling wait."""
         attempt = 0
+        at_once = False
         while True:
             if deadline is not None and self._clock() > deadline:
                 raise RefusedError(None, None)
@@ -334,9 +369,15 @@ class StatusClient:
             attempt += 1
             now = self._clock()
             wait = _wait_of(headers, now, attempt)
+            if wait <= 0 and at_once:
+                wait = _doubled(attempt)
+            at_once = wait <= 0
             if now + wait > deadline:
                 raise refused
-            self._sleep(wait)
+            if wait > 0:
+                self._sleep(wait)
+            if taken is not None and _unanswered(status) and taken():
+                return status, answer, headers
 
     def _attempt(
         self, method: str, url: str, bearer: str, body: dict[str, str] | None, limit: int

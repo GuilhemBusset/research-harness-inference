@@ -292,13 +292,22 @@ class Client:
         self.posted: list[tuple[str, str, str, str]] = []
         self.held = list(held or [])
         self.deadlines: list[float | None] = []
+        self.newer_than: list[int | None] = []
         self.refuse: int | None = None
         self.refusal: Exception = RefusedError(None, None)
 
     def post_status(
-        self, commit: str, state: str, context: str, description: str, *, deadline: float | None = None
+        self,
+        commit: str,
+        state: str,
+        context: str,
+        description: str,
+        *,
+        deadline: float | None = None,
+        newer_than: int | None = None,
     ) -> None:
         self.deadlines.append(deadline)
+        self.newer_than.append(newer_than)
         if self.refuse == len(self.posted) + 1:
             raise self.refusal
         self.posted.append((commit, state, context, description))
@@ -1037,6 +1046,8 @@ def test_a_measurement_invoked_again_completes_the_posting_cut_short(stub: Stub)
     again = Client(held=as_held(first.posted))
     run([event], stub, again)
     assert parts(again) == list(range(43, 62))
+    # Each part is posted as one the commit must not hold twice: none newer than its statuses.
+    assert set(again.newer_than) == {42}
     # Once whole, a third invocation posts nothing.
     whole = Client(held=as_held(first.posted + again.posted))
     run([event], stub, whole)
@@ -1059,6 +1070,10 @@ def test_a_newest_posting_that_differs_is_posted_again_from_part_1(stub: Stub) -
     older = Client(held=as_held(changed) + as_held(first.posted, first_id=100))
     run([event], stub, older)
     assert parts(older) == list(range(43, 62))
+    # Nor is a posting completed that holds a part twice: the record reads it as two postings.
+    twice = Client(held=as_held([*first.posted, first.posted[-1]]))
+    run([event], stub, twice)
+    assert parts(twice) == list(range(1, 62))
 
 
 def test_the_deadline_is_the_context_s_remaining_time_less_ten_seconds() -> None:
