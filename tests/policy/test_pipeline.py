@@ -242,6 +242,13 @@ DIGEST = r"(:[\w.-]+)?@sha256:[0-9a-f]{64}"
 BUILDX = r"\$HOME/\.docker/cli-plugins/docker-buildx"
 MIRROR = r"\$RHI_REGISTRY/rhi-mirror"
 BUILDKIT_CONFIG = r"/tmp/rhi-buildkitd\.toml"
+# The builder's configuration: its one mirror, the mirror's path, for the registry the variable
+# `MIRRORED_REGISTRY` names, which the build specification sets to Docker Hub's (`mirrors_docker_hub`).
+MIRRORED_REGISTRY = "RHI_MIRRORED_REGISTRY"
+CONFIGURES_THE_BUILDKIT = re.compile(
+    rf"""printf '\[registry\."%s"\]\\n  mirrors = \["%s"\]\\n' "\${MIRRORED_REGISTRY}" """
+    rf'"{MIRROR}" > {BUILDKIT_CONFIG}'
+)
 INSTALLS_THE_IMAGE_BUILDER = [
     re.compile(
         r'export RHI_REGISTRY="\$\(aws sts get-caller-identity --query Account --output text\)'
@@ -255,10 +262,7 @@ INSTALLS_THE_IMAGE_BUILDER = [
     ),
     re.compile(rf'echo "[0-9a-f]{{64}}  {BUILDX}" \| sha256sum -c -'),
     re.compile(rf'chmod \+x "{BUILDX}"'),
-    re.compile(
-        r"""printf '\[registry\."%s"\]\\n  mirrors = \["%s"\]\\n' "\$RHI_MIRRORED_REGISTRY" """
-        rf'"{MIRROR}" > {BUILDKIT_CONFIG}'
-    ),
+    CONFIGURES_THE_BUILDKIT,
     re.compile(
         r"docker buildx create --name [\w-]+ --driver docker-container"
         rf' --driver-opt "image={MIRROR}/moby/buildkit{DIGEST}"'
@@ -536,16 +540,22 @@ def stages_of(pipeline: Mapping[str, Any]) -> list[tuple[str, list[dict[str, Any
     ]
 
 
-def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any:
-    """The build specification of the project a CodeBuild action runs, when the project is one of
-    the same template, named by a `Ref`."""
+def project_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The properties of the project a CodeBuild action runs, when the project is one of the same
+    template, named by a `Ref`."""
     project = action.get("Configuration", {}).get("ProjectName")
     if type_of(action) != CODEBUILD or not isinstance(project, dict) or list(project) != ["Ref"]:
         return None
     resource = template.get("Resources", {}).get(project["Ref"], {})
     if resource.get("Type") != "AWS::CodeBuild::Project":
         return None
-    return resource.get("Properties", {}).get("Source", {}).get("BuildSpec")
+    return resource.get("Properties", {})
+
+
+def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any:
+    """The build specification of the project a CodeBuild action runs (`project_of`)."""
+    project = project_of(action, template)
+    return None if project is None else project.get("Source", {}).get("BuildSpec")
 
 
 def commands_of(build_spec: Any) -> list[str] | None:
@@ -570,9 +580,33 @@ def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> 
         return False
     publishing = [command for command in commands if PUBLISHES_ASSETS.fullmatch(command)]
     installs = [INSTALLS_THE_PUBLISHER, *INSTALLS_THE_IMAGE_BUILDER]
-    return bool(publishing) and all(
-        any(install.fullmatch(command) for install in installs) for command in commands if command not in publishing
+    configures = any(CONFIGURES_THE_BUILDKIT.fullmatch(command) for command in commands)
+    return (
+        bool(publishing)
+        and all(
+            any(install.fullmatch(command) for install in installs) for command in commands if command not in publishing
+        )
+        and (not configures or mirrors_docker_hub(action, template))
     )
+
+
+def mirrors_docker_hub(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
+    """Whether the registry the builder's configuration mirrors (`CONFIGURES_THE_BUILDKIT`) is
+    Docker Hub's: the build specification's variables set `MIRRORED_REGISTRY` to `docker.io`, and
+    nothing else that CodeBuild reads a variable from names it, neither another source of the build
+    specification, nor the project's variables, nor the action's, which take precedence."""
+    project = project_of(action, template) or {}
+    try:
+        environment = json.loads(build_spec_of(action, template))["env"]
+        variables = environment["variables"]
+    except (TypeError, ValueError, KeyError):  # No variables: the configuration names no registry.
+        return False
+    elsewhere = [
+        {key: value for key, value in environment.items() if key != "variables"},
+        project.get("Environment", {}).get("EnvironmentVariables", []),
+        action.get("Configuration", {}).get("EnvironmentVariables", ""),
+    ]
+    return variables.get(MIRRORED_REGISTRY) == "docker.io" and MIRRORED_REGISTRY not in json.dumps(elsewhere)
 
 
 def deploys_a_stack(action: Mapping[str, Any]) -> bool:
@@ -1918,8 +1952,18 @@ IMAGE_BUILDER = [
 RUNS_THE_EMULATOR, DOWNLOADS_THE_BUILDER, CONFIGURES_THE_BUILDER, CREATES_THE_BUILDER = 2, 3, 6, 7
 
 
-def a_publisher_that_installs(installs: list[str]) -> Change:
-    """Adds to the asset stage a project that installs the publisher and `installs`, then publishes."""
+# The variables of its build specification, as `src/rhi/pipeline/stack.py` writes them: the
+# registry the builder's configuration mirrors is Docker Hub's.
+IMAGE_BUILDER_VARIABLES = {"RHI_MIRRORED_REGISTRY": "docker.io"}
+
+
+def a_publisher_that_installs(
+    installs: list[str],
+    variables: dict[str, str] = IMAGE_BUILDER_VARIABLES,
+    project_variables: dict[str, str] | None = None,
+) -> Change:
+    """Adds to the asset stage a project that installs the publisher and `installs`, then publishes,
+    with `variables` in its build specification and `project_variables` in its own environment."""
 
     def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
         codebuild = cdk.aws_codebuild
@@ -1927,8 +1971,11 @@ def a_publisher_that_installs(installs: list[str]) -> Change:
             "install": {"commands": ["npm install -g cdk-assets@latest", *installs]},
             "build": {"commands": [PUBLISH]},
         }
-        spec = codebuild.BuildSpec.from_object({"version": "0.2", "phases": phases})
-        project = codebuild.PipelineProject(stack, "Image", build_spec=spec)
+        spec = codebuild.BuildSpec.from_object({"version": "0.2", "env": {"variables": variables}, "phases": phases})
+        environment = {
+            name: codebuild.BuildEnvironmentVariable(value=value) for name, value in (project_variables or {}).items()
+        }
+        project = codebuild.PipelineProject(stack, "Image", build_spec=spec, environment_variables=environment)
         synthesized = cdk.aws_codepipeline.Artifact("Synth_Output")
         action = cdk.aws_codepipeline_actions.CodeBuildAction(action_name="Image", project=project, input=synthesized)
         pipeline.stage(ASSET_STAGE).add_action(action)
@@ -1980,6 +2027,21 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             a_publisher_that_installs([IMAGE_BUILDER[CONFIGURES_THE_BUILDER].replace('"$RHI_REGISTRY', '"example.com')]),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that configures a mirror outside the deploying account's registry",
+        ),
+        pytest.param(
+            a_publisher_that_installs(IMAGE_BUILDER, variables={"RHI_MIRRORED_REGISTRY": "example.com"}),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures the mirror for a registry other than Docker Hub",
+        ),
+        pytest.param(
+            a_publisher_that_installs(IMAGE_BUILDER, variables={}),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures the mirror for no registry",
+        ),
+        pytest.param(
+            a_publisher_that_installs(IMAGE_BUILDER, project_variables={"RHI_MIRRORED_REGISTRY": "example.com"}),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage whose own variables change the registry the mirror is for",
         ),
         pytest.param(a_deletion, [f"Rhi/Delete: {CLOUDFORMATION}"], id="a CloudFormation action that deletes a stack"),
     ],

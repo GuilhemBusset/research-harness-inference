@@ -13,8 +13,10 @@ builder that mirror as its one mirror for Docker Hub.
 
 from __future__ import annotations
 
+import copy
 import json
 import re
+import runpy
 import shlex
 import subprocess
 import tomllib
@@ -104,12 +106,28 @@ def installed(template: dict[str, Any]) -> list[str]:
     ]
 
 
+def commands_of(project: dict[str, Any]) -> list[str]:
+    """Every command a project runs: those of each phase, and those of each phase's `finally`."""
+    phases = build_spec(project)["phases"].values()
+    return [command for phase in phases for key in ("commands", "finally") for command in phase.get(key, [])]
+
+
+# The Docker commands that start, create or pull a container image, each in its short form and
+# under its group: `docker run` is `docker container run`, `docker pull` is `docker image pull`.
+TAKES_AN_IMAGE = [
+    *(["docker", verb] for verb in ("run", "create", "pull")),
+    *(["docker", "container", verb] for verb in ("run", "create")),
+    ["docker", "image", "pull"],
+]
+
+
 def images_of(words: list[str]) -> list[str]:
-    """The container images a command names: what `docker run` or `docker pull` starts or pulls
-    (options written as one word), and an `image=` option."""
+    """The container images a command names: what a Docker command of `TAKES_AN_IMAGE` starts,
+    creates or pulls (options written as one word), and an `image=` option."""
     found = [part.split("=", 1)[1] for word in words for part in word.split(",") if part.startswith("image=")]
-    if words[:2] in (["docker", "run"], ["docker", "pull"]):
-        found += [next(word for word in words[2:] if not word.startswith("-"))]
+    for verb in TAKES_AN_IMAGE:
+        if words[: len(verb)] == verb:
+            found += [next(word for word in words[len(verb) :] if not word.startswith("-"))]
     return found
 
 
@@ -200,12 +218,7 @@ def test_each_image_project_installs_the_emulator_and_the_builder_from_the_mirro
 
 
 def test_no_command_of_an_image_project_names_an_image_on_docker_hub(template: dict[str, Any]) -> None:
-    commands = [
-        command
-        for project in image_projects(template)
-        for phase in build_spec(project)["phases"].values()
-        for command in phase["commands"]
-    ]
+    commands = [command for project in image_projects(template) for command in commands_of(project)]
     images = [image.replace("$RHI_REGISTRY", REGISTRY) for c in commands for image in images_of(shlex.split(c))]
     assert len(images) == 4
     assert not [image for image in images if on_docker_hub(image)]
@@ -225,6 +238,46 @@ def test_no_command_of_an_image_project_names_an_image_on_docker_hub(template: d
 )
 def test_an_image_on_docker_hub_is_found(image: str, expected: bool) -> None:
     assert on_docker_hub(image) is expected
+
+
+@pytest.mark.parametrize(
+    ("section", "command"),
+    [
+        pytest.param("finally", "docker pull docker.io/library/python", id="a pull in a finally block"),
+        pytest.param("commands", "docker image pull python", id="a pull under the image group"),
+        pytest.param("commands", "docker container run --rm python", id="a run under the container group"),
+    ],
+)
+def test_a_command_that_names_an_image_on_docker_hub_is_found(
+    template: dict[str, Any], section: str, command: str
+) -> None:
+    changed = copy.deepcopy(template)
+    project = image_projects(changed)[0]
+    spec = build_spec(project)
+    spec["phases"]["install"].setdefault(section, []).append(command)
+    project["Source"]["BuildSpec"] = json.dumps(spec)
+    with pytest.raises(AssertionError):
+        test_no_command_of_an_image_project_names_an_image_on_docker_hub(changed)
+
+
+def test_the_pipeline_policy_leaves_out_an_image_project_only_while_its_mirror_is_for_docker_hub(
+    template: dict[str, Any],
+) -> None:
+    """The policy of `tests/policy/test_pipeline.py` leaves out each image project as the stack
+    writes it, and lists one whose builder's configuration mirrors another registry."""
+    policy = runpy.run_path(str(Path(__file__).resolve().parents[1] / "policy" / "test_pipeline.py"))
+    (pipeline,) = [r["Properties"] for r in template["Resources"].values() if r["Type"] == "AWS::CodePipeline::Pipeline"]
+    (stage,) = [stage for stage in pipeline["Stages"] if stage["Name"] == ASSET_STAGE]
+    for action in stage["Actions"]:
+        changed = copy.deepcopy(template)
+        project = changed["Resources"][action["Configuration"]["ProjectName"]["Ref"]]["Properties"]
+        assert policy["publishes_assets"](action, changed)
+        if not project["Environment"]["PrivilegedMode"]:
+            continue
+        spec = build_spec(project)
+        spec["env"]["variables"]["RHI_MIRRORED_REGISTRY"] = "example.com"
+        project["Source"]["BuildSpec"] = json.dumps(spec)
+        assert not policy["publishes_assets"](action, changed)
 
 
 def test_the_file_project_is_left_as_cdk_pipelines_writes_it(template: dict[str, Any]) -> None:
@@ -278,3 +331,24 @@ def test_tools_are_pinned_fails_on_the_stack_with_an_unpinned_tool(
     assert by_tag != stack.IMAGE_BUILDER
     monkeypatch.setattr(stack, "IMAGE_BUILDER", by_tag)
     assert unpinned(installed(synthesize(tmp_path))) == [f"{MIRROR}/tonistiigi/binfmt:latest"] * 2
+
+
+def test_the_image_projects_role_reaches_ecr_only_through_the_mirror_s_grant(
+    app_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CDK Pipelines gives the image projects' role no ECR permission of its own: the token and
+    the pulls of the emulator and BuildKit are what the mirror's grant adds."""
+    from rhi.pipeline.mirror import MirrorRepositories
+
+    monkeypatch.setattr(MirrorRepositories, "grant_the_image_builder", lambda *_: None)
+    template = synthesize(tmp_path)
+    (role,) = {project["ServiceRole"]["Fn::GetAtt"][0] for project in image_projects(template)}
+    actions = [
+        action
+        for policy in template["Resources"].values()
+        if policy["Type"] == "AWS::IAM::Policy" and {"Ref": role} in policy["Properties"]["Roles"]
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+        for action in ([statement["Action"]] if isinstance(statement["Action"], str) else statement["Action"])
+    ]
+    assert actions
+    assert not [action for action in actions if action.startswith("ecr:")]
