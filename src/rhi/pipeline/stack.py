@@ -39,7 +39,10 @@ The only thing that deploys the endpoint is this pipeline (requirement R6). It h
 The asset step builds every image asset of the stage for its pool's processor architecture
 (sections 4.2 and 4.3): linux/arm64 for the mock pool, linux/amd64 for the GPU pools. CodeBuild's
 build hosts are x86_64, so each project that publishes an image first registers an emulator for
-arm64 and selects a builder that can target either platform, all pinned (`IMAGE_BUILDER`).
+arm64 and selects a builder that can target either platform, all pinned (`IMAGE_BUILDER`). It
+pulls nothing from Docker Hub: it logs in to the deploying account's registry with its own role,
+runs the emulator and the builder from the mirror's copies, and gives the builder the mirror as its
+one mirror for Docker Hub, from which BuildKit pulls the base images of the FROM lines.
 
 Beside the pipeline, the reporter of `rhi.pipeline.reporter`: a rule on the pipeline's state and a
 function that posts commit statuses to GitHub (step 7), and sends the owner, on the topic of
@@ -96,6 +99,7 @@ from rhi.pipeline.canary import GpuCanary
 from rhi.pipeline.events import PipelineEvents
 from rhi.pipeline.hold import hold_step
 from rhi.pipeline.image_promotion import ImagePromotion
+from rhi.pipeline.mirror import PREFIX as MIRROR_PREFIX
 from rhi.pipeline.mirror import MirrorRepositories, mirror_step
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
@@ -123,6 +127,8 @@ SOURCE_ACTION = "GitHub"
 # What a project that publishes an image installs, so that one run builds an image for linux/arm64
 # as well as one for linux/amd64. Each is pinned, by digest or by version and checksum, and each
 # release had been out a week when it was pinned (the cooling-off of sections 9 and 17).
+# The two images are named as on Docker Hub, where the mirror's step reads their pins
+# (`rhi.pipeline.mirror`), and pulled from the mirror's copies at the same digests.
 # The emulator: QEMU's arm64 handler, registered with the host's kernel by this image.
 EMULATOR_IMAGE = (
     "tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0"
@@ -138,18 +144,50 @@ BUILDX_PLUGIN = "$HOME/.docker/cli-plugins/docker-buildx"
 # loads what it builds into Docker, from where `cdk-assets` tags and pushes it.
 BUILDKIT_IMAGE = "moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
 BUILDER = "rhi-assets"
+# The deploying account's registry, which holds the mirror: read on the build host, from the
+# account of the project's role and CodeBuild's region, so that the build specification names no
+# account. Version 0.2 of a build specification runs every command in one shell, so the commands
+# after this one read it.
+REGISTRY = "$RHI_REGISTRY"
+FINDS_THE_REGISTRY = (
+    'export RHI_REGISTRY="$(aws sts get-caller-identity --query Account --output text)'
+    '.dkr.ecr.$AWS_REGION.amazonaws.com"'
+)
+# The mirror's path in that registry, under which each image is at its path on Docker Hub.
+MIRROR = f"{REGISTRY}/{MIRROR_PREFIX}"
+# The configuration of the builder's BuildKit: one mirror for Docker Hub, the mirror's path, which
+# BuildKit asks first for each base image, by its digest. The registry it mirrors comes from a
+# variable of the build (`IMAGE_BUILDER_ENVIRONMENT`) and the host from the shell, so that no
+# command CodeBuild logs names Docker Hub.
+BUILDKIT_CONFIG = "/tmp/rhi-buildkitd.toml"
+WRITES_THE_BUILDKIT_CONFIG = (
+    f"""printf '[registry."%s"]\\n  mirrors = ["%s"]\\n' "$RHI_MIRRORED_REGISTRY" "{MIRROR}" > {BUILDKIT_CONFIG}"""
+)
 IMAGE_BUILDER = [
-    f"docker run --privileged --rm {EMULATOR_IMAGE} --install arm64",
+    FINDS_THE_REGISTRY,
+    # Docker logs in with the project's own role, for the two pulls of the daemon below. The
+    # builds' pulls carry the login `cdk-assets` makes afterwards with the bootstrap's
+    # image-publishing role.
+    f'aws ecr get-login-password | docker login --username AWS --password-stdin "{REGISTRY}"',
+    f'docker run --privileged --rm "{MIRROR}/{EMULATOR_IMAGE}" --install arm64',
     f'curl -fsSL --create-dirs -o "{BUILDX_PLUGIN}" {BUILDX_URL}',
     f'echo "{BUILDX_SHA256}  {BUILDX_PLUGIN}" | sha256sum -c -',
     f'chmod +x "{BUILDX_PLUGIN}"',
+    WRITES_THE_BUILDKIT_CONFIG,
     (
-        f"docker buildx create --name {BUILDER} --driver docker-container --driver-opt image={BUILDKIT_IMAGE}"
-        " --driver-opt default-load=true --bootstrap --use"
+        f'docker buildx create --name {BUILDER} --driver docker-container --driver-opt "image={MIRROR}/{BUILDKIT_IMAGE}"'
+        f" --driver-opt default-load=true --buildkitd-config {BUILDKIT_CONFIG} --bootstrap --use"
     ),
 ]
 # `docker build`, as `cdk-assets` runs it, is the builder's: BuildKit, on the builder created above.
-IMAGE_BUILDER_ENVIRONMENT = {"DOCKER_BUILDKIT": "1", "BUILDX_BUILDER": BUILDER}
+# Its progress stays quiet: BuildKit names each base image there by its Docker Hub reference,
+# even one it pulls from the mirror. A build that fails still prints its error.
+IMAGE_BUILDER_ENVIRONMENT = {
+    "DOCKER_BUILDKIT": "1",
+    "BUILDX_BUILDER": BUILDER,
+    "BUILDKIT_PROGRESS": "quiet",
+    "RHI_MIRRORED_REGISTRY": "docker.io",
+}
 
 
 class PipelineStack(cdk.Stack):
@@ -289,7 +327,8 @@ class PipelineStack(cdk.Stack):
 
     def _builds_images_for_both_platforms(self) -> None:
         """Gives every project of the asset step that publishes an image `IMAGE_BUILDER`, after
-        what CDK Pipelines installs and before it publishes.
+        what CDK Pipelines installs and before it publishes, and their shared role the pulls of
+        the emulator and BuildKit from the mirror.
 
         CDK Pipelines gives every asset project the same build settings, and runs Docker only in
         a project that publishes an image, which it makes privileged for that: a privileged
@@ -298,6 +337,11 @@ class PipelineStack(cdk.Stack):
         """
         assets = self.pipeline.node.try_find_child("Assets")
         projects = [] if assets is None else assets.node.find_all()
+        # The role CDK Pipelines shares among the projects that publish images, when there is one.
+        role = None if assets is None else assets.node.try_find_child("DockerRole")
+        if role is not None:
+            assert isinstance(role, iam.Role)
+            self.mirror.grant_the_image_builder(role)
         for project in projects:
             if not isinstance(project, codebuild.CfnProject):
                 continue

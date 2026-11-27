@@ -10,7 +10,9 @@ listed, because every stack and every asset a later change adds to the stage bri
 - an asset-publishing action: a CodeBuild action whose project does nothing but publish assets
   with `cdk-assets`, after installing, to build an image for linux/arm64 as well as linux/amd64,
   an arm64 emulator and a multi-platform builder, each pinned by its digest or by its version and
-  checksum (`INSTALLS_THE_IMAGE_BUILDER`). It is left out in the asset stage, and so is that stage
+  checksum, the two images from the mirror in the deploying account's registry after a login to
+  it, and the builder configured with that mirror as its one mirror for Docker Hub
+  (`INSTALLS_THE_IMAGE_BUILDER`). It is left out in the asset stage, and so is that stage
   while it holds nothing else: CDK Pipelines creates it with the first asset;
 - a stack's deployment action: a CloudFormation action that prepares or executes a change set, or
   creates and updates a stack.
@@ -231,22 +233,44 @@ ASSET_STAGE = "Assets"
 # What a project that only publishes assets runs, as CDK Pipelines writes it.
 PUBLISHES_ASSETS = re.compile(r'cdk-assets --path "[\w./-]+" --verbose publish "[\w:.-]+"')
 INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@[\w.-]+")
-# What a project that publishes images may also run, as `src/rhi/pipeline/stack.py` writes it: an
-# arm64 emulator and a builder for either platform, each image by its digest and the builder's
+# What a project that publishes images may also run, as `src/rhi/pipeline/stack.py` writes it: the
+# login to the deploying account's registry, whose host it reads on the build host, an arm64
+# emulator and a builder for either platform, each image from the mirror in that registry by its
+# digest, the builder's configuration with that mirror as its one mirror, and the builder's
 # download by its version, checked against its checksum (sections 4.2 and 8.2, step 4).
 DIGEST = r"(:[\w.-]+)?@sha256:[0-9a-f]{64}"
 BUILDX = r"\$HOME/\.docker/cli-plugins/docker-buildx"
+MIRROR = r"\$RHI_REGISTRY/rhi-mirror"
+BUILDKIT_CONFIG = r"/tmp/rhi-buildkitd\.toml"
+# The builder's configuration: its one mirror, the mirror's path, for the registry the variable
+# `MIRRORED_REGISTRY` names, which the build specification sets to Docker Hub's (`mirrors_docker_hub`).
+MIRRORED_REGISTRY = "RHI_MIRRORED_REGISTRY"
+CONFIGURES_THE_BUILDKIT = re.compile(
+    rf"""printf '\[registry\."%s"\]\\n  mirrors = \["%s"\]\\n' "\${MIRRORED_REGISTRY}" """
+    rf'"{MIRROR}" > {BUILDKIT_CONFIG}'
+)
+# The registry's host, read from the caller's account and CodeBuild's region: every other command
+# that reads it runs after this one (`finds_the_registry_first`).
+REGISTRY_VARIABLE = "RHI_REGISTRY"
+FINDS_THE_REGISTRY = re.compile(
+    r'export RHI_REGISTRY="\$\(aws sts get-caller-identity --query Account --output text\)'
+    r'\.dkr\.ecr\.\$AWS_REGION\.amazonaws\.com"'
+)
 INSTALLS_THE_IMAGE_BUILDER = [
-    re.compile(rf"docker run --privileged --rm tonistiigi/binfmt{DIGEST} --install arm64"),
+    FINDS_THE_REGISTRY,
+    re.compile(r'aws ecr get-login-password \| docker login --username AWS --password-stdin "\$RHI_REGISTRY"'),
+    re.compile(rf'docker run --privileged --rm "{MIRROR}/tonistiigi/binfmt{DIGEST}" --install arm64'),
     re.compile(
         rf'curl -fsSL --create-dirs -o "{BUILDX}" '
         r"https://github\.com/docker/buildx/releases/download/v(\d+\.\d+\.\d+)/buildx-v\1\.linux-amd64"
     ),
     re.compile(rf'echo "[0-9a-f]{{64}}  {BUILDX}" \| sha256sum -c -'),
     re.compile(rf'chmod \+x "{BUILDX}"'),
+    CONFIGURES_THE_BUILDKIT,
     re.compile(
-        rf"docker buildx create --name [\w-]+ --driver docker-container --driver-opt image=moby/buildkit{DIGEST}"
-        r" --driver-opt default-load=true --bootstrap --use"
+        r"docker buildx create --name [\w-]+ --driver docker-container"
+        rf' --driver-opt "image={MIRROR}/moby/buildkit{DIGEST}"'
+        rf" --driver-opt default-load=true --buildkitd-config {BUILDKIT_CONFIG} --bootstrap --use"
     ),
 ]
 # The modes of a CloudFormation action that only deploy a stack: the others delete one, or replace
@@ -520,16 +544,22 @@ def stages_of(pipeline: Mapping[str, Any]) -> list[tuple[str, list[dict[str, Any
     ]
 
 
-def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any:
-    """The build specification of the project a CodeBuild action runs, when the project is one of
-    the same template, named by a `Ref`."""
+def project_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """The properties of the project a CodeBuild action runs, when the project is one of the same
+    template, named by a `Ref`."""
     project = action.get("Configuration", {}).get("ProjectName")
     if type_of(action) != CODEBUILD or not isinstance(project, dict) or list(project) != ["Ref"]:
         return None
     resource = template.get("Resources", {}).get(project["Ref"], {})
     if resource.get("Type") != "AWS::CodeBuild::Project":
         return None
-    return resource.get("Properties", {}).get("Source", {}).get("BuildSpec")
+    return resource.get("Properties", {})
+
+
+def build_spec_of(action: Mapping[str, Any], template: Mapping[str, Any]) -> Any:
+    """The build specification of the project a CodeBuild action runs (`project_of`)."""
+    project = project_of(action, template)
+    return None if project is None else project.get("Source", {}).get("BuildSpec")
 
 
 def commands_of(build_spec: Any) -> list[str] | None:
@@ -554,9 +584,50 @@ def publishes_assets(action: Mapping[str, Any], template: Mapping[str, Any]) -> 
         return False
     publishing = [command for command in commands if PUBLISHES_ASSETS.fullmatch(command)]
     installs = [INSTALLS_THE_PUBLISHER, *INSTALLS_THE_IMAGE_BUILDER]
-    return bool(publishing) and all(
-        any(install.fullmatch(command) for install in installs) for command in commands if command not in publishing
+    configures = any(CONFIGURES_THE_BUILDKIT.fullmatch(command) for command in commands)
+    return (
+        bool(publishing)
+        and all(
+            any(install.fullmatch(command) for install in installs) for command in commands if command not in publishing
+        )
+        and (not configures or mirrors_docker_hub(action, template))
+        and finds_the_registry_first(build_spec_of(action, template))
     )
+
+
+def finds_the_registry_first(build_spec: Any) -> bool:
+    """Whether every command that reads the registry's host (`REGISTRY_VARIABLE`) runs after the
+    command that finds it (`FINDS_THE_REGISTRY`), so that none reads a value set before: each is
+    among the install phase's commands, which CodeBuild runs in their order before any other
+    phase, after the first that finds it."""
+    phases = json.loads(build_spec)["phases"]
+    commands = commands_of(build_spec) or []
+    reading = [command for command in commands if REGISTRY_VARIABLE in command and not FINDS_THE_REGISTRY.fullmatch(command)]
+    if not reading:
+        return True
+    install = phases.get("install", {}).get("commands", [])
+    found = next((at for at, command in enumerate(install) if FINDS_THE_REGISTRY.fullmatch(command)), None)
+    after = [] if found is None else [command for command in install[found + 1 :] if REGISTRY_VARIABLE in command]
+    return sorted(reading) == sorted(command for command in after if not FINDS_THE_REGISTRY.fullmatch(command))
+
+
+def mirrors_docker_hub(action: Mapping[str, Any], template: Mapping[str, Any]) -> bool:
+    """Whether the registry the builder's configuration mirrors (`CONFIGURES_THE_BUILDKIT`) is
+    Docker Hub's: the build specification's variables set `MIRRORED_REGISTRY` to `docker.io`, and
+    nothing else that CodeBuild reads a variable from names it, neither another source of the build
+    specification, nor the project's variables, nor the action's, which take precedence."""
+    project = project_of(action, template) or {}
+    try:
+        environment = json.loads(build_spec_of(action, template))["env"]
+        variables = environment["variables"]
+    except (TypeError, ValueError, KeyError):  # No variables: the configuration names no registry.
+        return False
+    elsewhere = [
+        {key: value for key, value in environment.items() if key != "variables"},
+        project.get("Environment", {}).get("EnvironmentVariables", []),
+        action.get("Configuration", {}).get("EnvironmentVariables", ""),
+    ]
+    return variables.get(MIRRORED_REGISTRY) == "docker.io" and MIRRORED_REGISTRY not in json.dumps(elsewhere)
 
 
 def deploys_a_stack(action: Mapping[str, Any]) -> bool:
@@ -1871,11 +1942,17 @@ def more_than_publishing(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
     pipeline.stage(ASSET_STAGE).add_action(action)
 
 
-# The emulator and the builder as a project that publishes images installs them, pinned.
+# The emulator and the builder as a project that publishes images installs them, pinned, from the
+# mirror in the deploying account's registry.
 PINNED = "@sha256:" + "0" * 64
 PLUGIN = "$HOME/.docker/cli-plugins/docker-buildx"
 IMAGE_BUILDER = [
-    f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64",
+    (
+        'export RHI_REGISTRY="$(aws sts get-caller-identity --query Account --output text)'
+        '.dkr.ecr.$AWS_REGION.amazonaws.com"'
+    ),
+    'aws ecr get-login-password | docker login --username AWS --password-stdin "$RHI_REGISTRY"',
+    f'docker run --privileged --rm "$RHI_REGISTRY/rhi-mirror/tonistiigi/binfmt:qemu-v10.2.3{PINNED}" --install arm64',
     (
         f'curl -fsSL --create-dirs -o "{PLUGIN}" '
         "https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.linux-amd64"
@@ -1883,14 +1960,37 @@ IMAGE_BUILDER = [
     f'echo "{"0" * 64}  {PLUGIN}" | sha256sum -c -',
     f'chmod +x "{PLUGIN}"',
     (
-        f"docker buildx create --name rhi-assets --driver docker-container --driver-opt image=moby/buildkit{PINNED}"
-        " --driver-opt default-load=true --bootstrap --use"
+        """printf '[registry."%s"]\\n  mirrors = ["%s"]\\n' "$RHI_MIRRORED_REGISTRY" "$RHI_REGISTRY/rhi-mirror\""""
+        " > /tmp/rhi-buildkitd.toml"
+    ),
+    (
+        "docker buildx create --name rhi-assets --driver docker-container"
+        f' --driver-opt "image=$RHI_REGISTRY/rhi-mirror/moby/buildkit{PINNED}"'
+        " --driver-opt default-load=true --buildkitd-config /tmp/rhi-buildkitd.toml --bootstrap --use"
     ),
 ]
+# Where the commands that each case below changes are in that list.
+RUNS_THE_EMULATOR, DOWNLOADS_THE_BUILDER, CONFIGURES_THE_BUILDER, CREATES_THE_BUILDER = 2, 3, 6, 7
 
 
-def a_publisher_that_installs(installs: list[str]) -> Change:
-    """Adds to the asset stage a project that installs the publisher and `installs`, then publishes."""
+def the_image_builder_with(at: int, command: str) -> list[str]:
+    """`IMAGE_BUILDER` with its command at `at` replaced by `command` and every other kept, in its
+    place: a case changes one command, so the one it changes is what lists it."""
+    return [command if index == at else other for index, other in enumerate(IMAGE_BUILDER)]
+
+
+# The variables of its build specification, as `src/rhi/pipeline/stack.py` writes them: the
+# registry the builder's configuration mirrors is Docker Hub's.
+IMAGE_BUILDER_VARIABLES = {"RHI_MIRRORED_REGISTRY": "docker.io"}
+
+
+def a_publisher_that_installs(
+    installs: list[str],
+    variables: dict[str, str] = IMAGE_BUILDER_VARIABLES,
+    project_variables: dict[str, str] | None = None,
+) -> Change:
+    """Adds to the asset stage a project that installs the publisher and `installs`, then publishes,
+    with `variables` in its build specification and `project_variables` in its own environment."""
 
     def change(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
         codebuild = cdk.aws_codebuild
@@ -1898,8 +1998,11 @@ def a_publisher_that_installs(installs: list[str]) -> Change:
             "install": {"commands": ["npm install -g cdk-assets@latest", *installs]},
             "build": {"commands": [PUBLISH]},
         }
-        spec = codebuild.BuildSpec.from_object({"version": "0.2", "phases": phases})
-        project = codebuild.PipelineProject(stack, "Image", build_spec=spec)
+        spec = codebuild.BuildSpec.from_object({"version": "0.2", "env": {"variables": variables}, "phases": phases})
+        environment = {
+            name: codebuild.BuildEnvironmentVariable(value=value) for name, value in (project_variables or {}).items()
+        }
+        project = codebuild.PipelineProject(stack, "Image", build_spec=spec, environment_variables=environment)
         synthesized = cdk.aws_codepipeline.Artifact("Synth_Output")
         action = cdk.aws_codepipeline_actions.CodeBuildAction(action_name="Image", project=project, input=synthesized)
         pipeline.stage(ASSET_STAGE).add_action(action)
@@ -1928,14 +2031,72 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             id="a project of the asset stage that does more than publish assets",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[0].replace(f":qemu-v10.2.3{PINNED}", ":latest")]),
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    RUNS_THE_EMULATOR, IMAGE_BUILDER[RUNS_THE_EMULATOR].replace(f":qemu-v10.2.3{PINNED}", ":latest")
+                )
+            ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that installs an emulator without its digest",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[1].replace("download/v0.38.2", "latest/download")]),
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    DOWNLOADS_THE_BUILDER, IMAGE_BUILDER[DOWNLOADS_THE_BUILDER].replace("download/v0.38.2", "latest/download")
+                )
+            ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that downloads the builder without its version",
+        ),
+        pytest.param(
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    RUNS_THE_EMULATOR, f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64"
+                )
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that runs the emulator from Docker Hub by its digest",
+        ),
+        pytest.param(
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    CREATES_THE_BUILDER, IMAGE_BUILDER[CREATES_THE_BUILDER].replace("$RHI_REGISTRY/rhi-mirror/", "")
+                )
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that creates its builder from Docker Hub by its digest",
+        ),
+        pytest.param(
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    CONFIGURES_THE_BUILDER, IMAGE_BUILDER[CONFIGURES_THE_BUILDER].replace('"$RHI_REGISTRY', '"example.com')
+                )
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures a mirror outside the deploying account's registry",
+        ),
+        pytest.param(
+            a_publisher_that_installs(
+                [IMAGE_BUILDER[CONFIGURES_THE_BUILDER], *IMAGE_BUILDER[:CONFIGURES_THE_BUILDER], IMAGE_BUILDER[CREATES_THE_BUILDER]],
+                variables={**IMAGE_BUILDER_VARIABLES, "RHI_REGISTRY": "example.com"},
+            ),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures the mirror before it finds the deploying account's registry",
+        ),
+        pytest.param(
+            a_publisher_that_installs(IMAGE_BUILDER, variables={"RHI_MIRRORED_REGISTRY": "example.com"}),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures the mirror for a registry other than Docker Hub",
+        ),
+        pytest.param(
+            a_publisher_that_installs(IMAGE_BUILDER, variables={}),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures the mirror for no registry",
+        ),
+        pytest.param(
+            a_publisher_that_installs(IMAGE_BUILDER, project_variables={"RHI_MIRRORED_REGISTRY": "example.com"}),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage whose own variables change the registry the mirror is for",
         ),
         pytest.param(a_deletion, [f"Rhi/Delete: {CLOUDFORMATION}"], id="a CloudFormation action that deletes a stack"),
     ],
