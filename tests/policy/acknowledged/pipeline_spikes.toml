@@ -33,6 +33,7 @@
 #   the document carries no such tag.
 # - ssm:ListCommandInvocations on every resource, the only way AWS grants it: the status of each
 #   invocation of the check and what its step printed.
+#   A stage that launches no instance, parked or with no pool, gives the role none of these three.
 # Nothing of Auto Scaling or IAM, and no action of EC2: the job sends by the tag and reads no
 # instance. No report group: a project declares none.
 #

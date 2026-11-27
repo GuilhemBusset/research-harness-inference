@@ -50,7 +50,8 @@ then adds a project and nothing else: no statement and no finding.
   else. IAM reads the condition on each resource the call names, and the document carries no such
   tag, so the right is two statements: the document alone, and the instances under the condition;
 - read each invocation's status and what its step printed, `ssm:ListCommandInvocations`, which
-  AWS grants only on every resource.
+  AWS grants only on every resource. A stage that launches no instance, parked or with no pool,
+  holds neither the document nor a launch template, and its role has none of these three.
 
 No action of Auto Scaling, EC2 or IAM: a spike reaches a pool through the gateway, as a canary
 student, and changes nothing of one but the mock pool's session; the job `engine_contract` sends
@@ -291,20 +292,27 @@ class SpikeJobs(Construct):
                     conditions={"ForAllValues:StringEquals": {"dynamodb:LeadingKeys": [MOCK_POOL]}},
                 )
             )
-            # The contract check: the one document, and the instances of the configuration's pools
-            # by their tag. The condition is on a statement of its own, since the document carries
-            # no such tag.
-            document = stack.format_arn(service="ssm", resource="document", resource_name=DOCUMENT_NAME)
-            instances = stack.format_arn(service="ec2", resource="instance", resource_name="*")
-            pools = sorted(pool.name for pool in stage.config.pools)
-            statements.append(iam.PolicyStatement(actions=CONTRACT_SENDS, resources=[document]))
-            statements.append(
-                iam.PolicyStatement(
-                    actions=CONTRACT_SENDS,
-                    resources=[instances],
-                    conditions={"StringEquals": {f"ssm:resourceTag/{POOL_TAG}": pools}},
-                )
-            )
-            # Run Command grants listing invocations only on every resource.
-            statements.append(iam.PolicyStatement(actions=CONTRACT_READS, resources=["*"]))
+            statements += contract_check(stack, stage)
         return statements
+
+
+def contract_check(stack: cdk.Stack, stage: EndpointStage) -> list[iam.PolicyStatement]:
+    """What sends the contract check: the one document, and the instances of the stage's pools by
+    their tag, with the condition on a statement of its own since the document carries no such
+    tag; and the read of the invocations. None for a stage that launches no instance, parked or
+    with no pool: its pools stack holds neither the document nor a launch template."""
+    pools = sorted(stage.pools.groups)
+    if stage.pools.contract_check is None or not pools:
+        return []
+    document = stack.format_arn(service="ssm", resource="document", resource_name=DOCUMENT_NAME)
+    instances = stack.format_arn(service="ec2", resource="instance", resource_name="*")
+    return [
+        iam.PolicyStatement(actions=CONTRACT_SENDS, resources=[document]),
+        iam.PolicyStatement(
+            actions=CONTRACT_SENDS,
+            resources=[instances],
+            conditions={"StringEquals": {f"ssm:resourceTag/{POOL_TAG}": pools}},
+        ),
+        # Run Command grants listing invocations only on every resource.
+        iam.PolicyStatement(actions=CONTRACT_READS, resources=["*"]),
+    ]

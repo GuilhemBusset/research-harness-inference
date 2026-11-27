@@ -3235,14 +3235,11 @@ def test_refuses_another_writer_of_the_images_and_a_trigger_of_the_job(
 TWO_SPIKES = (("first_spike", "first_spike.py"), ("second_spike", "second_spike.py"))
 
 
-@pytest.fixture(scope="module")
-def two_spikes(cdk: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
-    """The templates of the app of `app.py`, from the example configuration, with the two spike
-    jobs of `TWO_SPIKES` in place of the app's list, synthesized under cdk-nag."""
+def spike_app(cdk: ModuleType, outdir: Path, settings: Any, jobs: list[Any] | None = None) -> dict[str, dict[str, Any]]:
+    """The templates of the app of `app.py` for the configuration `settings`, with the spike jobs
+    of `jobs` in place of the app's list unless it is None, synthesized under cdk-nag."""
     import importlib.util
 
-    from rhi import config
-    from rhi.pipeline.spikes import SpikeJob
     from rhi.pipeline.stack import PipelineStack
     from rhi.stage import EndpointStage
 
@@ -3252,18 +3249,28 @@ def two_spikes(cdk: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dic
     app_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(app_module)
     context = json.loads((repo / "cdk.json").read_text(encoding="utf-8"))["context"] | {"aws:cdk:bundling-stacks": []}
-    outdir = tmp_path_factory.mktemp("spikes")
     app = cdk.App(outdir=str(outdir), context=context, analytics_reporting=False)
-    example = config.load({"RHI_CONFIG": "example"})
-    stage = EndpointStage(app, "Rhi", config=example)
+    stage = EndpointStage(app, "Rhi", config=settings)
     app_module.add_nag(app)
-    jobs = [SpikeJob(name, script) for name, script in TWO_SPIKES]
-    PipelineStack(app, "RhiPipeline", config=example, stage=stage, spike_jobs=jobs)
+    given = {} if jobs is None else {"spike_jobs": jobs}
+    PipelineStack(app, "RhiPipeline", config=settings, stage=stage, **given)
     out = Path(app.synth().directory)
     return {
         path.relative_to(out).as_posix(): json.loads(path.read_text(encoding="utf-8"))
         for path in sorted(out.rglob("*.template.json"))
     }
+
+
+@pytest.fixture(scope="module")
+def two_spikes(cdk: ModuleType, tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict[str, Any]]:
+    """The templates of the app of `app.py`, from the example configuration, with the two spike
+    jobs of `TWO_SPIKES` in place of the app's list, synthesized under cdk-nag."""
+    from rhi import config
+    from rhi.pipeline.spikes import SpikeJob
+
+    example = config.load({"RHI_CONFIG": "example"})
+    jobs = [SpikeJob(name, script) for name, script in TWO_SPIKES]
+    return spike_app(cdk, tmp_path_factory.mktemp("spikes"), example, jobs)
 
 
 def found_spikes(templates: Templates) -> list[tuple[str, str, str | None, str | None]]:
@@ -3290,6 +3297,25 @@ def test_two_spike_jobs_keep_the_rules(two_spikes: dict[str, dict[str, Any]]) ->
     # And the pools whose instances it may send the contract check to, by the tag they launch with.
     assert pool_tags(two_spikes) == {"coursework", "mock"}
     assert breaches(two_spikes) == []
+
+
+@pytest.mark.parametrize("stage", ["parked", "no pool"])
+def test_a_stage_that_launches_no_instance_keeps_the_rules(stage: str, cdk: ModuleType, tmp_path: Path) -> None:
+    # Parked, the stage keeps its pools in the configuration and holds no launch template; with no
+    # pool, there is none to name. Either way the role names no instance, and keeps the rules.
+    import tomllib
+
+    from rhi import config
+
+    raw = tomllib.loads((Path(__file__).resolve().parents[2] / "config.example.toml").read_text(encoding="utf-8"))
+    if stage == "parked":
+        raw["parked"] = True
+    else:
+        raw["pools"] = {}
+        raw.pop("default_pool", None)
+    built = spike_app(cdk, tmp_path, config.parse(raw, "example"))
+    assert pool_tags(built) == set()
+    assert spike_breaches(built) == []
 
 
 def the_spike_role(templates: Templates) -> tuple[Mapping[str, Any], dict[str, Any]]:

@@ -12,18 +12,21 @@ of EC2 or Auto Scaling: Run Command finds the instances by the tag.
 | --- | --- |
 | `RHI_SPIKE_POOL` | The pool, `coursework` unless given |
 | `RHI_SPIKE_INSTANCES` | The instances the session must have in service, and the fewest that must answer; 1 unless given |
-| `RHI_SPIKE_RUN_MINUTES` | How long the job may wait for the invocations, which the session must outlast. Required |
+| `RHI_SPIKE_RUN_MINUTES` | How long the job sends and waits for the invocations, which the session must outlast. Required |
 | `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 
 **In a booked session.** Before it sends anything the job checks the pool's session
 (`common.require_session`): active, with the instances in service, lasting the run's minutes from
 now. Otherwise it writes `job_failed` with the reason and sends nothing.
 
-**The wait.** Run Command resolves the tag into invocations, one for each instance, and lists them
-as it does (`ListCommandInvocations`), so an invocation may appear some time after the command was
-sent. The job reads the list every `POLL_SECONDS` and stops once at least the instances it was
-given have appeared, every one that has appeared has ended, and no new one has appeared for
-`SETTLE_SECONDS`; or once the run's minutes have passed, with what it then holds.
+**The wait.** The run's minutes start when the session check admits the run, and the send and
+every read of the invocations are taken out of them. Run Command resolves the tag into
+invocations, one for each instance, and lists them as it does (`ListCommandInvocations`), so an
+invocation may appear at any time after the command was sent, and nothing the role may read says
+how many instances the tag reaches. So the job reads the list every `POLL_SECONDS` until the run's
+minutes end, and records each instance's last listing read within them: a page of the list that
+comes back once they have ended is not taken, and an invocation that has not ended by then does
+not pass. When a read fails, the job records what it read until then, and then the error.
 
 **What is recorded**, one JSON object a line on standard output, which the spike jobs' log group
 keeps. Every line has `at`, its UTC time, and `kind`:
@@ -80,10 +83,8 @@ STATUSES = ("Pending", "InProgress", "Delayed", "Success", "Cancelled", "TimedOu
 ENDED = frozenset({"Success", "Cancelled", "TimedOut", "Failed"})
 SUCCESS = "Success"
 OTHER = "other"
-# Seconds between two reads of the invocations, and how long no new one may appear before the job
-# takes the list as whole.
+# Seconds between two reads of the invocations.
 POLL_SECONDS = 10
-SETTLE_SECONDS = 60
 # What Run Command answers for a command it does not list yet.
 NOT_LISTED_YET = "InvalidCommandId"
 
@@ -139,59 +140,51 @@ def output_of(invocation: Mapping[str, Any]) -> str:
     return "\n".join(str(plugin.get("Output") or "") for plugin in invocation.get("CommandPlugins", []))
 
 
-def invocations(ssm: Any, command_id: str) -> list[dict[str, Any]]:
-    """Every invocation of the command Run Command lists now, with its steps' output, in its order;
-    none for a command it does not list yet."""
-    found: list[dict[str, Any]] = []
+def read_invocations(
+    ssm: Any, command_id: str, held: dict[str, Mapping[str, Any]], *, deadline: float, now: Callable[[], float]
+) -> bool:
+    """Reads every invocation of the command Run Command lists now into `held`, by instance, page by
+    page, an instance first held keeping its place; none for a command it does not list yet. A page
+    that comes back after `deadline` is not taken: False then, True otherwise."""
     asked: dict[str, Any] = {"CommandId": command_id, "Details": True}
     while True:
         try:
             page = ssm.list_command_invocations(**asked)
         except botocore.exceptions.ClientError as error:
-            if error.response.get("Error", {}).get("Code") == NOT_LISTED_YET and not found:
-                return []
+            if error.response.get("Error", {}).get("Code") == NOT_LISTED_YET and "NextToken" not in asked:
+                return now() <= deadline
             raise
-        found += page.get("CommandInvocations", [])
+        if now() > deadline:
+            return False
+        for invocation in page.get("CommandInvocations", []):
+            held[str(invocation.get("InstanceId"))] = invocation
         if not page.get("NextToken"):
-            return found
+            return True
         asked["NextToken"] = page["NextToken"]
 
 
 def check(
     ssm: Any,
     pool: str,
+    held: dict[str, Mapping[str, Any]],
     *,
-    instances: int,
-    run_minutes: int,
+    deadline: float,
     now: Callable[[], float],
     sleep: Callable[[float], None],
-) -> list[dict[str, Any]]:
-    """Sends the document to the pool's instances, by the tag, and waits for its invocations
-    (module docstring, "The wait"); returns each one's last listing, in order of appearance."""
+) -> None:
+    """Sends the document to the pool's instances, by the tag, and reads its invocations into
+    `held` until `deadline` (module docstring, "The wait")."""
     sent = ssm.send_command(
         DocumentName=DOCUMENT,
         Targets=[{"Key": f"tag:{POOL_TAG}", "Values": [pool]}],
         MaxConcurrency="100%",
         MaxErrors="100%",
-        TimeoutSeconds=max(30, run_minutes * 60),
+        # How long an instance may take to start the check: no longer than the run has left.
+        TimeoutSeconds=max(30, int(deadline - now())),
     )
     command_id = sent["Command"]["CommandId"]
-    deadline = now() + run_minutes * 60
-    order: list[str] = []
-    held: dict[str, dict[str, Any]] = {}
-    last_new = now()
-    while True:
-        for invocation in invocations(ssm, command_id):
-            instance = str(invocation.get("InstanceId"))
-            if instance not in held:
-                order.append(instance)
-                last_new = now()
-            held[instance] = invocation
-        at = now()
-        ended = all(status_of(held[instance]) in ENDED for instance in order)
-        if (len(order) >= instances and ended and at - last_new >= SETTLE_SECONDS) or at >= deadline:
-            return [held[instance] for instance in order]
-        sleep(max(0.0, min(POLL_SECONDS, deadline - at)))
+    while read_invocations(ssm, command_id, held, deadline=deadline, now=now) and now() < deadline:
+        sleep(min(POLL_SECONDS, deadline - now()))
 
 
 def record(lines: Lines, checked: Iterable[Mapping[str, Any]], *, instances: int) -> int:
@@ -225,24 +218,31 @@ def run_job(
     if len(pools) != 1:
         raise ValueError("the deployed configuration has no pool of that name")
     (pool,) = pools
+    # The time the session check reads, at which the run's minutes start.
+    admitted: list[float] = []
+
+    def admitting() -> float:
+        admitted.append(now())
+        return admitted[-1]
+
     common.require_session(
         common.pool_state_table(environ) if table is None else table,
         name,
         instances=needs.instances,
         run_minutes=needs.run_minutes,
         session_max_hours=settings.session_max_hours,
-        now=now,
+        now=admitting,
     )
+    deadline = admitted[-1] + needs.run_minutes * 60
     lines.write(Line.JOB, pool=name, engine=pool.engine)
-    checked = check(
-        boto3.client("ssm") if ssm is None else ssm,
-        name,
-        instances=needs.instances,
-        run_minutes=needs.run_minutes,
-        now=now,
-        sleep=sleep,
-    )
-    return record(lines, checked, instances=needs.instances)
+    held: dict[str, Mapping[str, Any]] = {}
+    try:
+        check(boto3.client("ssm") if ssm is None else ssm, name, held, deadline=deadline, now=now, sleep=sleep)
+    except Exception:
+        # What was read before the error is recorded all the same; the error then fails the job.
+        record(lines, held.values(), instances=needs.instances)
+        raise
+    return record(lines, held.values(), instances=needs.instances)
 
 
 def main(environ: Mapping[str, str] = os.environ, out: Callable[[str], None] = print, **given: Any) -> int:

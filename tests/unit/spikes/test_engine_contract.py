@@ -8,11 +8,14 @@ import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import engine_contract as job
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 T0 = 1_800_000_000.0
 # The instances of the documentation's examples, which no line may name.
@@ -36,7 +39,7 @@ class RunCommand:
     """Stands for Systems Manager: records what is sent, and lists, at each read, the invocations
     the script gives for that read (the last one again once it runs out), two to a page."""
 
-    def __init__(self, *reads: list[tuple[str, str, str]]) -> None:
+    def __init__(self, *reads: Sequence[tuple[str, str, str]]) -> None:
         self.reads, self.sent, self.read = list(reads), [], 0
 
     def send_command(self, **sent: Any) -> dict[str, Any]:
@@ -65,11 +68,13 @@ def deployed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(job.config, "read_ssm", lambda: SimpleNamespace(pools=[pool], session_max_hours=12))
 
 
-def ran(pool_state: Any, ssm: RunCommand, instances: int = 2) -> tuple[int, list[dict[str, Any]], list[str]]:
-    clock = Clock()
-    pool_state.book(in_service=instances, now=int(T0))
+def ran(
+    pool_state: Any, ssm: Any, instances: int = 2, clock: Clock | None = None, **given: str
+) -> tuple[int, list[dict[str, Any]], list[str]]:
+    clock = Clock() if clock is None else clock
+    pool_state.book(in_service=max(instances, 2), now=int(T0))
     written: list[str] = []
-    environ = pool_state.environ | {"RHI_SPIKE_INSTANCES": str(instances)}
+    environ = pool_state.environ | {"RHI_SPIKE_INSTANCES": str(instances)} | given
     status = job.main(environ, out=written.append, ssm=ssm, table=pool_state, now=clock, sleep=clock.sleep)
     assert all(UTC_TIME.fullmatch(json.loads(line)["at"]) for line in written)
     assert not [line for line in written if FIRST in line or SECOND in line]
@@ -142,19 +147,72 @@ def test_an_invocation_that_timed_out_or_never_ended_fails_the_job(pool_state: A
     assert checks(lines)[1] == (2, "InProgress", dict.fromkeys(job.TESTS), None)
 
 
-def test_an_invocation_that_appears_after_the_given_instances_ended_is_waited_for(pool_state: Any) -> None:
+def test_an_invocation_that_appears_late_in_the_run_is_recorded(pool_state: Any) -> None:
+    # The given instance passed at once; the tag reaches a second, listed only after 90 seconds.
     failed = PASSING.replace("test_health passed", "test_health error")
-    ssm = RunCommand(
-        [(FIRST, "Success", PASSING)],
-        [(FIRST, "Success", PASSING), (SECOND, "InProgress", "")],
-        [(FIRST, "Success", PASSING), (SECOND, "Failed", failed)],
-    )
-    status, lines, _ = ran(pool_state, ssm, instances=1)
+    ssm = RunCommand(*[[(FIRST, "Success", PASSING)]] * 9, [(FIRST, "Success", PASSING), (SECOND, "Failed", failed)])
+    status, lines, _ = ran(pool_state, ssm, instances=1, RHI_SPIKE_RUN_MINUTES="2")
     assert status == 1
-    assert checks(lines)[1] == (2, "Failed", ALL_PASSED | {"test_health": "error"}, 0)
+    assert checks(lines) == [(1, "Success", ALL_PASSED, 0), (2, "Failed", ALL_PASSED | {"test_health": "error"}, 0)]
 
 
-def test_fewer_instances_than_given_fail_the_job_once_the_list_settles(pool_state: Any) -> None:
+class Slow(RunCommand):
+    """Run Command whose invocation ends at `ends` seconds into the run, and which takes 20 seconds
+    to answer the send, or the read made at 50 seconds."""
+
+    def __init__(self, clock: Clock, slow: str, ends: float) -> None:
+        super().__init__()
+        self.clock, self.slow, self.ends = clock, slow, T0 + ends
+
+    def send_command(self, **sent: Any) -> dict[str, Any]:
+        self.clock.sleep(20 if self.slow == "send" else 0)
+        return super().send_command(**sent)
+
+    def list_command_invocations(self, **asked: Any) -> dict[str, Any]:
+        if self.slow == "read" and self.clock() == T0 + 50:
+            self.clock.sleep(20)
+        ended = self.clock() >= self.ends
+        self.reads = [[(FIRST, "Success", PASSING) if ended else (FIRST, "InProgress", "")]]
+        return super().list_command_invocations(**asked)
+
+
+@pytest.mark.parametrize("slow", ["send", "read"])
+def test_the_run_s_minutes_start_when_the_session_admits_it(slow: str, pool_state: Any) -> None:
+    # A run of one minute, whose one invocation ends at 70 seconds: too late, whether the minute
+    # went on a slow send or on a read that came back after it.
+    clock = Clock()
+    status, lines, _ = ran(pool_state, Slow(clock, slow, ends=70), 1, clock, RHI_SPIKE_RUN_MINUTES="1")
+    assert status == 1 and checks(lines) == [(1, "InProgress", dict.fromkeys(job.TESTS), None)]
+    assert clock() - T0 <= (60 if slow == "send" else 70)
+    # Ended at 40 seconds, it passes.
+    clock = Clock()
+    status, _, _ = ran(pool_state, Slow(clock, slow, ends=40), 1, clock, RHI_SPIKE_RUN_MINUTES="1")
+    assert status == 0
+
+
+class Failing(RunCommand):
+    """Run Command whose listing fails from its second call on, with a text no line may carry."""
+
+    def list_command_invocations(self, **asked: Any) -> dict[str, Any]:
+        if self.read or "NextToken" in asked:
+            raise OSError("an unavailable sentinel")
+        return super().list_command_invocations(**asked)
+
+
+@pytest.mark.parametrize("listed", [1, 3], ids=["on the next read", "on the next page"])
+def test_a_failed_read_keeps_what_was_read_before_it(listed: int, pool_state: Any) -> None:
+    # One instance listed, and the next read fails; or three, two to a page, and the second page fails.
+    status, lines, written = ran(
+        pool_state,
+        Failing([(FIRST, "Success", PASSING), (SECOND, "Success", PASSING), (FIRST, "Success", PASSING)][:listed]),
+    )
+    assert status == 1
+    assert checks(lines) == [(1, "Success", ALL_PASSED, 0), (2, "Success", ALL_PASSED, 0)][: min(listed, 2)]
+    assert (lines[-1]["kind"], lines[-1]["error"]) == ("job_failed", "OSError")
+    assert "sentinel" not in "".join(written)
+
+
+def test_fewer_instances_than_given_fail_the_job_when_the_run_s_minutes_end(pool_state: Any) -> None:
     status, lines, _ = ran(pool_state, RunCommand([(FIRST, "Success", PASSING)]), instances=2)
     assert status == 1 and len(checks(lines)) == 1
 
