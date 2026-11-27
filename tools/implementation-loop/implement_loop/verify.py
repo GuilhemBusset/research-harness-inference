@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -155,10 +156,11 @@ def unconditional_failures(root: Path, files: list[str]) -> list[str]:
 
 PLUGIN = "implement_loop.loop_pytest"
 ENGINE_DIR = Path(__file__).resolve().parent.parent   # what PYTHONPATH needs for PLUGIN
-# The name of a copy of the plugin, a top-level module alone in a directory of its own
-# (`run_check`'s `plugin_dir`), which the second run of a reproduction loads (`Engine._reproduction`):
-# that directory exposes no `implement_loop` package, to the command or to a process it starts.
-PLUGIN_COPY = "implement_loop_result_plugin"
+# How the name of a copy of the plugin begins: a top-level module alone in a directory of its own
+# (`run_check`'s `plugin_copy`), which the second run of a reproduction loads (`Engine._reproduction`).
+# That directory exposes no `implement_loop` package, to the command or to a process it starts, and
+# the rest of the name is new on every run, so no module of the code under review can stand in for it.
+PLUGIN_COPY_PREFIX = "implement_loop_result_plugin_"
 # outcome -> what it means for a check; a worse outcome of the same test wins (as in loop_pytest)
 OUTCOMES = {"passed": "passed", "xfailed": "skipped", "skipped": "skipped", "xpassed": "failed",
             "failed": "failed", "error": "failed"}
@@ -270,6 +272,29 @@ def _notes(cases: dict | None, output: str) -> list[str]:
     return notes + stopped
 
 
+def without_plugin(addopts: str) -> str:
+    """`addopts` (a PYTEST_ADDOPTS value) without the options that load PLUGIN, read as pytest reads
+    them: split as a shell would, `-p` taking the next word, `-pNAME` joined, the name stripped.
+    Every other word is kept as it was; a value with nothing to remove, or one pytest could not
+    split either, is returned as written."""
+    try:
+        words = shlex.split(addopts)
+    except ValueError:
+        return addopts
+    kept: list[str] = []
+    rest = iter(words)
+    for word in rest:
+        if word == "-p":
+            name = next(rest, None)
+            if name is None:
+                kept.append(word)
+            elif name.strip() != PLUGIN:
+                kept += [word, name]
+        elif not (word.startswith("-p") and word[2:].strip() == PLUGIN):
+            kept.append(word)
+    return addopts if kept == words else shlex.join(kept)
+
+
 CREDENTIAL_VARS = sandbox.GITHUB_VARS
 
 
@@ -282,7 +307,7 @@ def scrubbed_env(env: dict[str, str], work_dir: Path) -> dict[str, str]:
 
 def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, default_timeout: int = 900,
               extra_env: dict[str, str] | None = None, mounts: sandbox.Mounts | None = None,
-              plugin_dir: Path | None = None) -> tuple[Evidence, dict | None]:
+              plugin_copy: Path | None = None) -> tuple[Evidence, dict | None]:
     """Run one check command. Returns its evidence, and what its pytest processes reported:
     `{"passed", "failed", "skipped", "collected": [ids], "processes": n, "bad_exit": [status]}`
     (failed includes errors and xpasses, skipped includes xfails), or None when no pytest ran.
@@ -291,9 +316,10 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
     judgement and its git (default: `root`, read-write); the verifier's plugin, the record
     directory and the run's package caches are added here.
 
-    With `plugin_dir`, a directory that holds a copy of the plugin alone as `PLUGIN_COPY`, pytest
-    loads the plugin by that name, and the directory comes after the engine's on PYTHONPATH and is
-    added to what the command may read.
+    With `plugin_copy`, a copy of the plugin alone in its directory, as a top-level module whose
+    name begins with `PLUGIN_COPY_PREFIX`, pytest loads the plugin by that module's name instead,
+    and the directory comes after the engine's on PYTHONPATH and is added to what the command may
+    read.
 
     The command passes when it exits 0, no test failed, erred, xpassed, xfailed or was skipped,
     and, if pytest ran at all, at least one test ran and every pytest ended with a test result
@@ -315,12 +341,12 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
     env["LOOP_REPORT_DIR"] = str(report_dir)
     env["LOOP_REPO_ROOT"] = str(Path(root).resolve())
     addopts, plugin = env.get("PYTEST_ADDOPTS", ""), PLUGIN
-    if plugin_dir is not None:
+    if plugin_copy is not None:
         # A verifier run under another's pytest (the engine's own tests, run as a check) inherits
         # its `-p PLUGIN`, which a command that replaces PYTHONPATH no longer reaches.
-        addopts, plugin = re.sub(rf"(?<!\S)-p {re.escape(PLUGIN)}(?!\S)", "", addopts), PLUGIN_COPY
+        addopts, plugin = without_plugin(addopts), plugin_copy.stem
     env["PYTEST_ADDOPTS"] = (addopts + f" -p {plugin} -p no:cacheprovider").strip()
-    plugin_dirs = [ENGINE_DIR, *([plugin_dir] if plugin_dir is not None else [])]
+    plugin_dirs = [ENGINE_DIR, *([plugin_copy.parent] if plugin_copy is not None else [])]
     path = [str(d) for d in plugin_dirs] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
     env["PYTHONPATH"] = os.pathsep.join(path)
     cwd = root / spec.cwd

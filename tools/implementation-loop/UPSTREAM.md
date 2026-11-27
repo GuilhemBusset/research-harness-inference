@@ -33,13 +33,16 @@ plugin runs again with it" below exposes the plugin. Its directory held the plug
 `sys.path` in the pytest process alone: a process a test started inherited the PYTHONPATH entry,
 and its `import implement_loop` found the stub where the code under review has none. The directory
 now holds the plugin alone, as a top-level module, so it exposes no `implement_loop` package to
-anything. The engine's version stays 1.2.22: nothing waits for this change.
+anything. The module's name is new on every run: a module of the code under review earlier on a
+pytest's `sys.path` (the current directory of `python -m pytest` comes before every PYTHONPATH
+entry) cannot take the recorder's place in one pytest of a command while another pytest records.
+The engine's version stays 1.2.22: nothing waits for this change.
 
 | File | What changed |
 | --- | --- |
-| `implement_loop/verify.py` | `run_check` takes `plugin_dir`, a directory that holds a copy of the plugin as the top-level module `PLUGIN_COPY` (`implement_loop_result_plugin`). Given one, pytest loads the plugin by that name (`-p PLUGIN_COPY`, and an inherited `-p PLUGIN`, which an outer verifier's run gives the engine's own tests, is left out), and the directory comes after the engine's on PYTHONPATH, so a pytest the command's assignment does not reach finds it too, and is bound read-only into the sandbox. Without one, nothing changes. |
-| `implement_loop/engine.py` | `_plugin_only` writes the copy alone as `PLUGIN_COPY`; the stub package (`PLUGIN_PACKAGE`) is gone. `_run_reproduction` passes the directory to `run_check` as `plugin_dir`, which binds it. |
-| `tests/test_reproduction_pythonpath.py` | New tests: a process a test of the second run starts inherits its PYTHONPATH and finds no `implement_loop`, and that run's test is recorded; the directory holds the copy alone, byte for byte the plugin; a second pytest in the command, with the verifier's PYTHONPATH, is recorded too; a run under another verifier's `-p` of the plugin loads the copy. |
+| `implement_loop/verify.py` | `run_check` takes `plugin_copy`, a copy of the plugin alone in its directory as a top-level module whose name begins with `PLUGIN_COPY_PREFIX` (`implement_loop_result_plugin_`). Given one, pytest loads the plugin by that module's name, and the directory comes after the engine's on PYTHONPATH, so a pytest the command's assignment does not reach finds it too, and is bound read-only into the sandbox. The `-p PLUGIN` that an outer verifier's run gives the engine's own tests is left out (`without_plugin`, which reads PYTEST_ADDOPTS as pytest does: split as a shell would, `-p` taking the next word, `-pNAME` joined; every other word is kept). Without a copy, nothing changes. |
+| `implement_loop/engine.py` | `_plugin_only` writes the copy alone, named `PLUGIN_COPY_PREFIX` and 16 random hex digits, and returns its path; the stub package (`PLUGIN_PACKAGE`) is gone. `_run_reproduction` passes the copy to `run_check` as `plugin_copy`, which binds its directory. |
+| `tests/test_reproduction_pythonpath.py` | New tests: a process a test of the second run starts inherits its PYTHONPATH and finds no `implement_loop`, and that run's test is recorded; the directory holds the copy alone, byte for byte the plugin, under a name that differs between two runs; two pytest sessions of one command, the second with the verifier's PYTHONPATH, are both recorded, and a failing first one stops the run at `&&` and fails it; a project module of the fixed name an earlier version used, first on the second session's `sys.path`, does not displace the recorder, so that session's skip is recorded and fails the run; a run under another verifier's `-p` of the plugin loads the copy and keeps a `--deselect` id that contains the same text; `without_plugin` removes only the options that load the plugin. |
 
 ## A reproduction that cannot load the verifier's plugin runs again with it (2026-11-26)
 

@@ -37,6 +37,7 @@ import json
 import os
 import posixpath
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -2036,26 +2037,29 @@ class Engine:
         work.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=work, prefix="plugin-") as tmp:
             plugin = self._plugin_only(Path(tmp))
-            extended = extended_pythonpath(command, str(plugin))
+            extended = extended_pythonpath(command, str(plugin.parent))
             retry = None if extended == command else self._run_reproduction(wt, extended, cwd, probe, plugin)
         return retry[0] if retry is not None and retry[1] is not None else first[0]
 
     @staticmethod
     def _plugin_only(root: Path) -> Path:
-        """`root`, holding the verifier's result plugin alone, copied from where the verifier ships
-        it, as the top-level module `verify.PLUGIN_COPY`, the name `verify.run_check` loads it by
-        when given this directory. No `implement_loop` package is in it: a test, and a process a
-        test starts with the PYTHONPATH it inherits, import the code under review's own
-        `implement_loop` if their path has one, and none if not."""
+        """The verifier's result plugin, copied from where the verifier ships it into `root`, alone,
+        as a top-level module whose name is `verify.PLUGIN_COPY_PREFIX` and a part new on every call:
+        `verify.run_check` loads it by that name when given the copy. No `implement_loop` package is
+        in `root`: a test, and a process a test starts with the PYTHONPATH it inherits, import the
+        code under review's own `implement_loop` if their path has one, and none if not. Nor can a
+        module of the code under review take the copy's place in a pytest: none has its name."""
         source = verify.ENGINE_DIR.joinpath(*verify.PLUGIN.split(".")).with_suffix(".py")
-        shutil.copyfile(source, root / f"{verify.PLUGIN_COPY}.py")
-        return root
+        copy = root / f"{verify.PLUGIN_COPY_PREFIX}{secrets.token_hex(8)}.py"
+        shutil.copyfile(source, copy)
+        return copy
 
     def _run_reproduction(self, wt: Path, command: str, cwd: str, probe: tuple[str, str] | None,
                           plugin: Path | None = None) -> tuple[Evidence, dict | None] | None:
         """One run of `command` in a throwaway copy of the head with the probe written into it (and
-        the verifier's plugin loaded from `plugin`, given one, `verify.run_check`'s `plugin_dir`):
-        what `verify.run_check` returns, or None when the probe's path leads out of the copy."""
+        the verifier's plugin loaded from the copy `plugin`, given one: `verify.run_check`'s
+        `plugin_copy`): what `verify.run_check` returns, or None when the probe's path leads out of
+        the copy."""
         with self.ws.disposable(wt) as scratch:
             if probe:
                 target = scratch / probe[0]
@@ -2067,7 +2071,7 @@ class Engine:
             spec = CheckSpec(criterion="repro", command=command, cwd=cwd)
             return verify.run_check(scratch, spec, self.ws.head(wt), self.store.issue_dir(0) / "repro",
                                     self.caps.check_timeout_s, extra_env=self.check_env, mounts=self._mounts(scratch),
-                                    plugin_dir=plugin)
+                                    plugin_copy=plugin)
 
     @staticmethod
     def _replace_file(target: Path, text: str) -> None:
