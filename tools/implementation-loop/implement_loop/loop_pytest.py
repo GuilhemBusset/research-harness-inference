@@ -43,10 +43,11 @@ SEVERITY = {"passed": 0, "xfailed": 1, "skipped": 2, "xpassed": 3, "failed": 4, 
 _written = []   # records this process wrote, for the exit fallback
 
 
-def _write(record: dict) -> bool:
+def _write(record: dict, start=None) -> bool:
     try:
         os.makedirs(REPORT_DIR, exist_ok=True)
-        name = f"run-{os.getpid()}-{time.time_ns()}.json"
+        session = os.path.basename(start)[len("start-"):] if start else f"{os.getpid()}-{time.time_ns()}"
+        name = f"run-{session}.json"
         tmp = os.path.join(REPORT_DIR, f".{name}.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(record, f)
@@ -139,7 +140,9 @@ class Recorder:
         record = {"cwd": os.getcwd(), "rootdir": self.rootdir, "exitstatus": int(status),
                   "cases": [{"id": k, "outcome": v} for k, v in self.outcomes.items()],
                   "collected": self.collected}
-        if not _write(record):
+        if getattr(self.config, "_loop_recovered", False):
+            record["recovered"] = True
+        if not _write(record, getattr(self.config, "_loop_start", None)):
             session.exitstatus = 3   # no record means no evidence: fail rather than pass unaccounted
 
 

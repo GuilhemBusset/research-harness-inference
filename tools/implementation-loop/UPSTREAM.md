@@ -25,29 +25,30 @@ git diff --no-index <empty dir>/tools/implementation-loop tools/implementation-l
 
 The reason for each local change is in the pull request that made it.
 
-## The second run of a reproduction loads the plugin under a module name of its own (2026-11-27)
+## The reproduction retry loads the verifier's recorder by file (2026-11-27)
 
-A local patch, not in upstream, that changes how "A reproduction that cannot load the verifier's
-plugin runs again with it" below exposes the plugin. Its directory held the plugin as
-`implement_loop.loop_pytest`, under a stub `implement_loop` package that took the directory off
-`sys.path` in the pytest process alone: a process a test started inherited the PYTHONPATH entry,
-and its `import implement_loop` found the stub where the code under review has none. The directory
-now holds the plugin alone, as a top-level module, so it exposes no `implement_loop` package to
-anything. The module's name is drawn for each run: no module written before the run can take the
-recorder's place in one pytest of a command (the current directory of `python -m pytest` comes
-before every PYTHONPATH entry) while another pytest records. pytest loads a plugin by module name
-only, so a module written during the run under the name it reads from its environment still could;
-code that does so can as well write a record into the record directory its environment names. A
-pytest that could not load the run's recorder now fails the run even beside one that recorded, and
-each run names only its own recorder. The engine's version stays 1.2.22: nothing waits for this
-change.
+PR #843 follows #815. A literal PYTHONPATH replacement can make pytest lose the verifier's
+recorder. The engine retries only when the first run has no pytest records and the only observed
+failure is recorder startup. The retry needs a pytest record to decide the finding.
 
-| File | What changed |
-| --- | --- |
-| `implement_loop/verify.py` | `run_check` takes `plugin_copy`, a copy of the plugin alone in its directory as a top-level module whose name begins with `PLUGIN_COPY_PREFIX` (`implement_loop_result_plugin_`). Given one, pytest loads the plugin by that module's name, and the directory comes after the engine's on PYTHONPATH, so a pytest the command's assignment does not reach finds it too, and is bound read-only into the sandbox. Every run leaves out of the PYTEST_ADDOPTS it inherits the `-p` of another verifier's recorder (PLUGIN or a copy), which a verifier this run is nested in gives the engine's own tests (`without_plugin`, which reads the value as pytest does: split as a shell would, `-p` taking the next word, `-pNAME` joined; every other word is kept). `_notes` fails a run in which pytest could not load the run's recorder, whatever records other pytest processes left. Without a copy, the run loads `PLUGIN` as before. |
-| `implement_loop/engine.py` | `_plugin_only` writes the copy alone, named `PLUGIN_COPY_PREFIX` and 16 random hex digits, and returns its path; the stub package (`PLUGIN_PACKAGE`) is gone. `_run_reproduction` passes the copy to `run_check` as `plugin_copy`, which binds its directory. |
-| `tests/test_reproduction_pythonpath.py` | New tests: a process a test of the second run starts inherits its PYTHONPATH and finds no `implement_loop`, and that run's test is recorded; the directory holds the copy alone, byte for byte the plugin, under a name that differs between two runs; two pytest sessions of one command, the second with the verifier's PYTHONPATH, are both recorded, and a failing first one stops the run at `&&` and fails it; a project module of the fixed name an earlier version used, first on the second session's `sys.path`, does not displace the recorder, so that session's skip is recorded and fails the run; a later pytest that cannot load the copy fails the run though its failure was swallowed and the first pytest recorded a pass; a reproduction under another verifier's `-p` of the plugin, or of its copy, gets its own second run; a `--deselect` id that contains the plugin's `-p` text is kept; `without_plugin` removes only the options that load a verifier's recorder. |
-| `tests/test_verify_accounting.py` | New test: a check in which one pytest recorded a pass and another could not load the plugin, its failure swallowed, fails. The tests that start pytest with the plugin themselves leave out an inherited PYTEST_ADDOPTS, so the suite also passes under a verifier's second run. |
+For a direct pytest launcher (including `python -m pytest` or `uv run --locked pytest`),
+the engine inserts the verifier's Python startup hook at that launcher alone. The hook
+restores the interpreter's original PYTHONPATH and search path before loading the project's
+site customization. The shell retains the examiner's original path, including when it uses
+that value to select another command. Opaque launchers retain the first failure.
+
+After the required plugins load, the bootstrap checks whether the ordinary recorder
+was unavailable on that interpreter's original path. It loads `loop_pytest.py` from an
+absolute file link in a verifier-owned read-only directory and registers the module object.
+Its registration name never goes through project module or pytest entry-point lookup. Only
+a result from the repaired session can authorize the retry verdict.
+
+Each top-level pytest call gets a startup file whose identifier also names its result. A
+verifier-owned pytest argument file covers the case where replacing PYTHONPATH prevents the
+bootstrap itself from loading. The bootstrap removes the argument before pytest parses it.
+An interpreter missing the bootstrap opens the empty file during normal argument parsing. The verifier observes that open with Linux inotify, including when a wrapper captures
+both streams and returns success. Nested verifiers carry the exact outer recorder name for
+shell-aware cleanup of PYTEST_ADDOPTS.
 
 ## A reproduction that cannot load the verifier's plugin runs again with it (2026-11-26)
 

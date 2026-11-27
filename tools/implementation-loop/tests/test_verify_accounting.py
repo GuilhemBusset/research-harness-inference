@@ -154,10 +154,48 @@ class RunCheckTests(TempTree):
         """Its tests ran unaccounted, whatever the command made of its exit status."""
         self.write("tests/test_a.py", "def test_a():\n    pass\n")
         self.write("tests/test_b.py", "def test_b():\n    pass\n")
-        ev, cases = self.check(f"{PY} -m pytest -q tests/test_a.py && (PYTHONPATH=src {PY} -m pytest -q tests/test_b.py || true)")
+        ev, cases = self.check(f"{PY} -m pytest -q tests/test_a.py && (PYTHONPATH=src {PY} -m pytest -q tests/test_b.py >/dev/null 2>&1 || true)")
         self.assertEqual((ev.exit_code, cases["passed"], cases["processes"]), (0, ["tests/test_a.py::test_a"], 1))
         self.assertFalse(ev.passed)
         self.assertIn("pytest could not load the verifier's result plugin", ev.note)
+
+    def test_diagnostic_text_in_ordinary_output_is_only_output(self):
+        ev, cases = self.check("""echo 'Error importing plugin "implement_loop.loop_pytest"'""")
+        self.assertTrue(ev.passed, ev.note)
+        self.assertIsNone(cases)
+
+    def test_aborted_session_cannot_use_another_sessions_result(self):
+        self.write("test_ok.py", "def test_ok(): pass")
+        self.write("test_stop.py", "import os\ndef test_stop(): os._exit(0)")
+        ev, cases = self.check(f"{PY} -m pytest -q test_ok.py && {PY} -m pytest -q test_stop.py")
+        self.assertEqual((ev.exit_code, cases["processes"]), (0, 1))
+        self.assertFalse(ev.passed)
+        self.assertIn("without a corresponding result", ev.note)
+
+    def test_missing_required_plugin_with_the_recorder_prefix_fails(self):
+        from unittest.mock import patch
+
+        name = "implement_loop_result_plugin_audit"
+        for outer in ("", "implement_loop_result_plugin_outer"):
+            with self.subTest(outer=outer), patch.dict(os.environ, {
+                    "PYTEST_ADDOPTS": f"-p {name}" + (f" -p {outer}" if outer else ""),
+                    "LOOP_PYTEST_RECORDER": outer}):
+                self.write("test_ok.py", "def test_ok(): pass")
+                ev, _ = self.check(f"{PY} -m pytest -q test_ok.py")
+                self.assertFalse(ev.passed)
+                self.assertIn(name, ev.output_tail)
+
+    def test_same_interpreter_starts_two_independent_sessions(self):
+        self.write("test_ok.py", "def test_a(): pass\ndef test_b(): pass")
+        self.write("check.py", """
+            import pytest
+            assert pytest.main(["-q", "test_ok.py::test_a"]) == 0
+            assert pytest.main(["-q", "test_ok.py::test_b"]) == 0
+        """)
+        ev, cases = self.check(f"{PY} check.py")
+        self.assertTrue(ev.passed, ev.note)
+        self.assertEqual(cases["passed"], ["test_ok.py::test_a", "test_ok.py::test_b"])
+        self.assertEqual(cases["processes"], 2)
 
     def test_a_failure_in_the_first_of_two_runs_is_not_lost(self):
         self.write("tests/test_a.py", "def test_a():\n    assert False\n")
@@ -220,6 +258,7 @@ class RunCheckTests(TempTree):
         ev, cases = self.check(f"PYTHONPATH=src {PY} -m pytest -q tests/test_a.py")
         self.assertIsNone(cases)
         self.assertFalse(ev.passed)
+        self.assertEqual(ev.exit_code, 1)
         self.assertIn("extend it (PYTHONPATH=src:$PYTHONPATH)", ev.note)
 
     def test_a_pytest_run_by_a_test_is_not_the_checks_own(self):

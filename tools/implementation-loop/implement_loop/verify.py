@@ -16,16 +16,20 @@ judges, and it trusts nothing an implementer could have changed.
 from __future__ import annotations
 
 import ast
+import ctypes
 import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterable
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -156,17 +160,41 @@ def unconditional_failures(root: Path, files: list[str]) -> list[str]:
 
 PLUGIN = "implement_loop.loop_pytest"
 ENGINE_DIR = Path(__file__).resolve().parent.parent   # what PYTHONPATH needs for PLUGIN
-# How the name of a copy of the plugin begins: a top-level module alone in a directory of its own
-# (`run_check`'s `plugin_copy`), which the second run of a reproduction loads (`Engine._reproduction`).
-# That directory exposes no `implement_loop` package, to the command or to a process it starts, and
-# the rest of the name is drawn for each run, so no module written before the run can stand in for it.
-PLUGIN_COPY_PREFIX = "implement_loop_result_plugin_"
+RECORDER_UNAVAILABLE = ("pytest could not load the verifier's result plugin; if the command sets PYTHONPATH, "
+                        "extend it (PYTHONPATH=src:$PYTHONPATH) instead of replacing it")
+BOOTSTRAP = ENGINE_DIR / "sitecustomize.py"
 # outcome -> what it means for a check; a worse outcome of the same test wins (as in loop_pytest)
 OUTCOMES = {"passed": "passed", "xfailed": "skipped", "skipped": "skipped", "xpassed": "failed",
             "failed": "failed", "error": "failed"}
 SEVERITY = {"passed": 0, "xfailed": 1, "skipped": 2, "xpassed": 3, "failed": 4, "error": 5}
 # pytest exit statuses that mean it did not run the tests it was given (0 and 1 are results)
 BAD_EXIT = {2: "interrupted", 3: "internal error", 4: "usage error", 5: "no tests collected"}
+
+
+# pytest 8 reads @argument-files before it loads plugins. A process that lost
+# the bootstrap reads this empty file in argument parsing. Watch the file
+# in the verifier, so that even a wrapper consuming stdout/stderr and the exit
+# status cannot hide that startup. An open event is sufficient even if several
+# uninstrumented sessions fail concurrently.
+@contextmanager
+def _watch_startup_guard(path: Path):
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.inotify_init1(os.O_CLOEXEC | os.O_NONBLOCK)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "cannot observe pytest startup")
+    try:
+        if libc.inotify_add_watch(fd, os.fsencode(path), 0x20) < 0:  # IN_OPEN
+            raise OSError(ctypes.get_errno(), "cannot watch pytest argument file")
+
+        def opened() -> bool:
+            try:
+                return bool(os.read(fd, 4096))
+            except BlockingIOError:
+                return False
+
+        yield opened
+    finally:
+        os.close(fd)
 
 
 def _run(command: str, cwd: Path, timeout: int, env: dict[str, str],
@@ -212,6 +240,7 @@ def _read_records(report_dir: Path) -> dict | None:
     worst: dict[str, str] = {}
     collected: dict[str, None] = {}
     bad_exit: list[int | None] = []
+    recovered = False
     for path in records:
         try:
             data = json.loads(path.read_text())
@@ -221,6 +250,8 @@ def _read_records(report_dir: Path) -> dict | None:
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             bad_exit.append(None)   # unreadable: no evidence either way
             continue
+        if data.get("recovered") is True:
+            recovered = True
         if status not in (0, 1):
             bad_exit.append(status)
         for test_id, outcome in cases:
@@ -231,6 +262,8 @@ def _read_records(report_dir: Path) -> dict | None:
     for test_id, outcome in sorted(worst.items()):
         out[OUTCOMES[outcome]].append(test_id)
     out.update(collected=list(collected), processes=len(records), bad_exit=bad_exit)
+    if recovered:
+        out["recovered"] = True
     return out
 
 
@@ -246,16 +279,11 @@ def _pytest_said(output: str, status: int | None) -> str:
     return ""
 
 
-def _notes(cases: dict | None, output: str, plugin: str = PLUGIN) -> list[str]:
-    """Why the pytest runs of a command do not prove anything, in words. A pytest that could not
-    load the run's result plugin (`plugin`) ran unaccounted, whatever records the others left and
-    whatever the command made of its exit status."""
-    notes = []
-    if f'Error importing plugin "{plugin}"' in output:
-        notes.append("pytest could not load the verifier's result plugin; if the command sets PYTHONPATH, "
-                     "extend it (PYTHONPATH=src:$PYTHONPATH) instead of replacing it")
+def _notes(cases: dict | None, output: str) -> list[str]:
+    """Why the recorded pytest results fail the check."""
     if cases is None:
-        return notes
+        return []
+    notes = []
     if cases["failed"]:
         notes.append(f"failed tests: {cases['failed'][:5]}")
     if cases["skipped"]:
@@ -274,14 +302,8 @@ def _notes(cases: dict | None, output: str, plugin: str = PLUGIN) -> list[str]:
     return notes + stopped
 
 
-def _recorder(name: str) -> bool:
-    """Whether a plugin name is one a verifier loads its result plugin by: PLUGIN, or a copy."""
-    return name == PLUGIN or name.startswith(PLUGIN_COPY_PREFIX)
-
-
-def without_plugin(addopts: str) -> str:
-    """`addopts` (a PYTEST_ADDOPTS value) without the options that load a verifier's result plugin
-    (PLUGIN or a copy of it), read as pytest reads them: split as a shell would, `-p` taking the
+def without_plugin(addopts: str, recorder: str | None, guard: str | None = None) -> str:
+    """Remove the exact outer recorder from PYTEST_ADDOPTS, read as pytest reads it: split as a shell would, `-p` taking the
     next word, `-pNAME` joined, the name stripped. Every other word is kept as it was; a value with
     nothing to remove, or one pytest could not split either, is returned as written."""
     try:
@@ -295,9 +317,11 @@ def without_plugin(addopts: str) -> str:
             name = next(rest, None)
             if name is None:
                 kept.append(word)
-            elif not _recorder(name.strip()):
+            elif name.strip() != recorder:
                 kept += [word, name]
-        elif not (word.startswith("-p") and _recorder(word[2:].strip())):
+        elif guard and word == "@" + guard:
+            continue
+        elif not (word.startswith("-p") and word[2:].strip() == recorder):
             kept.append(word)
     return addopts if kept == words else shlex.join(kept)
 
@@ -314,7 +338,7 @@ def scrubbed_env(env: dict[str, str], work_dir: Path) -> dict[str, str]:
 
 def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, default_timeout: int = 900,
               extra_env: dict[str, str] | None = None, mounts: sandbox.Mounts | None = None,
-              plugin_copy: Path | None = None) -> tuple[Evidence, dict | None]:
+              retry_bootstrap: Path | None = None) -> tuple[Evidence, dict | None]:
     """Run one check command. Returns its evidence, and what its pytest processes reported:
     `{"passed", "failed", "skipped", "collected": [ids], "processes": n, "bad_exit": [status]}`
     (failed includes errors and xpasses, skipped includes xfails), or None when no pytest ran.
@@ -323,10 +347,8 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
     judgement and its git (default: `root`, read-write); the verifier's plugin, the record
     directory and the run's package caches are added here.
 
-    With `plugin_copy`, a copy of the plugin alone in its directory, as a top-level module whose
-    name begins with `PLUGIN_COPY_PREFIX`, pytest loads the plugin by that module's name instead,
-    and the directory comes after the engine's on PYTHONPATH and is added to what the command may
-    read.
+    On a retry the bootstrap registers the verifier-owned recorder file under a
+    session-specific name. The reproduced command can import its own packages.
 
     The command passes when it exits 0, no test failed, erred, xpassed, xfailed or was skipped,
     and, if pytest ran at all, at least one test ran and every pytest ended with a test result
@@ -344,16 +366,16 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
     report_dir.mkdir(parents=True)
     env = scrubbed_env(dict(os.environ) | dict(extra_env or {}), work_dir)
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")   # never write caches into the tree being judged
+    env.pop("LOOP_PYTEST_REPAIR", None)
     env.pop("LOOP_PYTEST_PID", None)   # a verification is never nested in an outer one's pytest
     env["LOOP_REPORT_DIR"] = str(report_dir)
     env["LOOP_REPO_ROOT"] = str(Path(root).resolve())
     # This run's recorder alone: a verifier run under another's pytest (the engine's own tests, run
     # as a check) inherits that verifier's `-p` of its own, which this command may not reach.
-    plugin = plugin_copy.stem if plugin_copy is not None else PLUGIN
-    env["PYTEST_ADDOPTS"] = (without_plugin(env.get("PYTEST_ADDOPTS", "")) + f" -p {plugin} -p no:cacheprovider").strip()
-    plugin_dirs = [ENGINE_DIR, *([plugin_copy.parent] if plugin_copy is not None else [])]
-    path = [str(d) for d in plugin_dirs] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
-    env["PYTHONPATH"] = os.pathsep.join(path)
+    plugin = PLUGIN if retry_bootstrap is None else f"implement_loop_result_plugin_{secrets.token_hex(8)}"
+    outer = env.get("LOOP_PYTEST_RECORDER")
+    addopts = without_plugin(env.get("PYTEST_ADDOPTS", ""), outer, env.get("LOOP_PYTEST_GUARD"))
+    env["LOOP_PYTEST_RECORDER"] = plugin
     cwd = root / spec.cwd
     timeout = spec.timeout_s or default_timeout
     start = time.monotonic()
@@ -369,14 +391,36 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
         code, output = None, f"check directory does not exist: {spec.cwd}"
         notes.append(output)
     else:
-        box = (mounts if mounts is not None else sandbox.Mounts(writable=(Path(root),))).plus(
-            readable=plugin_dirs, writable=[report_dir, *sandbox.cache_dirs(extra_env)])
-        code, output, timed_out = _run(spec.command, cwd, timeout, env, box)
+        with tempfile.TemporaryDirectory(dir=work_dir, prefix="pytest-start-") as tmp:
+            guard = Path(tmp).resolve() / "recorder.args"
+            # An empty argument file preserves pytest's own argument processing
+            # and exit status when the command replaced PYTHONPATH.
+            guard.touch()
+            env["LOOP_PYTEST_GUARD"] = str(guard)
+            options = [shlex.quote("@" + str(guard)), addopts]
+            if retry_bootstrap is None:
+                options.append(f"-p {PLUGIN}")
+            else:
+                (guard.parent / "recorder.py").symlink_to(Path(__file__).resolve().with_name("loop_pytest.py"))
+            options.append("-p no:cacheprovider")
+            env["PYTEST_ADDOPTS"] = " ".join(part for part in options if part)
+            plugin_dirs = [ENGINE_DIR] if retry_bootstrap is None else [ENGINE_DIR, retry_bootstrap]
+            path = [str(ENGINE_DIR)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+            env["PYTHONPATH"] = os.pathsep.join(path)
+            box = (mounts if mounts is not None else sandbox.Mounts(writable=(Path(root),))).plus(
+                readable=[*plugin_dirs, guard.parent], writable=[report_dir, *sandbox.cache_dirs(extra_env)])
+            with _watch_startup_guard(guard) as missed:
+                code, output, timed_out = _run(spec.command, cwd, timeout, env, box)
+                if missed():
+                    notes.append(RECORDER_UNAVAILABLE)
         if timed_out:
             notes.append(f"timed out after {timeout} s")
     duration = round(time.monotonic() - start, 2)
     cases = _read_records(report_dir)
-    notes += _notes(cases, output, plugin)
+    notes += _notes(cases, output)
+    if any(not start.with_name("run-" + start.name.removeprefix("start-") + ".json").is_file()
+           for start in report_dir.glob("start-*")):
+        notes.append("pytest started without a corresponding result")
     ev = Evidence(criterion=spec.criterion, kind="command", command=spec.command, cwd=spec.cwd, head_sha=head_sha,
                   exit_code=code, passed=code == 0 and not notes, duration_s=duration,
                   output_tail=output[-OUTPUT_TAIL:], output_sha256=hashlib.sha256(output.encode()).hexdigest(),

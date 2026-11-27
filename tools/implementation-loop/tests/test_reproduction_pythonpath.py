@@ -10,9 +10,7 @@ PYTHONPATH its first command assigns extended by a directory that holds the plug
 The engine runs are real (git, the verifier, real pytest, squash merges into a bare remote); the
 agents and GitHub are the fakes."""
 
-import os
 import shlex
-import subprocess
 import sys
 
 import pytest
@@ -23,7 +21,7 @@ from test_deploying import L  # the `implement_loop` beside these tests (`loop_b
 EPIC, ISSUE = 1, 2
 PY = sys.executable
 Phase = L.model.Phase
-extended = L.engine.extended_pythonpath
+instrumented = L.engine.recorder_command
 
 # What the builder writes on every build: a module the probe finds only through the probe's own
 # PYTHONPATH. The fake builder writes the file it names once a finding speaks of an edge case.
@@ -153,10 +151,9 @@ def test_a_bare_import_on_the_extended_run_finds_the_implement_loop_under_review
 
 
 # A probe whose test starts a Python process of its own, with the environment it was given: that
-# process inherits the extended PYTHONPATH (the probe's `lib` and the directory that holds the
-# plugin), and finds there no `implement_loop`, since the code under review has none.
+# process inherits the original PYTHONPATH and sees the code under review.
 CHILD = ("import os\nimport subprocess\nimport sys\n\n\ndef test_x():\n"
-         "    assert len(os.environ['PYTHONPATH'].split(os.pathsep)) == 2\n"
+         "    assert os.environ['PYTHONPATH'] == 'lib'\n"
          "    found = subprocess.run([sys.executable, '-c', 'import importlib.util; "
          "print(importlib.util.find_spec(\"implement_loop\"))'], capture_output=True, text=True, check=True)\n"
          "    assert found.stdout.strip() == 'None'\n")
@@ -167,25 +164,10 @@ def test_a_process_the_extended_run_starts_finds_no_implement_loop_and_its_tests
     """Codex's review of the fourth version: the directory added to PYTHONPATH held the plugin as
     `implement_loop.loop_pytest`, under a package of that name, and only the pytest process took it
     off `sys.path`. A process a test started inherited the entry and imported that package. The
-    directory now holds the plugin alone, as a top-level module of its own name
-    (`verify.PLUGIN_COPY_PREFIX`), and the run still records its tests through it."""
-    commit(wt, {"README.md": "code under review\n"})
-    ran = engine._reproduction(wt, REPLACES, ".", ("checks/probe_x.py", CHILD))
+    directory now holds the startup hook alone. The recorder is loaded by absolute path."""
+    commit(wt, {"lib/sitecustomize.py": "import os\nos.environ['PROJECT_SITE'] = 'loaded'\n"})
+    ran = engine._reproduction(wt, REPLACES, ".", ("checks/probe_x.py", CHILD + "    assert os.environ['PROJECT_SITE'] == 'loaded'\n"))
     assert (ran.passed, ran.tests) == (True, {"passed": 1, "failed": 0, "skipped": 0}), ran.output_tail
-
-
-def test_the_directory_added_to_pythonpath_holds_the_plugin_alone_under_a_name_new_on_every_run(tmp_path):
-    verify = L.engine.verify
-    one, two = tmp_path / "one", tmp_path / "two"
-    one.mkdir()
-    two.mkdir()
-    copy = L.engine.Engine._plugin_only(one)
-    assert [p.relative_to(one).as_posix() for p in one.rglob("*")] == [copy.name]
-    assert copy.suffix == ".py" and copy.stem.startswith(verify.PLUGIN_COPY_PREFIX)
-    assert copy.stem.isidentifier(), "a top-level module, under no package"
-    source = verify.ENGINE_DIR.joinpath(*verify.PLUGIN.split(".")).with_suffix(".py")
-    assert copy.read_bytes() == source.read_bytes()
-    assert L.engine.Engine._plugin_only(two).name != copy.name, "the project cannot know it"
 
 
 def second_run(engine, wt, command: str, probe: str, monkeypatch) -> tuple[bool | None, dict]:
@@ -214,8 +196,7 @@ REPLACES_A = f"env PYTHONPATH=lib {PY} -m pytest -q {A}"
 
 @pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
 def test_a_pytest_of_the_extended_run_that_keeps_the_verifiers_pythonpath_loads_the_plugin_too(engine, wt, monkeypatch):
-    """A second pytest in the command, which the assignment at its head does not reach, runs with
-    the verifier's PYTHONPATH: it finds the copy there, and both are recorded."""
+    """Both launchers record distinct nodes, including the one outside the assignment."""
     verdict, cases = second_run(engine, wt, f"{REPLACES_A} && {PY} -m pytest -q {B}", TWO, monkeypatch)
     assert verdict is False
     assert (sorted(cases["passed"]), cases["failed"], cases["processes"]) == ([A, B], [], 2)
@@ -230,15 +211,56 @@ def test_a_failing_first_pytest_of_the_extended_run_decides_it(engine, wt, monke
     assert (cases["passed"], cases["failed"], cases["collected"]) == ([], [A], [A])
 
 
+@pytest.mark.parametrize("outcome", ["fail", "skip"])
+def test_first_run_record_prevents_retry(engine, wt, outcome):
+    command = f"{REPLACES_A} || {PY} -m pytest -q {B}"
+    probe = TWO.replace("def test_b():\n    pass", f"def test_b():\n    import pytest\n    pytest.{outcome}('observed')")
+    ev = engine._reproduction(wt, command, ".", ("checks/probe_x.py", probe))
+    assert ev.command == command
+    assert not ev.passed
+    assert ev.tests["failed" if outcome == "fail" else "skipped"] == 1
+
+
+def test_hidden_recorder_failure_retries_only_with_a_record(engine, wt, monkeypatch):
+    command = f"{REPLACES} >/dev/null 2>&1 || true"
+    verdict, cases = second_run(engine, wt, command, FAILS, monkeypatch)
+    assert verdict is True
+    assert cases["failed"] == ["checks/probe_x.py::test_x"]
+
+
+def test_swallowed_unrelated_plugin_error_cannot_authorize_retry(engine, wt):
+    # The missing project plugin fails before pytest even requests the recorder.
+    # Only the extended path would take the branch with a passing session.
+    command = (f'PYTHONPATH=lib; if [ "$PYTHONPATH" = lib ]; then '
+               f'PYTEST_ADDOPTS="-p required_audit $PYTEST_ADDOPTS" {PY} -m pytest -q {A} >/dev/null 2>&1 || true; '
+               f'else {PY} -m pytest -q {A}; fi')
+    ev = engine._reproduction(wt, command, ".", ("checks/probe_x.py", TWO))
+    assert ev.command == command
+    assert not ev.passed
+
+
+def test_a_discoverable_recorder_that_failed_on_its_own_cannot_authorize_retry(engine, wt):
+    commit(wt, {"lib/implement_loop/__init__.py": "",
+                "lib/implement_loop/loop_pytest.py": "import missing_project_dependency\n"})
+    ev = engine._reproduction(wt, REPLACES, ".", ("checks/probe_x.py", PASSES))
+    assert (ev.command, ev.passed, ev.tests) == (REPLACES, False, None)
+
+
+def test_an_independent_first_run_exit_prevents_retry(engine, wt):
+    command = f"{REPLACES_A} || exit 17"
+    ev = engine._reproduction(wt, command, ".", ("checks/probe_x.py", TWO))
+    assert (ev.command, ev.exit_code, ev.tests) == (command, 17, None)
+
+
 @pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
 def test_a_project_module_named_like_the_copy_cannot_take_the_recorders_place(engine, wt, monkeypatch):
-    """Codex's review of the fifth version, which loaded the copy by a fixed name: a module of that
-    name earlier on a pytest's `sys.path` (here the current directory of `python -m pytest`) was
-    loaded instead, and that pytest recorded nothing. The first pytest's pass was then the run's
-    only record, and the second one's skip went unseen. The copy's name is drawn for each run, so
-    no module written before it has that name, and both are recorded."""
-    commit(wt, {"sub/implement_loop_result_plugin.py": "# not the recorder\n"})   # the fifth version's name
-    probe = TWO.replace("def test_b():\n    pass", "def test_b():\n    import pytest\n    pytest.skip('unseen')")
+    """The second interpreter starts in a directory holding the actual selected name."""
+    commit(wt, {"sub/.keep": "", "pytest.ini": "[pytest]\n"})
+    probe = ("import os\nfrom pathlib import Path\nimport pytest\n\n"
+             "def test_a():\n"
+             "    name = os.environ['LOOP_PYTEST_RECORDER']\n"
+             "    Path('sub', name + '.py').write_text('raise AssertionError')\n"
+             "def test_b():\n    pytest.skip('observed')\n")
     command = f"{REPLACES_A} && cd sub && {PY} -m pytest -q ../{B}"
     verdict, cases = second_run(engine, wt, command, probe, monkeypatch)
     assert verdict is True, "a skip fails the run"
@@ -251,8 +273,10 @@ def test_an_extended_run_under_another_verifiers_pytest_loads_the_copy_alone(eng
     by its package name, which a command that replaces PYTHONPATH cannot reach: the extended run
     leaves it out and loads the copy. Codex's review of the fifth version: only that option goes,
     not the same text inside another argument (a test id given to `--deselect`)."""
+    commit(wt, {"pytest.ini": "[pytest]\n"})
     plugin = L.engine.verify.PLUGIN
     deselected = f"checks/probe_x.py::test_x[a -p {plugin} b]"
+    monkeypatch.setenv("LOOP_PYTEST_RECORDER", plugin)
     monkeypatch.setenv("PYTEST_ADDOPTS", shlex.join(["-p", plugin, "-p", "no:cacheprovider", "--deselect", deselected]))
     probe = (f"import pytest\n\n\n@pytest.mark.parametrize('x', ['a -p {plugin} b'])\n"
              "def test_x(x):\n    assert 1 == 2\n\n\ndef test_y():\n    pass\n")
@@ -263,12 +287,9 @@ def test_an_extended_run_under_another_verifiers_pytest_loads_the_copy_alone(eng
 
 @pytest.mark.skipif(not HAS_PYTEST, reason="pytest is needed for the verifier's accounting")
 def test_a_later_pytest_of_the_extended_run_that_cannot_load_the_copy_fails_it(engine, wt, monkeypatch):
-    """Codex's review of the sixth version: a later pytest whose path holds the code under
-    review's packaged recorder but not the copy could not load the plugin, its wrapper swallowed
-    that, and the first pytest's pass was the run's only record. A plugin that could not load was
-    heeded only when no pytest left a record; it now fails the run beside one that did."""
+    """A later uninstrumented pytest cannot use the first session's record."""
     commit(wt, {"src/implement_loop/__init__.py": "", "src/implement_loop/loop_pytest.py": "# the code's own copy\n"})
-    command = f"{REPLACES_A} && (env PYTHONPATH=src {PY} -m pytest -q {B} || true)"
+    command = f"{REPLACES_A} && (env PYTHONPATH=src {PY} -m pytest -q {B} >/dev/null 2>&1 || true)"
     verdict, cases = second_run(engine, wt, command, TWO, monkeypatch)
     assert verdict is True
     assert (cases["passed"], cases["processes"]) == ([A], 1)
@@ -280,7 +301,8 @@ def test_a_reproduction_under_another_verifiers_second_run_gets_a_second_run_of_
     second run, inherited that run's `-p` of its copy. A command that replaced PYTHONPATH then
     failed on that name first, the note that pytest could not load this verifier's plugin never
     came, and the reproduction ran only once. Every run now names only its own recorder."""
-    outer = f"{L.engine.verify.PLUGIN_COPY_PREFIX}0123456789abcdef"
+    outer = "implement_loop_result_plugin_0123456789abcdef"
+    monkeypatch.setenv("LOOP_PYTEST_RECORDER", outer)
     monkeypatch.setenv("PYTEST_ADDOPTS", f"-p {outer} -p no:cacheprovider")
     verdict, cases = second_run(engine, wt, REPLACES, PASSES, monkeypatch)
     assert (verdict, cases["passed"]) == (False, ["checks/probe_x.py::test_x"])
@@ -299,19 +321,20 @@ def test_a_reproduction_under_another_verifiers_second_run_gets_a_second_run_of_
     ("-p -p implement_loop.loop_pytest", ["-p", "-p", "implement_loop.loop_pytest"]),   # `-p` takes the next word
 ])
 def test_only_the_options_that_load_a_recorder_of_the_verifiers_are_left_out(addopts, kept):
-    assert shlex.split(L.engine.verify.without_plugin(addopts)) == kept
+    outer = "implement_loop_result_plugin_0123456789abcdef" if "0123456789abcdef" in addopts else L.engine.verify.PLUGIN
+    assert shlex.split(L.engine.verify.without_plugin(addopts, outer)) == kept
 
 
 @pytest.mark.parametrize("addopts", ["", "-x -q", "--deselect 'a b'", "-k 'unbalanced"])
 def test_options_that_load_no_such_plugin_are_left_as_written(addopts):
-    assert L.engine.verify.without_plugin(addopts) == addopts
+    assert L.engine.verify.without_plugin(addopts, None) == addopts
 
 
 def test_an_extended_run_that_left_no_pytest_record_proves_nothing(engine, wt):
     """Codex's review of the second version: its second run closed a finding on exit 0 alone. As
     written, this command runs pytest, which cannot load the plugin; extended, it runs none."""
     command = f"PYTHONPATH=lib; case $PYTHONPATH in *:*) ;; *) {PY} -m pytest -q checks/probe_x.py;; esac"
-    assert extended(command, "/plugin") != command
+    assert instrumented(command, "/plugin") == command
     assert reproduces(engine, wt, command, PASSES) is True
 
 
@@ -328,36 +351,22 @@ def test_a_command_that_fails_on_its_own_is_judged_as_written(engine, wt):
 def test_a_value_that_is_not_literal_is_run_as_written_only(engine, wt):
     """The first version split `PYTHONPATH=lib:<(true)` before the process substitution."""
     command = f"PYTHONPATH=lib:<(true) {PY} -m pytest -q checks/probe_x.py"
-    assert extended(command, "/plugin") == command
+    assert instrumented(command, "/plugin") == command
     assert reproduces(engine, wt, command, PASSES) is True, "it still cannot load the plugin: the examiner's to fix"
 
 
-def run(command: str, directory: str) -> str:
-    """What `command`, extended by `directory`, prints, run by bash as the verifier's own run is
-    (`verify._run`), where the verifier's PYTHONPATH is `/verifier`."""
-    env = {"PATH": os.environ["PATH"], "PYTHONPATH": "/verifier"}
-    return subprocess.run(["bash", "-c", extended(command, directory)], env=env, capture_output=True, text=True,
-                          check=True).stdout.strip()
-
-
-@pytest.mark.parametrize(("command", "printed"), [
-    ("env PYTHONPATH=tools:tools/evaluate/tests printenv PYTHONPATH", "tools:tools/evaluate/tests:/plugin"),
-    ("PYTHONPATH=src printenv PYTHONPATH", "src:/plugin"),
-    ("env -u VIRTUAL_ENV PYTHONPATH=client printenv PYTHONPATH", "client:/plugin"),
-    ("CI=true PYTHONPATH=src printenv PYTHONPATH", "src:/plugin"),
-    ("PYTHONPATH=src; printenv PYTHONPATH", "src:/plugin"),
-    ("PYTHONPATH=src&&printenv PYTHONPATH", "src:/plugin"),
-    ("export PYTHONPATH=src && printenv PYTHONPATH", "src:/plugin"),
-    # an empty value adds no empty entry, which is the current directory
-    ("PYTHONPATH= printenv PYTHONPATH", "/plugin"),
+@pytest.mark.parametrize("head", [
+    "PYTHONPATH=lib", "env PYTHONPATH=lib", "env -u VIRTUAL_ENV PYTHONPATH=lib",
+    "CI=true PYTHONPATH=lib", "export PYTHONPATH=lib &&", "PYTHONPATH=lib;",
 ])
-def test_a_literal_pythonpath_the_first_command_assigns_is_extended_by_the_directory(command, printed):
-    assert extended(command, "/plugin") != command
-    assert run(command, "/plugin") == printed
-
-
-def test_the_directory_is_quoted_for_the_shell():
-    assert run("env PYTHONPATH=src printenv PYTHONPATH", "/a b/$HOME") == "src:/a b/$HOME"
+@pytest.mark.parametrize("launcher", ["pytest", "python -m pytest", "uv run --locked pytest"])
+def test_only_the_pytest_launcher_gets_the_bootstrap(head, launcher):
+    command = f"{head} {launcher} -q first && pytest -q second"
+    wrapped = instrumented(command, "/dir with spaces")
+    assert wrapped.startswith(head + " ")
+    assert wrapped.endswith(" -q first && pytest -q second")
+    assert wrapped.count("LOOP_PYTEST_REPAIR=1") == 1
+    assert "PYTHONPATH='/dir with spaces:lib'" in wrapped
 
 
 @pytest.mark.parametrize("command", [
@@ -387,4 +396,4 @@ def test_the_directory_is_quoted_for_the_shell():
     "grep -r PYTHONPATH=src scripts",
 ])
 def test_any_other_command_is_left_as_written(command):
-    assert extended(command, "/plugin") == command
+    assert instrumented(command, "/plugin") == command
