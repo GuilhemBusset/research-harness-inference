@@ -1,12 +1,18 @@
-"""Which commits a self-update of the pipeline left without an execution, and which execution
+"""Which commits the pipeline left without an execution that deploys them, and which execution
 covers each (system design, section 8.4; evidence E20).
 
-The pipeline runs queued, one execution per commit, and updates itself first. An update of the
-pipeline cancels the executions still queued, and CodePipeline restarts on the latest commit of
-`main`: the commits of the cancelled executions are never deployed on their own, and their
-stages send no event. This module is the pure part of what the reporter does about it: functions
-from the pipeline's executions, as `ListPipelineExecutions` gives them, to commit statuses. It
-calls nothing.
+The pipeline runs its executions in superseded mode, and updates itself first. An execution ends
+without deploying its commit in two ways:
+
+- a newer one overtakes it between stages: an execution that has finished a stage and waits in
+  front of the next one, while another execution holds that stage, ends `Superseded` when a newer
+  execution reaches the same point. Newer merges gather in front of the stage `Rhi` while an
+  execution waits in its hold, and each supersedes the one that waited before it;
+- the pipeline updates itself: the update cancels the active execution and every pending one.
+
+Either way the commit is never deployed on its own, and its later stages send no event. This
+module is the pure part of what the reporter does about it: functions from the pipeline's
+executions, as `ListPipelineExecutions` gives them, to commit statuses. It calls nothing.
 
 **The decision.** An execution that ended `Cancelled` or `Superseded` (`SUPERSEDED_STATUSES`)
 did not deploy its commit. Its commit is covered by the earliest execution that started after it,
@@ -47,7 +53,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
 
 # The statuses CodePipeline gives an execution that ended without deploying its commit: cancelled
-# by an update of the pipeline in queued mode, or replaced by a later one.
+# by an update of the pipeline, or superseded, by that update or by a newer execution that
+# overtook it while it waited between stages.
 SUPERSEDED_STATUSES = frozenset({"Cancelled", "Superseded"})
 # The statuses of an execution that has ended with a verdict, in its API's spelling, each as the
 # state a stage's own event would give it.

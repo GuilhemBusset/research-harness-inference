@@ -1,5 +1,5 @@
-"""The pipeline stack: CDK Pipelines on CodePipeline V2, in queued execution, from `main` (system
-design, section 8.2).
+"""The pipeline stack: CDK Pipelines on CodePipeline V2, in superseded execution, from `main`
+(system design, section 8.2).
 
 The only thing that deploys the endpoint is this pipeline (requirement R6). It has seven steps:
 
@@ -62,6 +62,15 @@ starts. No CodeBuild project has a webhook: on a public repository
 it would run a stranger's code with a role of the account (section 8.3). Every role of this stack
 carries the permissions boundary of the bounded bootstrap, by its fixed name, as every role of the
 stage does.
+
+The pipeline runs its executions in superseded mode (evidence E20). A stage holds one execution at a
+time, and an execution that waits in front of a stage, most often in front of the stage while
+another one sits in its hold, is overtaken by a newer one that reaches the same point: the waiting
+one ends `Superseded` and the newer one deploys a commit that holds it. The reporter gives the
+overtaken commit the verdict of that execution (section 8.4). In queued mode every execution
+waited its turn, so a change to the configuration in SSM could deploy only after every merge
+queued before it, and an execution stopped by hand to let it through left its commit pending for
+good: `Stopped` is a verdict, which no later execution covers.
 
 The stack is environment-agnostic, like the stage: the account and the region come from the
 credentials that deploy it (section 10).
@@ -172,8 +181,11 @@ class PipelineStack(cdk.Stack):
             self,
             "CodePipeline",
             pipeline_type=codepipeline.PipelineType.V2,
-            # Each commit has its own execution (evidence E20).
-            execution_mode=codepipeline.ExecutionMode.QUEUED,
+            # Superseded (evidence E20): a newer merge overtakes an execution that waits between
+            # stages, so nothing has to be stopped by hand to let the newest commit, or a change
+            # to the configuration in SSM, deploy. The overtaken commit takes the verdict of the
+            # execution that overtook it, which deploys a commit that holds it.
+            execution_mode=codepipeline.ExecutionMode.SUPERSEDED,
         )
         self.pipeline = pipelines.CodePipeline(self, "Pipeline", code_pipeline=underlying, synth=synth)
         # After every deployment action of the stage: the smoke tests, against what was deployed. The

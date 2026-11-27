@@ -152,9 +152,14 @@ repository's requirements:
    only when they report success; a failure takes the existing broken-`main` path (one
    fix-forward with the failure summary, then a revert pull request); no verdict within the
    timeout makes the issue `waiting`, which the supervisor resumes. The landing claim is held
-   through the wait, so one merge maps to one deployment and one verdict; the pipeline therefore
-   runs its executions queued, not superseded. The contexts list is empty until the pipeline
-   exists, and then nothing waits.
+   through the wait. The pipeline runs in superseded mode: a newer merge can overtake an
+   execution that waits between stages, which then ends `Superseded`, and the reporter gives the
+   overtaken merge commit the verdict of the execution that covers it, which deploys a later head
+   of `main` that holds it. One deployment's verdict can therefore answer for several merges, and
+   the discharge accepts a success on a later head of `main` that holds the merge commit. Superseded
+   mode replaced queued mode, in which an execution stopped by hand to let a newer one through
+   left its commit pending for good (system design, section 8.2). The contexts list is empty
+   until the pipeline exists, and then nothing waits.
 
 6. **Work only a real AWS account can prove is an obligation, never a pass.** `loop.toml [host]
    lacks` names what the host cannot provide: `aws:account`, `aws:deployed-environment`,

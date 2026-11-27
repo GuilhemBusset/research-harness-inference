@@ -114,9 +114,13 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      left a stack half way (step 3). "The pipeline reported a state the reporter does not know.":
      read the execution's actions in the console. None of these has a report on GitHub; the
      owner's e-mail of step 2 has the details;
-   - "Superseded: this commit is covered by the execution of commit" and a SHA: a self-update of
-     the pipeline cancelled this commit's run. The named commit's execution deploys this one too:
-     read that commit's statuses instead.
+   - "Superseded: this commit is covered by the execution of commit" and a SHA: this commit's
+     execution did not deploy it. Either a newer merge's execution overtook it while it waited
+     between stages (most often in front of the stage `Rhi`, while another execution sat in the
+     deployment hold during a session), and it ended `Superseded`; or a self-update of the
+     pipeline cancelled it. The named commit's execution deploys this one too: read that commit's
+     statuses instead. A failure there names a batch of commits, its own and those it covers:
+     any of them can be the cause.
 
 2. **The failure report.** A failure comes with more statuses on the same commit, one per fact, in
    the failure state. Their contexts start with the failed status's own context:
@@ -291,6 +295,12 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
      ```sh
      setup/owner-setup.sh --step configuration --config "$HOME/.config/rhi/config.toml"
      ```
+
+     The pipeline runs in superseded mode: a newer merge can supersede an execution waiting
+     between stages, the one you started with **Release change** included, which then ends
+     `Superseded` in the execution history. The newer execution synthesizes from SSM again, so it
+     deploys its own commit and the configuration SSM holds, your revert included: follow that
+     execution, the newer row of the history, from then on.
 
    - **a GPU pool's machine image**, the parameter `/rhi/images/<pool>` that image promotion
      writes and the launch template resolves at deployment. A git revert leaves it too. Put the
