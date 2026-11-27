@@ -16,6 +16,19 @@ pytest's import path in `PYTHONPATH`:
   letter case, and fails with the file and line of each hit, never with the value. It refuses to
   run when that file lies inside the tree it searches.
 
+The script of the step that fills the private mirror of the images the builds pull
+(`src/rhi/pipeline/mirror.py`), which runs in the stage Build before the synth step:
+
+- `mirror_images.py` lists the images of the FROM lines of the Dockerfiles under `services/`, but
+  `scratch` and a stage of the same file, and the emulator and BuildKit images that
+  `src/rhi/pipeline/stack.py` pins, each of Docker Hub and pinned by its sha256 digest; one named
+  without its digest fails the step before anything is copied. For each, it asks ECR whether the
+  repository `rhi-mirror/<path on Docker Hub>` holds the digest, and when it does not, copies the
+  image from Docker Hub, read anonymously, with crane at the path `RHI_MIRROR_CRANE` names: its
+  index and every manifest that index lists. A digest already there reads nothing from Docker Hub,
+  and an image whose repository does not exist yet is left for a later execution. A copy that
+  fails does not stop the others: the step exits 1 once every image was tried.
+
 The scripts of the verification step (`src/rhi/pipeline/verify.py`), which runs after the stage's
 deployment, with the folders of pytest's import path in `PYTHONPATH` for the booking:
 

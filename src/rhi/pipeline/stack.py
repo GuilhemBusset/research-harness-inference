@@ -1,10 +1,13 @@
 """The pipeline stack: CDK Pipelines on CodePipeline V2, in superseded execution, from `main`
 (system design, section 8.2).
 
-The only thing that deploys the endpoint is this pipeline (requirement R6). It has seven steps:
+The only thing that deploys the endpoint is this pipeline (requirement R6). It has eight steps:
 
 - its source is this repository, on `main`, through a CodeConnections connection the stack
   creates. The connection starts pending until the owner authorizes it once (section 8.6).
+- the mirror of `rhi.pipeline.mirror`, in the stage Build before the synthesis: it copies each image
+  the builds pull, by its pinned digest, into the account's private mirror when the mirror lacks
+  it, the only read of Docker Hub the pipeline makes for a pin. Its repositories are this stack's.
 - the synth step of `rhi.pipeline.synth`: it reads the configuration from SSM into a file outside
   the source tree, checks that no private value of it is in the tree, synthesizes from that file
   and runs the tests.
@@ -93,6 +96,7 @@ from rhi.pipeline.canary import GpuCanary
 from rhi.pipeline.events import PipelineEvents
 from rhi.pipeline.hold import hold_step
 from rhi.pipeline.image_promotion import ImagePromotion
+from rhi.pipeline.mirror import MirrorRepositories, mirror_step
 from rhi.pipeline.notify import OwnerTopic
 from rhi.pipeline.reporter import Reporter
 from rhi.pipeline.spikes import JOBS, SpikeJobs
@@ -177,6 +181,10 @@ class PipelineStack(cdk.Stack):
             action_name=SOURCE_ACTION,
         )
         synth = synth_step(self, source)
+        # Before the synthesis, in the stage Build, so before the Assets stage that pulls the images:
+        # the copy of each pinned image the mirror lacks. Until the Assets stage reads it, nothing does.
+        self.mirror = MirrorRepositories(self, "Mirror")
+        synth.add_step_dependency(mirror_step(self, source))
         underlying = codepipeline.Pipeline(
             self,
             "CodePipeline",

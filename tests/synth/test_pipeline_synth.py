@@ -34,7 +34,8 @@ def synth_project(templates: dict[str, dict[str, Any]]) -> dict[str, Any]:
     resources = templates[PIPELINE_TEMPLATE]["Resources"]
     (pipeline,) = [r["Properties"] for r in resources.values() if r["Type"] == "AWS::CodePipeline::Pipeline"]
     (build,) = [stage for stage in pipeline["Stages"] if stage["Name"] == "Build"]
-    (synth,) = build["Actions"]
+    # The stage Build holds the mirror's step too, before the synthesis.
+    (synth,) = [action for action in build["Actions"] if action["Name"] == "Synth"]
     return resources[synth["Configuration"]["ProjectName"]["Ref"]]["Properties"]
 
 
