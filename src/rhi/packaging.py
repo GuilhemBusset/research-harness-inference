@@ -12,7 +12,9 @@ A service imports `rhi_common`, its own package and the libraries of its depende
   Dockerfile and the group's requirements file with hashes, which the Dockerfile installs.
 
 `bundle` is the layout of a function's bundle, in any directory: the release's files carry the
-lifecycle agent in it (`rhi.pools.release`).
+lifecycle agent in it, and the engine contract suite (`rhi.pools.release`). The suite is no
+service: its group, `contract`, is bundled with `rhi_common` and the packages its two modules
+import (`SUITES`), and it has neither a function nor an image.
 
 None holds anything else of the repository. A function that needs a list kept elsewhere in it
 gets it at synthesis, as an environment variable its construct sets.
@@ -59,6 +61,11 @@ SERVICES = {
     "issuer": "services/issuer/rhi_issuer",
     "lifecycle": "services/engine/lifecycle/rhi_lifecycle",
 }
+# Each group that is bundled but is no service, and the packages it carries beside `rhi_common`:
+# the contract suite of tests/contract imports `rhi_gateway.sse` and the mock engine.
+SUITES = {
+    "contract": ("services/gateway/rhi_gateway", "services/engine/mock/rhi_mock_engine"),
+}
 # Python's bytecode cache, which a run of the tests leaves in a package: never part of what is deployed.
 _CACHE = "__pycache__"
 
@@ -69,7 +76,7 @@ def requirements(service: str, *, repo: Path = REPO) -> str:
     It holds what the group needs and nothing about the rest of the lock, so a change to another
     group leaves it as it was. uv reads the lock and nothing else: no network.
     """
-    _package(service, repo)
+    _packages(service, repo)
     exported = subprocess.run(
         ["uv", "export", "--quiet", "--project", str(repo), "--locked", "--only-group", service]
         + ["--format", "requirements-txt", "--no-header", "--no-annotate"],
@@ -161,7 +168,8 @@ def image_context(service: str, dockerfile: Path, *, repo: Path = REPO) -> str:
 
 def bundle(service: str, platform: str, into: Path, *, repo: Path = REPO, locked: str | None = None) -> None:
     """Fill `into` with a function's bundle: `rhi_common`, the service's package and the libraries
-    of the service's group, installed for the Lambda runtime's Python on `platform`.
+    of the service's group, installed for the Lambda runtime's Python on `platform`. A suite of
+    `SUITES` is bundled the same way, with its packages.
 
     `locked` is the group's requirements file when the caller already holds it.
     """
@@ -184,9 +192,20 @@ def _package(service: str, repo: Path) -> Path:
     return repo / SERVICES[service]
 
 
+def _packages(group: str, repo: Path) -> list[Path]:
+    """The folders of the packages a service's group or a suite's carries beside `rhi_common`."""
+    if group in SUITES:
+        return [repo / package for package in SUITES[group]]
+    if group not in SERVICES:
+        message = f"no service or suite named {group!r}: expected one of {sorted([*SERVICES, *SUITES])}"
+        raise ValueError(message)
+    return [repo / SERVICES[group]]
+
+
 def copy_packages(service: str, repo: Path, into: Path) -> None:
-    """Copy `rhi_common` and the service's package to the root of a bundle or of a build context."""
-    for package in (repo / COMMON, _package(service, repo)):
+    """Copy `rhi_common` and the service's package, or a suite's packages, to the root of a bundle
+    or of a build context."""
+    for package in (repo / COMMON, *_packages(service, repo)):
         shutil.copytree(package, into / package.name, ignore=shutil.ignore_patterns(_CACHE))
 
 

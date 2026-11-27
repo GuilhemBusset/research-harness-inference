@@ -60,6 +60,8 @@ include = [
     "services/engine/mock",
     # The vLLM image's copy program for the fallback loader: one file, in a folder that is no root.
     "services/engine/vllm/fetch_model.py",
+    # The contract check's pytest plugin, which the release carries beside the suite: the same.
+    "services/engine/contract/rhi_contract_outcomes.py",
     "client",
     "admin",
     "dashboards",

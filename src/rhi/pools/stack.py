@@ -1,6 +1,7 @@
 """The pools stack: the pools' state and heartbeats, the model bucket, the internal load balancer,
-the groups, the scaler that sizes them, the releases their instances run and the lifecycle hooks
-their instances complete (system design, sections 2, 4.2, 4.3, 4.4 and 5).
+the groups, the scaler that sizes them, the releases their instances run, the lifecycle hooks
+their instances complete and the document that runs the engine contract suite on an instance
+(system design, sections 2, 4.1, 4.2, 4.3, 4.4 and 5).
 
 The stack may reference other stacks of the stage (the network, the workspace); none of them may
 reference it back. The stack and the logical IDs of its tables and of its bucket are recorded in
@@ -16,8 +17,8 @@ The stack declares two outputs, which the pipeline's verification takes as input
   verification reads there the last lifecycle stage each instance reached.
 
 **Parked** (the configuration's `parked`, sections 5.6 and 11.2), the stack holds no internal load
-balancer, no group or lifecycle hook, no release and no scaler or its schedule: nothing
-runs. The tables, the model bucket, each pool's instance role with its log group, each pool's
+balancer, no group or lifecycle hook, no release, no scaler or its schedule and no contract
+check's document: nothing runs. The tables, the model bucket, each pool's instance role with its log group, each pool's
 secret and the scaler's log group, whose name is fixed (`rhi.pools.scaler.log_group`), stay, and
 `ReleaseParameters` reads `NO_POOL`. The stack still deploys after the network stack and the
 observability stack, whose exports it imports: the model bucket's policy names the S3 endpoint, and
@@ -44,6 +45,7 @@ from constructs import Construct
 
 from rhi.network.vpc import PRIVATE, ZONES, private_subnets
 from rhi.pools import image
+from rhi.pools.contract_check import ContractCheck
 from rhi.pools.group import PoolGroup, release_parameter
 from rhi.pools.hooks import PoolHooks
 from rhi.pools.model_store import ModelStore
@@ -103,7 +105,8 @@ class PoolsStack(cdk.Stack):
     `scaler`, whose `scaler.function` another construct of the stage may allow its role to invoke,
     each pool's release, from `releases[name]`: its engine image and its release parameter, which
     the next session's instances read at their start, each pool's lifecycle hooks, from
-    `hooks[name]` (`hooks[name].launch`, `hooks[name].termination`), and the name of each pool's
+    `hooks[name]` (`hooks[name].launch`, `hooks[name].termination`), the document that runs the
+    engine contract suite on an instance, from `contract_check` (`None` parked), and the name of each pool's
     release parameter, from `release_parameters[name]` and, all of them, as the output
     `release_parameters_output`. The heartbeat table's name is the output `heartbeats_table_output`."""
 
@@ -163,6 +166,7 @@ class PoolsStack(cdk.Stack):
         self.scaler: Scaler | None = None
         self.releases: dict[str, PoolRelease] = {}
         self.hooks: dict[str, PoolHooks] = {}
+        self.contract_check: ContractCheck | None = None
         if config.parked:
             # The scaler's log group alone, at the scaler's path.
             log_group(Construct(self, "Scaler"))
@@ -252,6 +256,8 @@ class PoolsStack(cdk.Stack):
             pool.name: PoolHooks(self, f"Hooks-{pool.name}", pool=pool, group=self.groups[pool.name].group)
             for pool in config.pools
         }
+        # The one document that runs the release's contract check on an instance, whatever its pool.
+        self.contract_check = ContractCheck(self, "ContractCheck")
 
     def _keep_gateway_exports(self) -> None:
         """Keeps the four exports of this stack that the gateway stack imported while its role invoked

@@ -60,8 +60,11 @@ REFRESH = "Custom::RhiInstanceRefresh"
 UNITS = {"rhi-collector.service", "rhi-engine.service", "rhi-lifecycle.service"}
 # The units of a GPU instance only, in a folder of their own, which the boot program installs on no other.
 GPU_UNITS = {"gpu/rhi-engine.service.d/gpu.conf", "gpu/rhi-dcgm.service", "gpu/rhi-collector.service.d/dcgm.conf"}
-# What the sources of a release are, for a copy of them: the lock, the services and their images.
-SOURCES = ("pyproject.toml", "uv.lock", "services/common", "services/engine")
+# What the sources of a release are, for a copy of them: the lock, the services and their images,
+# and the contract suite with the gateway's package it imports.
+SOURCES = ("pyproject.toml", "uv.lock", "services/common", "services/engine", "services/gateway", "tests/contract")
+# The contract suite's packages, which the archive's contract/ holds at its root.
+CONTRACT_PACKAGES = ("services/common/rhi_common", "services/gateway/rhi_gateway", "services/engine/mock/rhi_mock_engine")
 
 REGION = "eu-west-3"
 PSEUDO = {
@@ -361,13 +364,38 @@ def test_the_archive_holds_the_units_the_collector_configuration_and_the_agent(m
         sources = {p.relative_to(package.parent).as_posix() for p in package.rglob("*.py")}
         assert sources and {f"agent/{source}" for source in sources} <= files
     assert "agent/rhi_lifecycle/__main__.py" in files
-    assert {name.split("/")[0] for name in found} == {"units", "collector", "dcgm", "agent"}
+    assert {name.split("/")[0] for name in found} == {"units", "collector", "dcgm", "agent", "contract"}
     assert not [name for name in found if "__pycache__" in name]
     # A file of the archive is the repository's, byte for byte.
     with tarfile.open(mock.archive) as tar:
         unit = tar.extractfile("units/rhi-lifecycle.service")
         assert unit is not None
         assert unit.read() == (REPO / "services/engine/units/rhi-lifecycle.service").read_bytes()
+
+
+def test_the_archive_holds_the_contract_suite_its_packages_and_its_script(mock: Release) -> None:
+    files = {name for name, member in members(mock.archive).items() if member.isfile()}
+    # The suite's folder as the repository has it, under the same path, so that the script names
+    # its tests as the repository does.
+    suite = {
+        p.relative_to(REPO).as_posix()
+        for p in (REPO / "tests/contract").rglob("*")
+        if p.is_file() and "__pycache__" not in p.parts
+    }
+    assert {"tests/contract/conftest.py", "tests/contract/test_engine_contract.py"} <= suite
+    assert {name for name in files if name.startswith("contract/tests/")} == {f"contract/{name}" for name in suite}
+    # The three packages its modules import, at the root, where Python finds them.
+    for package in CONTRACT_PACKAGES:
+        sources = {p.relative_to((REPO / package).parent).as_posix() for p in (REPO / package).rglob("*.py")}
+        assert sources and {f"contract/{source}" for source in sources} <= files
+    # The files that run it, byte for byte.
+    script_files = sorted(p for p in (REPO / "services/engine/contract").iterdir() if p.is_file())
+    assert {"run.sh", "rhi_contract_outcomes.py"} <= {p.name for p in script_files}
+    with tarfile.open(mock.archive) as tar:
+        for path in script_files:
+            held = tar.extractfile(f"contract/{path.name}")
+            assert held is not None
+            assert held.read() == path.read_bytes()
 
 
 def test_the_archive_is_reproducible(app_module: ModuleType, mock: Release, tmp_path: Path) -> None:
@@ -395,7 +423,8 @@ def test_a_bundled_stack_carries_the_agents_libraries(
     app_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Where CDK bundles the stack, the libraries of the lifecycle group are installed beside the
-    agent, as for a function's bundle. The step that installs them is replaced by a stand-in."""
+    agent, and those of the contract group beside the suite, as for a function's bundle. The step
+    that installs them is replaced by a stand-in."""
     from rhi import packaging
 
     asked = []
@@ -411,14 +440,17 @@ def test_a_bundled_stack_carries_the_agents_libraries(
 
     monkeypatch.setattr(packaging, "install", install)
     bundled = standalone(app_module, tmp_path, bundled=True)
-    ((command, requirements),) = asked
-    assert command[command.index("--python-version") + 1] == packaging.PYTHON == "3.13"
-    lifecycle = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["dependency-groups"]["lifecycle"]
-    assert lifecycle and all(pin in requirements for pin in lifecycle)
-
+    declared = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))["dependency-groups"]
+    installs = {Path(command[command.index("--target") + 1]).name: (command, text) for command, text in asked}
+    assert len(asked) == len(installs) == 2
     files = {name for name, member in members(bundled.archive).items() if member.isfile()}
-    assert {"agent/lib/__init__.py", "agent/lib-1.0.dist-info/METADATA", "agent/rhi_lifecycle/__main__.py"} <= files
-    assert not files & {"agent/lib-1.0.dist-info/RECORD", "agent/bin/lib", "agent/.lock"}
+    for folder, group, package in (("agent", "lifecycle", "rhi_lifecycle"), ("contract", "contract", "rhi_mock_engine")):
+        command, requirements = installs[folder]
+        assert command[command.index("--python-version") + 1] == packaging.PYTHON == "3.13"
+        assert declared[group] and all(pin in requirements for pin in declared[group])
+        assert {f"{folder}/lib/__init__.py", f"{folder}/lib-1.0.dist-info/METADATA", f"{folder}/{package}/__init__.py"} <= files
+        assert not files & {f"{folder}/lib-1.0.dist-info/RECORD", f"{folder}/bin/lib", f"{folder}/.lock"}
+    assert "contract/run.sh" in files
     # Sorted as text, a library's metadata folder before the files of the library itself.
     assert list(members(bundled.archive)) == sorted(members(bundled.archive))
     assert bundled.value["files"]["sha256"] == hashlib.sha256(bundled.archive.read_bytes()).hexdigest()
@@ -447,9 +479,10 @@ def without_a_pure_wheel(lock: Mapping[str, Any], group: str) -> list[str]:
     )
 
 
-def test_every_library_of_the_lifecycle_group_has_a_pure_python_wheel() -> None:
+def test_every_library_of_the_lifecycle_and_contract_groups_has_a_pure_python_wheel() -> None:
     lock = tomllib.loads((REPO / "uv.lock").read_text(encoding="utf-8"))
     assert without_a_pure_wheel(lock, "lifecycle") == []
+    assert without_a_pure_wheel(lock, "contract") == []
     # A library that is compiled for a platform, or that has no wheel at all, is found.
     made_up = {
         "package": [

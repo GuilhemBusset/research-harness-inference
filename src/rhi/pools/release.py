@@ -30,12 +30,18 @@ of the agent's unit is the version the bundle is built for (`rhi.packaging.PYTHO
 folder asset when it publishes it, which would leave the digest unknown at synthesis: the archive
 is built at synthesis as one file and published as a file asset, which CDK uploads unchanged to
 the bootstrap's bucket, and the digest the parameter names is the SHA-256 of the archive's bytes.
+Beside the agent, `contract/` carries the engine contract suite to the node, where the document
+`rhi-engine-contract` runs it against the node's own engine (`rhi.pools.contract_check`): the
+suite's folder as the repository has it, at `contract/tests/contract/`, the files of
+`services/engine/contract/` at its root, and `rhi_common`, `rhi_gateway`, `rhi_mock_engine` and
+the libraries of the contract group at their locked versions, in the same layout as the agent's
+and pure Python as well.
 The archive is reproducible: its entries are sorted, with one modification time, owner and group
 0 and fixed modes, and it leaves out what the installer records about its own run. The same
 files give the same bytes, so a synthesis that changes nothing in them leaves the parameter as
 it was. As for a function's bundle, the libraries are installed only for a stack that CDK
 bundles: where the context `aws:cdk:bundling-stacks` excludes the stack, as in the tests, the
-archive holds everything but the libraries and nothing is downloaded.
+archive holds everything but the libraries, the agent's and the suite's, and nothing is downloaded.
 
 **The parameter.** `/rhi/pools/<pool>/release`, the name the launch template puts in the instance
 tag `rhi-release-parameter`. Its value is one JSON object: the compared release (`engine_image`,
@@ -121,6 +127,9 @@ ENGINES = {
 UNITS = "services/engine/units"
 COLLECTOR_CONFIG = "services/engine/collector/config.yaml"
 DCGM_FIELDS = "services/engine/dcgm/counters.csv"
+# The contract suite, under `contract/` as under the repository, and the files that run it.
+CONTRACT_SUITE = "tests/contract"
+CONTRACT_FILES = "services/engine/contract"
 # One modification time for every entry: 1 January 1980, the earliest every archive tool reads.
 ARCHIVE_TIME = 315532800
 # Left out of the archive: Python's bytecode cache, and what the installer records about its own
@@ -168,7 +177,8 @@ def _members(root: Path) -> Iterator[tuple[str, Path]]:
 def build_archive(into: Path, *, repo: Path = packaging.REPO, libraries: bool = True) -> str:
     """Write the release's archive to the file `into`, and give the SHA-256 digest of its bytes.
 
-    Without `libraries` the agent is its two packages alone, and nothing is installed.
+    Without `libraries` the agent is its two packages alone, the suite its packages and its
+    files, and nothing is installed.
     """
     with tempfile.TemporaryDirectory(prefix="rhi-release-") as scratch:
         root = Path(scratch)
@@ -184,6 +194,16 @@ def build_archive(into: Path, *, repo: Path = packaging.REPO, libraries: bool = 
             packaging.bundle("lifecycle", packaging.PLATFORMS["arm64"], agent, repo=repo)
         else:
             packaging.copy_packages("lifecycle", repo, agent)
+        contract = root / "contract"
+        contract.mkdir()
+        if libraries:
+            packaging.bundle("contract", packaging.PLATFORMS["arm64"], contract, repo=repo)
+        else:
+            packaging.copy_packages("contract", repo, contract)
+        shutil.copytree(repo / CONTRACT_SUITE, contract / CONTRACT_SUITE, ignore=shutil.ignore_patterns(_CACHE))
+        for file in sorted((repo / CONTRACT_FILES).iterdir()):
+            if file.is_file():
+                shutil.copyfile(file, contract / file.name)
         with tarfile.open(into, "w", format=tarfile.GNU_FORMAT) as archive:
             for name, path in _members(root):
                 entry = tarfile.TarInfo(name)

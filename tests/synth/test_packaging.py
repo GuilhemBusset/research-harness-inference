@@ -44,6 +44,9 @@ GROUPS = {
     # with, the solver of the task spike S3 gives each harness, and the load generator's HTTP client.
     "spikes": {"openai", "anthropic", "boto3", "highspy", "httpx"},
 }
+# Not a service: the group of the contract suite of tests/contract, which the release bundles
+# (`rhi.packaging.SUITES`), and the libraries the suite imports.
+CONTRACT = {"pytest", "httpx", "prometheus-client", "starlette", "uvicorn"}
 # The name each library is imported by, where it is not the name it is installed by.
 IMPORT_NAMES = {"prometheus-client": "prometheus_client", "protobuf": "google.protobuf", "pyjwt": "jwt"}
 
@@ -77,11 +80,11 @@ def groups(pyproject: Path) -> dict[str, list[Any]]:
 
 
 def unpinned(pyproject: Path) -> list[str]:
-    """The requirements of the service groups and of the dev group that are not one exact version."""
+    """The requirements of the service groups, the contract group and the dev group that are not one exact version."""
     declared = groups(pyproject)
     return [
         f"{group}: {requirement}"
-        for group in (*GROUPS, "dev")
+        for group in (*GROUPS, "contract", "dev")
         for requirement in declared[group]
         if isinstance(requirement, str) and not PIN.fullmatch(requirement)
     ]
@@ -323,18 +326,44 @@ def test_every_group_is_pinned(tmp_path: Path) -> None:
         requirement.startswith("moto[dynamodb]==") for requirement in declared["dev"] if isinstance(requirement, str)
     )
 
-    # A requirement that is not one exact version is reported, in a service group and in the dev group.
+    # A requirement that is not one exact version is reported, in a service group, in the contract
+    # group and in the dev group: in each group whose line is loosened.
     text = PYPROJECT.read_text(encoding="utf-8")
     copy = tmp_path / "pyproject.toml"
-    for group, library in (("scaler", "cramjam"), ("cli", "keyring"), ("dev", "pytest"), ("dev", "moto[dynamodb]")):
+    cases = (("scaler", "cramjam"), ("cli", "keyring"), ("dev", "pytest"), ("contract", "pytest"), ("dev", "moto[dynamodb]"))
+    for group, library in cases:
         pinned = re.search(rf'"{re.escape(library)}==([^"]+)"', text)
         assert pinned, library
+        holding = [name for name in (*GROUPS, "contract", "dev") if pinned[0].strip('"') in declared[name]]
+        assert group in holding, (group, library)
         for loosened in (f"{library}>={pinned[1]}", f"{library}~={pinned[1]}", f"{library}=={pinned[1]}.*", library):
             copy.write_text(text.replace(pinned[0], f'"{loosened}"'), encoding="utf-8")
-            assert unpinned(copy) == [f"{group}: {loosened}"]
+            assert unpinned(copy) == [f"{name}: {loosened}" for name in holding]
 
     for library in sorted(set().union(*GROUPS.values())):
         importlib.import_module(IMPORT_NAMES.get(library, library))
+
+
+def pins(declared: dict[str, list[Any]], group: str) -> dict[str, str]:
+    """The libraries a group pins, by normalized name, with their versions."""
+    found = [PIN.fullmatch(requirement) for requirement in declared[group] if isinstance(requirement, str)]
+    return {normalized(pin["name"]): pin["version"] for pin in found if pin}
+
+
+def test_the_contract_group_pins_each_library_as_every_other_group_does() -> None:
+    declared = groups(PYPROJECT)
+    contract = pins(declared, "contract")
+    assert set(contract) == CONTRACT
+    assert "pytest" in pins(declared, "dev")
+    versions = {name: package["version"] for name, package in lock_packages().items()}
+    for library, version in contract.items():
+        others = {
+            group: held[library]
+            for group in declared
+            if group != "contract" and library in (held := pins(declared, group))
+        }
+        assert others, f"no other group pins {library}"
+        assert set(others.values()) == {version} == {versions[library]}, (library, others)
 
 
 if __name__ == "__main__":
