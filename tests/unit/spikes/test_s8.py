@@ -8,10 +8,15 @@ moto holds the pool-state table in process: no account, no credentials, no netwo
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 import dataclasses
 import io
 import itertools
+import json
+import selectors
+import threading
+import urllib.error
 import urllib.request
 from contextlib import ExitStack
 from types import SimpleNamespace
@@ -36,10 +41,12 @@ from rhi_mock_engine.app import Settings, create_app
 from rhi_reporter.measure import Verdict, measurement_event
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import AsyncIterator, Callable, Iterator
 
 Counts, Phase = s8.Counts, s8.Phase
 
+# The configuration's default per-address rate limit, in requests per 300 seconds.
+PER_ADDRESS = 2_000
 STUCK = {1: Counts(10, {"instance-a": 10}), 2: Counts(10, {"instance-b": 10})}
 REMAINED = {1: Counts(10, {"instance-a": 10}), 2: Counts(10, {"instance-a": 10})}
 
@@ -147,7 +154,7 @@ def _replay(keys: list[str], kept: tuple[bool, bool], on_rest: Callable[[], None
     """A replay answering every request, in which a student's second request has its first's whole
     input cached, as the mock's cache reports it, when `kept` says it reached its first's instance."""
 
-    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int) -> list:
+    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int, **named: object) -> list:
         records = _answered(load)
         if isinstance(load.sessions[0], s8.Rest):
             on_rest()
@@ -177,14 +184,14 @@ def test_the_first_requests_at_once_count_toward_the_verdict(
     monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
     firsts = {"instance-a": 1, "instance-b": 1}
     pool = _Pool([firsts, {"instance-b": 3}, {second_student_on: 3}])
-    run = s8.Run(pool, "https://gateway.example.com", keys, 3, 8)  # ty: ignore[invalid-argument-type] - a test double
+    run = s8.Run(pool, "https://gateway.example.com", keys, 3, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
     before = s8.asyncio.run(run.phase(first_at_once=True))
     assert all(held.sent == 4 and held.adds_up() for held in before.values())
     assert s8.SPIKE.verdict(s8.numbers_of(2, {Phase.BEFORE: before, Phase.AFTER: REMAINED})) is verdict
 
 
 def test_two_instances_are_two_seen_in_service_together(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
+    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int, **named: object) -> list:
         (stream, *_) = load.sessions
         assert isinstance(stream, s8.HeldStream)
         await stream.stop.wait()
@@ -194,7 +201,7 @@ def test_two_instances_are_two_seen_in_service_together(monkeypatch: pytest.Monk
     monkeypatch.setattr(s8, "POLL_SECONDS", 0)
     observed = [{"instance-a": "zone-1"}, {"instance-b": "zone-2"}, {"instance-a": "zone-1", "instance-b": "zone-2"}]
     pool = _Pool(observed=observed)
-    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 8, 3, 8)  # ty: ignore[invalid-argument-type] - a test double
+    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 8, 3, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
     # Instance-a alone, then instance-b alone, is not two instances serving: the load is held until
     # both are seen at once.
     assert s8.asyncio.run(run.two_instances()) == observed[2]
@@ -271,7 +278,7 @@ def _run(
     monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
     monkeypatch.setattr(s8.time, "time", lambda: clock.now)
     monkeypatch.setattr(s8.time, "sleep", clock.sleep)
-    return s8.Run(pool, "https://gateway.example.com", keys, 2, 8)  # ty: ignore[invalid-argument-type] - a test double
+    return s8.Run(pool, "https://gateway.example.com", keys, 2, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
 
 
 def test_a_run_passes_once_a_student_has_moved_from_the_instance_that_left(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -377,7 +384,7 @@ def test_each_run_talks_in_conversations_of_its_own(monkeypatch: pytest.MonkeyPa
     # conversation cannot be taken for this run's first request.
     bodies: list[bytes] = []
 
-    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int) -> list:
+    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int, **named: object) -> list:
         firsts = [session for session in load.sessions if isinstance(session, s8.Opening)]
         bodies.extend(next(session.requests())[1].body for session in firsts)
         return _answered(load)
@@ -387,7 +394,7 @@ def test_each_run_talks_in_conversations_of_its_own(monkeypatch: pytest.MonkeyPa
     keys = [generate_key(), generate_key()]
     for _ in range(2):
         pool = _Pool([{"instance-a": 2}, {"instance-a": 1}, {"instance-a": 1}])
-        run = s8.Run(pool, "https://gateway.example.com", keys, 1, 8)  # ty: ignore[invalid-argument-type] - a test double
+        run = s8.Run(pool, "https://gateway.example.com", keys, 1, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
         s8.asyncio.run(run.phase(first_at_once=True))
     assert len(bodies) == 4
     assert bodies[0] != bodies[2]
@@ -441,7 +448,7 @@ def _scaling_run(
     monkeypatch.setattr(s8.Run, "phase", phase)
     monkeypatch.setattr(s8, "_wait", wait)
     pool = s8.Pool("mock", scaling, scaling)  # ty: ignore[invalid-argument-type] - a test double
-    return s8.Run(pool, "https://gateway.example.com", [generate_key(), generate_key()], 2, 8)
+    return s8.Run(pool, "https://gateway.example.com", [generate_key(), generate_key()], 2, 8, PER_ADDRESS)
 
 
 def _measured(run: s8.Run) -> dict[str, int | float]:
@@ -548,7 +555,7 @@ def test_nothing_is_sent_until_two_are_in_service_and_the_load_is_held_until_bot
 ) -> None:
     clock, started, stopped = _Clock(1000), [], []
 
-    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
+    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int, **named: object) -> list:
         started.append(clock.now)
         await load.sessions[0].stop.wait()  # ty: ignore[missing-attribute] - the load's held streams
         stopped.append(clock.now)
@@ -565,7 +572,7 @@ def test_nothing_is_sent_until_two_are_in_service_and_the_load_is_held_until_bot
     monkeypatch.setattr(s8.time, "time", lambda: clock.now)
     held_fleet = fleet(clock)
     pool = s8.Pool("mock", held_fleet, held_fleet)  # ty: ignore[invalid-argument-type] - a test double
-    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 8, 3, 8)
+    run = s8.Run(pool, "https://gateway.example.com", [generate_key()] * 8, 3, 8, PER_ADDRESS)
     assert asyncio.run(run.two_instances()) == {"instance-a": "zone-1", "instance-b": "zone-2"}
     assert (started, stopped) == ([sent_from], [1060])
 
@@ -696,7 +703,7 @@ def test_a_number_raised_before_a_phase_reaches_the_gateway_before_the_phase_sen
     monkeypatch.setattr(s8.time, "time", lambda: clock.now)
     monkeypatch.setattr(s8.time, "sleep", clock.sleep)
     monkeypatch.setattr(s8.Run, "phase", phase)
-    run = s8.Run(Raised(), "https://gateway.example.com", [generate_key(), generate_key()], 2, 8)  # ty: ignore[invalid-argument-type] - a test double
+    run = s8.Run(Raised(), "https://gateway.example.com", [generate_key(), generate_key()], 2, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
     assert run.measured(Phase.BEFORE, first_at_once=True, in_service={"instance-a", "instance-b"}) == STUCK
     assert held == [True]
 
@@ -787,7 +794,7 @@ def test_scale_out_ends_only_with_exactly_two_in_service(monkeypatch: pytest.Mon
         def busy(self) -> int:
             return 0
 
-    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int) -> list:
+    async def held(load: s8.loadgen.Load, keys: object, endpoint: str, *, at_once: int, **named: object) -> list:
         await load.sessions[0].stop.wait()  # ty: ignore[missing-attribute] - the load's held streams
         stopped_at.append(poll)
         return []
@@ -803,7 +810,7 @@ def test_scale_out_ends_only_with_exactly_two_in_service(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(s8.loadgen, "replay", held)
     monkeypatch.setattr(s8, "_wait", wait)
-    run = s8.Run(Three(), "https://gateway.example.com", [generate_key()] * 8, 1, 8)  # ty: ignore[invalid-argument-type] - a test double
+    run = s8.Run(Three(), "https://gateway.example.com", [generate_key()] * 8, 1, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
     assert asyncio.run(run.two_instances()) == {"instance-a": "zone-1", "instance-b": "zone-2"}
     assert stopped_at == [3]
 
@@ -838,7 +845,7 @@ def test_a_third_instance_cannot_prove_two_instance_stickiness(
     monkeypatch.setattr(s8, "GATEWAY_SECONDS", 0)
     monkeypatch.setattr(s8.Run, "two_instances", two_instances)
     monkeypatch.setattr(s8.Run, "phase", phase)
-    run = s8.Run(Pool(), "https://gateway.example.com", [generate_key(), generate_key()], 1, 8)  # ty: ignore[invalid-argument-type] - a test double
+    run = s8.Run(Pool(), "https://gateway.example.com", [generate_key(), generate_key()], 1, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
     with pytest.raises(s8.Departed):
         run.measure(_Session())  # ty: ignore[invalid-argument-type] - a test double
 
@@ -932,7 +939,7 @@ def _booking_run(
     sent: list[Session | None] = []
     answered = _replay(keys, kept, on_rest)
 
-    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int) -> list:
+    async def replay(load: s8.loadgen.Load, supplied: list[str], endpoint: str, *, at_once: int, **named: object) -> list:
         sent.append(_stored(pool.table))
         (first, *_) = load.sessions
         if isinstance(first, s8.HeldStream):
@@ -950,7 +957,7 @@ def _booking_run(
     monkeypatch.setattr(s8, "SETTLE_SECONDS", 0)
     monkeypatch.setattr(s8.time, "time", lambda: clock.now)
     monkeypatch.setattr(s8.time, "sleep", clock.sleep)
-    return s8.Run(pool, "https://gateway.example.com", keys, 2, 3), sent  # ty: ignore[invalid-argument-type] - a test double
+    return s8.Run(pool, "https://gateway.example.com", keys, 2, 3, PER_ADDRESS), sent  # ty: ignore[invalid-argument-type] - a test double
 
 
 FIRSTS = {"instance-a": 1, "instance-b": 1}
@@ -1156,10 +1163,14 @@ def test_the_job_books_for_the_minutes_it_is_given_under_the_bounds_of_the_confi
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     example = config.load({"RHI_CONFIG": "example"})
+    example = dataclasses.replace(example, rate_limits=dataclasses.replace(example.rate_limits, per_address=1234))
     (mock,) = [pool for pool in example.pools if pool.name == "mock"]
     job = _job(monkeypatch, example)
 
     s8.main(_environ("https://gateway.example.com"))
+
+    # The load is spaced under the deployed per-address rate limit.
+    assert [run.per_address for run in job.booked] == [1234]
 
     assert job.asked == {
         "minutes": 75,
@@ -1186,3 +1197,352 @@ def test_the_job_given_an_http_address_starts_nothing_and_books_nothing(monkeypa
         s8.main(_environ("http://gateway.example.com"))
 
     assert (job.started, job.booked) == ([], [])
+
+
+# The held load, through the real replay, under a stub of the web ACL's per-address rate rule.
+
+# What a stub puts in the text of an answer or of an error: no line of the job may carry it.
+MARKER = "stub-text-0f3a"
+
+
+class _VirtualLoop(asyncio.SelectorEventLoop):
+    """An event loop on a clock of its own: when nothing is ready, it moves its clock to its next
+    timer at once instead of waiting, so a load of many minutes runs in a moment."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        loop = self
+
+        class Selector(selectors.DefaultSelector):
+            def select(self, timeout: float | None = None) -> list:
+                ready = super().select(0)
+                if not ready and timeout is None:
+                    raise RuntimeError("the loop has nothing to do and nothing scheduled")
+                if not ready:
+                    loop.now += timeout or 0.0
+                return ready
+
+        super().__init__(Selector())
+
+    def time(self) -> float:
+        return self.now
+
+
+def _on_virtual_time(work: Callable[[_VirtualLoop], Any]) -> Any:
+    loop = _VirtualLoop()
+    try:
+        return loop.run_until_complete(work(loop))
+    finally:
+        loop.close()
+
+
+def _stream() -> httpx.Response:
+    """A short streamed Messages answer, as the mock's canned turn, cut to one token."""
+    events = [
+        ("message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 200, "output_tokens": 0}}}),
+        ("content_block_delta", {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "ok"}}),
+        ("message_delta", {"type": "message_delta", "usage": {"output_tokens": 1}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    body = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
+
+
+class _RateRule(httpx.AsyncBaseTransport):
+    """The gateway behind the web ACL's per-address rule: every request comes from one address, and
+    once `RATE_WINDOW` seconds of the clock hold more than `per_address` of them, each request is
+    answered 403 by the rule itself. Before that, `fault`'s answer to the request, given its number
+    and itself, or a short stream."""
+
+    RATE_WINDOW = 300
+
+    def __init__(
+        self,
+        clock: Callable[[], float],
+        per_address: int,
+        fault: Callable[[int, httpx.Request], httpx.Response | None] = lambda number, request: None,
+    ) -> None:
+        self.clock, self.per_address, self.fault = clock, per_address, fault
+        self.arrivals: list[float] = []
+        self.blocked = False
+        self.refused = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        now = self.clock()
+        self.arrivals.append(now)
+        window = len(self.arrivals) - bisect.bisect_left(self.arrivals, now - self.RATE_WINDOW)
+        self.blocked = self.blocked or window > self.per_address
+        if self.blocked:
+            self.refused += 1
+            return httpx.Response(403, text=f"blocked {MARKER}")
+        return self.fault(len(self.arrivals), request) or _stream()
+
+    def most_in_a_window(self) -> int:
+        """The most requests any `RATE_WINDOW` seconds of the clock hold, both ends counted."""
+        return max(
+            (
+                bisect.bisect_right(self.arrivals, at + self.RATE_WINDOW) - first
+                for first, at in enumerate(self.arrivals)
+            ),
+            default=0,
+        )
+
+
+class _Serving:
+    """A pool whose two instances are in service from the start, and both serve once `serves` says so."""
+
+    name = "mock"
+
+    def __init__(self, serves: Callable[[], bool]) -> None:
+        self.serves = serves
+
+    def serving(self) -> dict[str, str]:
+        return BOTH if self.serves() else {}
+
+    def present(self) -> set[str]:
+        return set(BOTH)
+
+    def noted(self) -> tuple[int, int]:
+        return (2, 2)
+
+    def busy(self) -> int:
+        return 0
+
+
+def _held_run(pool: _Serving) -> s8.Run:
+    """A run whose load is 16 streams, as eight canary students, under the default per-address limit."""
+    return s8.Run(pool, "https://gateway.example.com", [generate_key() for _ in range(8)], 3, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
+
+
+def _through(
+    monkeypatch: pytest.MonkeyPatch, loop: _VirtualLoop, gateway: _RateRule, replayed: list[s8.loadgen.Record]
+) -> None:
+    """The job's replays sent through the real replay to `gateway`, on the loop's clock, their
+    records kept in `replayed`; the job's waits poll on the same clock."""
+    real = s8.loadgen.replay
+
+    async def replay(*given: Any, **named: Any) -> list[s8.loadgen.Record]:
+        # The job's own wait, if it gives one, is the one the replay waits.
+        named.setdefault("sleep", asyncio.sleep)
+        records = await real(*given, clock=loop.time, transport=gateway, **named)
+        replayed.extend(records)
+        return records
+
+    async def wait(condition: Callable[[], bool], seconds: float, what: str) -> None:
+        deadline = loop.time() + seconds
+        while not condition():
+            if loop.time() > deadline:
+                raise TimeoutError(what)
+            await asyncio.sleep(s8.POLL_SECONDS)
+
+    monkeypatch.setattr(s8.loadgen, "replay", replay)
+    monkeypatch.setattr(s8, "_wait", wait)
+
+
+@pytest.mark.parametrize("held_up", [0, 5])
+def test_the_held_load_stays_under_half_the_per_address_rule_until_both_instances_serve(
+    monkeypatch: pytest.MonkeyPatch, held_up: float
+) -> None:
+    # `held_up`: seconds for which the job's event loop runs nothing, once the gateway holds 30
+    # requests, so that the streams' waits that end then all end late, at once.
+    assert s8.RATE_WINDOW_SECONDS == _RateRule.RATE_WINDOW
+    replayed: list[s8.loadgen.Record] = []
+
+    async def work(loop: _VirtualLoop) -> tuple[dict[str, str], _RateRule, float]:
+        def hold_up(number: int, request: httpx.Request) -> None:
+            if number == 30:
+                loop.now += held_up
+
+        gateway = _RateRule(loop.time, PER_ADDRESS, hold_up)
+        _through(monkeypatch, loop, gateway, replayed)
+        # Both serve 600 seconds after the load's first request.
+        pool = _Serving(lambda: bool(gateway.arrivals) and loop.time() >= gateway.arrivals[0] + 600)
+        run = _held_run(pool)
+        return await run.two_instances(), gateway, loop.time()
+
+    found, gateway, ended_at = _on_virtual_time(work)
+    began = gateway.arrivals[0]
+    assert found == BOTH and ended_at >= began + 600
+    # No request was refused by the rule, and the load used at most half of it in any window.
+    assert gateway.refused == 0
+    assert gateway.most_in_a_window() <= PER_ADDRESS // 2
+    # Each of the 16 streams was answered 200 at every request, and still sent when the job stopped it.
+    streams = {record.session for record in replayed}
+    assert streams == set(range(16))
+    assert all(record.status == 200 and record.cause is None and record.failure is None for record in replayed)
+    for stream in streams:
+        assert max(r.sent_at or 0 for r in replayed if r.session == stream) >= began + 600 - s8.POLL_SECONDS
+
+
+def test_a_limit_under_one_request_a_stream_staggers_the_streams_and_holds_the_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Half of 30 is 15 requests in any 300 seconds, for 16 streams: they start at different times.
+    per_address = 30
+
+    async def work(loop: _VirtualLoop) -> tuple[dict[str, str], _RateRule]:
+        gateway = _RateRule(loop.time, per_address)
+        _through(monkeypatch, loop, gateway, [])
+        pool = _Serving(lambda: bool(gateway.arrivals) and loop.time() >= gateway.arrivals[0] + 600)
+        run = dataclasses.replace(_held_run(pool), per_address=per_address)
+        return await run.two_instances(), gateway
+
+    found, gateway = _on_virtual_time(work)
+    assert found == BOTH and gateway.refused == 0
+    assert 0 < gateway.most_in_a_window() <= per_address // 2
+
+
+def _read_error(request: httpx.Request) -> httpx.Response:
+    raise httpx.ReadError(f"connection reset {MARKER}", request=request)
+
+
+FAULTS = {
+    "403": lambda request: httpx.Response(403, text=f"refused {MARKER}"),
+    "concurrency_limit": lambda request: httpx.Response(
+        200,
+        headers={"content-type": "text/event-stream"},
+        content=(
+            "event: error\ndata: "
+            + json.dumps({"type": "error", "error": {"type": "concurrency_limit", "message": MARKER}})
+            + "\n\n"
+        ).encode(),
+    ),
+    "read_error": _read_error,
+}
+
+
+@pytest.mark.parametrize("way", list(FAULTS))
+def test_a_held_stream_that_ends_stops_the_load_and_fails_the_run_naming_how(
+    monkeypatch: pytest.MonkeyPatch, way: str
+) -> None:
+    async def work(loop: _VirtualLoop) -> tuple[str, _RateRule]:
+        # The 40th request, once each stream has sent twice or more, ends its stream.
+        gateway = _RateRule(loop.time, PER_ADDRESS, lambda number, request: FAULTS[way](request) if number == 40 else None)
+        _through(monkeypatch, loop, gateway, [])
+        run = _held_run(_Serving(lambda: False))
+        with pytest.raises(RuntimeError) as failed:
+            await run.two_instances()
+        return str(failed.value), gateway
+
+    line, gateway = _on_virtual_time(work)
+    assert f"{way} (1)" in line
+    assert MARKER not in line and "refused" not in line
+    # The load stopped at the end: no stream sent after it, those pausing then included.
+    assert len(gateway.arrivals) == 40 and max(gateway.arrivals) == gateway.arrivals[39]
+
+
+REFUSALS = {
+    "text": lambda request: httpx.Response(403, text=f"refused {MARKER}"),
+    # An error object whose type is no name of the gateway's causes: its status is what is named.
+    "unknown error object": lambda request: httpx.Response(403, json={"error": {"type": {"message": MARKER}}}),
+}
+
+
+@pytest.mark.parametrize("refusal", list(REFUSALS))
+def test_a_measured_student_s_request_not_answered_200_fails_the_run_naming_its_status(
+    monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    async def work(loop: _VirtualLoop) -> str:
+        _through(
+            monkeypatch, loop, _RateRule(loop.time, PER_ADDRESS, lambda number, request: REFUSALS[refusal](request)), []
+        )
+        keys = [generate_key(), generate_key()]
+        run = s8.Run(_Pool(), "https://gateway.example.com", keys, 3, 8, PER_ADDRESS)  # ty: ignore[invalid-argument-type] - a test double
+        with pytest.raises(RuntimeError) as failed:
+            await run.student(1, s8._session("mock", 3, 1))
+        return str(failed.value)
+
+    line = _on_virtual_time(work)
+    assert "403" in line and MARKER not in line
+
+
+class _CutLate(httpx.AsyncByteStream):
+    """A stream whose connection fails after a minute."""
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        await asyncio.sleep(60)
+        raise httpx.ReadError(MARKER)
+        yield b""
+
+
+def test_a_stream_in_flight_when_a_held_stream_ends_is_counted_when_it_ends_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def work(loop: _VirtualLoop) -> str:
+        # The first request's connection fails a minute later; the second, sent meanwhile, is refused.
+        answers = {1: lambda: httpx.Response(200, stream=_CutLate()), 2: lambda: httpx.Response(403, text=MARKER)}
+        gateway = _RateRule(loop.time, PER_ADDRESS, lambda number, request: answers[number]())
+        _through(monkeypatch, loop, gateway, [])
+        run = dataclasses.replace(_held_run(_Serving(lambda: False)), target_concurrency=1)
+        with pytest.raises(RuntimeError) as failed:
+            await run.two_instances()
+        return str(failed.value)
+
+    line = _on_virtual_time(work)
+    assert "403 (1)" in line and "read_error (1)" in line and MARKER not in line
+
+
+def test_a_request_that_fails_after_both_instances_serve_is_no_early_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def work(loop: _VirtualLoop) -> dict[str, str]:
+        cut: list[float] = []
+
+        def late(number: int, request: httpx.Request) -> httpx.Response | None:
+            # One request sent just before both serve is still in flight when the job stops the load.
+            if loop.time() < gateway.arrivals[0] + 595 or cut:
+                return None
+            cut.append(loop.time())
+            return httpx.Response(200, stream=_CutLate())
+
+        gateway = _RateRule(loop.time, PER_ADDRESS, late)
+        _through(monkeypatch, loop, gateway, [])
+        pool = _Serving(lambda: bool(gateway.arrivals) and loop.time() >= gateway.arrivals[0] + 600)
+        run = _held_run(pool)
+        found = await run.two_instances()
+        assert cut
+        return found
+
+    assert _on_virtual_time(work) == BOTH
+
+
+@pytest.mark.parametrize("observation", ["timed out", "failed"])
+def test_a_held_stream_s_end_seen_during_the_last_observation_outweighs_how_the_wait_ended(
+    monkeypatch: pytest.MonkeyPatch, observation: str
+) -> None:
+    # The pool's last observation is read while a held stream is answered 403: either it shows
+    # nothing serving and the wait's deadline has passed once it returns, or the workspace fails it.
+    async def work() -> str:
+        loop = asyncio.get_running_loop()
+        observing, recorded = asyncio.Event(), threading.Event()
+
+        class Pool(_Serving):
+            def serving(self) -> dict[str, str]:
+                loop.call_soon_threadsafe(observing.set)
+                if not recorded.wait(5):
+                    raise AssertionError("the held stream was not answered")
+                if observation == "failed":
+                    raise urllib.error.URLError(MARKER)
+                return {}
+
+        async def answer(request: httpx.Request) -> httpx.Response:
+            await observing.wait()
+            return httpx.Response(403, text=f"refused {MARKER}")
+
+        real = s8.loadgen.replay
+
+        async def replay(*given: Any, on_record: Callable[[s8.loadgen.Record], None], **named: Any) -> list:
+            def noted(record: s8.loadgen.Record) -> None:
+                on_record(record)
+                recorded.set()
+
+            return await real(*given, transport=httpx.MockTransport(answer), on_record=noted, **named)
+
+        monkeypatch.setattr(s8.loadgen, "replay", replay)
+        monkeypatch.setattr(s8, "IN_SERVICE_WAIT_SECONDS", 1)
+        monkeypatch.setattr(s8, "time", SimpleNamespace(monotonic=lambda: 2 if recorded.is_set() else 0))
+        run = dataclasses.replace(_held_run(Pool(lambda: False)), target_concurrency=1)
+        with pytest.raises(RuntimeError) as failed:
+            await run.two_instances()
+        return str(failed.value)
+
+    line = asyncio.run(work())
+    assert "403 (" in line and MARKER not in line
