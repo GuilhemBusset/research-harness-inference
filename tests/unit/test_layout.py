@@ -69,6 +69,34 @@ def test_the_spikes_are_imported_by_name_and_hold_no_test() -> None:
     assert not [path.name for path in (REPO / "spikes").rglob("test_*.py")]
 
 
+def test_a_run_with_no_path_finds_every_tools_tests_by_folder() -> None:
+    # The tools' tests are found by folder, so a new tool's are collected with no edit; the
+    # engine's run by their own command, and the container tests in CI's job.
+    tools = [folder for folder in (REPO / "tools").iterdir() if (folder / "tests").is_dir()]
+    expected = {
+        file.relative_to(REPO).as_posix()
+        for tool in tools
+        if tool.name != "implementation-loop"
+        for pattern in ("test_*.py", "*_test.py")  # pytest's default `python_files`
+        for file in (tool / "tests").rglob(pattern)
+    }
+    assert expected
+
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    collected = {line.split("::")[0] for line in result.stdout.splitlines() if "::" in line}
+    assert expected <= collected, sorted(expected - collected)
+    excluded = ("tools/implementation-loop/", "tests/container/")
+    assert not [file for file in collected if file.startswith(excluded)]
+
+
 def test_same_named_test_files_both_run(tmp_path: Path) -> None:
     for folder in ("first", "second"):
         (tmp_path / folder).mkdir()

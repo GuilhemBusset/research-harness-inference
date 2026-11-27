@@ -30,7 +30,7 @@ def test_default_checks_cover_the_evaluation_tool() -> None:
     ty = config("ty.toml")
 
     # Tests: collected by a pytest that is given no path.
-    assert f"{TOOL}/tests" in pytest_options["testpaths"]
+    assert covers_tool(pytest_options["testpaths"])
     assert not covers_tool(pytest_options["norecursedirs"])
     # Lint and types: `evaluate` is a package under `tools`, so that folder is the import root.
     assert "tools" in ruff["src"]
