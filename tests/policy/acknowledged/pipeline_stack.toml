@@ -103,6 +103,21 @@
 # - logs:CreateLogGroup, logs:CreateLogStream and logs:PutLogEvents on the project's own log group,
 #   and codebuild:CreateReportGroup, CreateReport, UpdateReport, BatchPutTestCases and
 #   BatchPutCodeCoverages on the project's own report groups: CodeBuild's grant to every project.
+#
+# What `src/rhi/pipeline/mirror.py` adds to the role CDK Pipelines shares among the projects that
+# publish images (`Assets/DockerRole`), beside what CDK Pipelines gives it: the project's Docker
+# daemon logs in to the account's registry with this role and pulls the emulator and BuildKit from
+# the mirror before `cdk-assets` runs. `tests/synth/test_pipeline_mirror.py` holds the role to it.
+#
+# - ecr:GetAuthorizationToken on every resource: the token Docker logs in to the account's registry
+#   with. AWS grants it only on every resource, and CDK Pipelines already grants it to this role.
+# - ecr:BatchGetImage, ecr:GetDownloadUrlForLayer and ecr:BatchCheckLayerAvailability (pull) on
+#   the repositories rhi-mirror/tonistiigi/binfmt and rhi-mirror/moby/buildkit, each by its ARN,
+#   and on no other repository. No push.
+#
+# The base images of the FROM lines are pulled by BuildKit with the login `cdk-assets` makes with
+# the bootstrap's image-publishing role, which the policy of each mirror repository lets pull its
+# images, and nothing more: a repository's policy names no other principal and allows no push.
 
 [nag]
 "AwsSolutions-S1" = "The pipeline's artifact bucket keeps no server access logs: only the pipeline's own roles reach it, CloudTrail records who changes it, and a bucket of access logs would add storage and its cost that nothing in the design reads."
@@ -145,4 +160,4 @@
 "codebuild:BatchGetBuilds" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
 "codebuild:StartBuild" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
 "codebuild:StopBuild" = "CDK Pipelines grants the role it shares among the asset-publishing projects this action on every resource, because the projects multiply with the assets."
-"ecr:GetAuthorizationToken" = "The mirror step logs crane in to the account's private registry with an ECR authorization token, which AWS grants only on every resource; the token reaches only what the role's other statements allow, the repositories under rhi-mirror/."
+"ecr:GetAuthorizationToken" = "The mirror step logs crane in to the account's private registry, and the projects that publish images log Docker in to it, each with an ECR authorization token, which AWS grants only on every resource; the token reaches only what each role's other statements allow: the repositories under rhi-mirror/ for the mirror step, the emulator's and BuildKit's repositories and the bootstrap's image-publishing role for the image projects."

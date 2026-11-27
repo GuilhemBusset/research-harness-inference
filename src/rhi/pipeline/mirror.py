@@ -11,7 +11,15 @@ CodeBuild's addresses are shared, so the account keeps its own copy of each.
 with `library/` (`REPOSITORIES`). BuildKit asks a mirror for an image at its Docker Hub path under
 the mirror's own path, so the Dockerfiles keep their FROM lines. Each repository is retained when
 the stack is deleted: it holds copies only, but a deletion should not empty what the builds read.
-No pull-through cache rule is created.
+No pull-through cache rule is created. Each repository's policy lets the bootstrap's
+image-publishing role of the deploying account pull its images (`IMAGE_PUBLISHING_ROLE`), and
+nothing more: `cdk-assets` logs in with that role before it builds, so BuildKit's pulls of the base
+images carry its login, and that role's own policy reaches only the bootstrap's asset repository.
+
+**The asset step** pulls from the mirror alone (`IMAGE_BUILDER` of `rhi.pipeline.stack`). The role
+CDK Pipelines shares among the projects that publish images may get an ECR authorization token and
+pull from the emulator's and BuildKit's repositories (`MirrorRepositories.grant_the_image_builder`):
+the Docker daemon pulls those two with it, before `cdk-assets` runs.
 
 **The step**, named `ACTION`, runs in the stage Build, before the synthesis, which depends on it
 (`rhi.pipeline.stack`): it is the first action of every execution, before the Assets stage that
@@ -93,20 +101,57 @@ MIRROR_ACTIONS = [
 ]
 
 
+# What a reader of the mirror may do in a repository: pull images.
+PULL_ACTIONS = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"]
+# The bootstrap's image-publishing role of the deploying account and region, by its name, with
+# the default qualifier: `cdk-assets` logs in with it before it builds, and BuildKit's pulls of the
+# base images carry that login.
+IMAGE_PUBLISHING_ROLE = cdk.DefaultStackSynthesizer.DEFAULT_IMAGE_ASSET_PUBLISHING_ROLE_ARN.replace(
+    "${Qualifier}", cdk.DefaultStackSynthesizer.DEFAULT_QUALIFIER
+)
+# The two repositories the Docker daemon of an image project pulls from, with the project's role.
+IMAGE_BUILDER_REPOSITORIES = (f"{PREFIX}/tonistiigi/binfmt", f"{PREFIX}/moby/buildkit")
+
+
 class MirrorRepositories(Construct):
-    """One private ECR repository for each name of `REPOSITORIES`, retained when the stack is deleted."""
+    """One private ECR repository for each name of `REPOSITORIES`, retained when the stack is
+    deleted, whose policy lets the bootstrap's image-publishing role pull its images, and nothing
+    else: within one account, a repository's policy is enough, and the bootstrap's own policies
+    stay as they are."""
 
     def __init__(self, scope: Construct, construct_id: str) -> None:
         super().__init__(scope, construct_id)
-        self.repositories = [
-            ecr.Repository(
+        self.repositories = {
+            name: ecr.Repository(
                 self,
                 name.removeprefix(f"{PREFIX}/").replace("/", "-").title().replace("-", ""),
                 repository_name=name,
                 removal_policy=cdk.RemovalPolicy.RETAIN,
             )
             for name in REPOSITORIES
-        ]
+        }
+        publishing_role = iam.ArnPrincipal(cdk.Fn.sub(IMAGE_PUBLISHING_ROLE))
+        for repository in self.repositories.values():
+            repository.add_to_resource_policy(
+                iam.PolicyStatement(
+                    actions=PULL_ACTIONS,
+                    # ty reads the CDK's generated principal as unlike its protocol: jsii renames a parameter.
+                    principals=[publishing_role],  # ty: ignore[invalid-argument-type]
+                )
+            )
+
+    def grant_the_image_builder(self, role: iam.Role) -> None:
+        """Lets `role`, that of the projects that publish images, get an ECR authorization token
+        and pull the emulator and BuildKit from their repositories: the Docker daemon pulls those
+        two with it, before `cdk-assets` logs in."""
+        # AWS grants the token only on every resource.
+        role.add_to_principal_policy(iam.PolicyStatement(actions=["ecr:GetAuthorizationToken"], resources=["*"]))
+        role.add_to_principal_policy(
+            iam.PolicyStatement(
+                actions=PULL_ACTIONS,
+                resources=[self.repositories[name].repository_arn for name in IMAGE_BUILDER_REPOSITORIES],
+            )
+        )
 
 
 def mirror_step(scope: cdk.Stack, source: pipelines.IFileSetProducer) -> pipelines.CodeBuildStep:

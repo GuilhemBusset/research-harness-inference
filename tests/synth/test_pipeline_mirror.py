@@ -4,12 +4,16 @@ path on Docker Hub, each retained; the action Mirror before Synth in the stage B
 the mirror's script on the source with crane checked against its checksum; and a role that may
 get an ECR authorization token and pull, push and describe images under rhi-mirror/ of the
 deploying account and region, beside what CDK Pipelines gives every project, and nothing else.
+Each repository's policy lets the bootstrap's image-publishing role pull its images, and lets no
+principal push; the role the image projects share may get a token and pull the emulator and
+BuildKit from their repositories, and reaches no other repository.
 
 The tests read the app's own pipeline, the one that is deployed.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import json
 from typing import Any
 
@@ -148,3 +152,85 @@ def test_the_mirror_s_role_reaches_the_token_and_the_repositories_under_rhi_mirr
     }
     own = mirror.allowed - every_project
     assert own == {("ecr:GetAuthorizationToken", "*"), *((action, UNDER_THE_PREFIX) for action in PULL_PUSH_DESCRIBE)}
+
+
+# The bootstrap's image-publishing role of the deploying account and region, by its name.
+IMAGE_PUBLISHING_ROLE = {
+    "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/"
+    "cdk-hnb659fds-image-publishing-role-${AWS::AccountId}-${AWS::Region}"
+}
+PULL = {"ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:BatchCheckLayerAvailability"}
+PUSH = {"ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage"}
+
+
+def allows_a_push(statement: dict[str, Any]) -> bool:
+    """Whether a statement allows an action that pushes, written as itself or as a wildcard."""
+    patterns = [action.lower() for action in as_list(statement.get("Action", []))]
+    return statement["Effect"] == "Allow" and (
+        "NotAction" in statement or any(fnmatch.fnmatchcase(push.lower(), p) for push in PUSH for p in patterns)
+    )
+
+
+def test_each_repository_lets_the_image_publishing_role_pull_and_no_principal_push(templates: Templates) -> None:
+    repositories = [
+        r["Properties"] for r in templates[PIPELINE_TEMPLATE]["Resources"].values() if r["Type"] == "AWS::ECR::Repository"
+    ]
+    assert len(repositories) == len(REPOSITORIES)
+    for repository in repositories:
+        statements = repository["RepositoryPolicyText"]["Statement"]
+        assert any(
+            statement["Effect"] == "Allow"
+            and statement["Principal"] == {"AWS": IMAGE_PUBLISHING_ROLE}
+            and PULL <= set(as_list(statement["Action"]))
+            for statement in statements
+        )
+        assert not any(allows_a_push(statement) for statement in statements)
+        # The role is the one principal a repository's policy names.
+        assert all(statement["Principal"] == {"AWS": IMAGE_PUBLISHING_ROLE} for statement in statements)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        {"Effect": "Allow", "Action": "ecr:PutImage"},
+        {"Effect": "Allow", "Action": ["ecr:BatchGetImage", "ecr:*"]},
+        {"Effect": "Allow", "NotAction": "ecr:BatchGetImage"},
+    ],
+)
+def test_a_statement_that_pushes_is_found(statement: dict[str, Any]) -> None:
+    assert allows_a_push(statement)
+    assert not allows_a_push({"Effect": "Allow", "Action": sorted(PULL)})
+
+
+def test_the_image_projects_role_may_get_a_token_and_pull_the_emulator_and_buildkit_alone(
+    templates: Templates,
+) -> None:
+    resources = templates[PIPELINE_TEMPLATE]["Resources"]
+    image_projects = [
+        r["Properties"]
+        for r in resources.values()
+        if r["Type"] == "AWS::CodeBuild::Project" and r["Properties"]["Environment"].get("PrivilegedMode")
+    ]
+    (role,) = {project["ServiceRole"]["Fn::GetAtt"][0] for project in image_projects}
+    by_name = {
+        r["Properties"]["RepositoryName"]: logical_id
+        for logical_id, r in resources.items()
+        if r["Type"] == "AWS::ECR::Repository"
+    }
+    reached = {
+        (action, text(resource))
+        for policy in resources.values()
+        if policy["Type"] == "AWS::IAM::Policy" and {"Ref": role} in policy["Properties"].get("Roles", [])
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]
+        for action in as_list(statement["Action"])
+        if action.startswith("ecr:")
+        for resource in as_list(statement["Resource"])
+    }
+    assert reached == {
+        ("ecr:GetAuthorizationToken", "*"),
+        *(
+            (action, f"<{by_name[name]}.Arn>")
+            for action in PULL
+            for name in ("rhi-mirror/tonistiigi/binfmt", "rhi-mirror/moby/buildkit")
+        ),
+    }

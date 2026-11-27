@@ -10,7 +10,9 @@ listed, because every stack and every asset a later change adds to the stage bri
 - an asset-publishing action: a CodeBuild action whose project does nothing but publish assets
   with `cdk-assets`, after installing, to build an image for linux/arm64 as well as linux/amd64,
   an arm64 emulator and a multi-platform builder, each pinned by its digest or by its version and
-  checksum (`INSTALLS_THE_IMAGE_BUILDER`). It is left out in the asset stage, and so is that stage
+  checksum, the two images from the mirror in the deploying account's registry after a login to
+  it, and the builder configured with that mirror as its one mirror for Docker Hub
+  (`INSTALLS_THE_IMAGE_BUILDER`). It is left out in the asset stage, and so is that stage
   while it holds nothing else: CDK Pipelines creates it with the first asset;
 - a stack's deployment action: a CloudFormation action that prepares or executes a change set, or
   creates and updates a stack.
@@ -231,13 +233,22 @@ ASSET_STAGE = "Assets"
 # What a project that only publishes assets runs, as CDK Pipelines writes it.
 PUBLISHES_ASSETS = re.compile(r'cdk-assets --path "[\w./-]+" --verbose publish "[\w:.-]+"')
 INSTALLS_THE_PUBLISHER = re.compile(r"npm install -g cdk-assets@[\w.-]+")
-# What a project that publishes images may also run, as `src/rhi/pipeline/stack.py` writes it: an
-# arm64 emulator and a builder for either platform, each image by its digest and the builder's
+# What a project that publishes images may also run, as `src/rhi/pipeline/stack.py` writes it: the
+# login to the deploying account's registry, whose host it reads on the build host, an arm64
+# emulator and a builder for either platform, each image from the mirror in that registry by its
+# digest, the builder's configuration with that mirror as its one mirror, and the builder's
 # download by its version, checked against its checksum (sections 4.2 and 8.2, step 4).
 DIGEST = r"(:[\w.-]+)?@sha256:[0-9a-f]{64}"
 BUILDX = r"\$HOME/\.docker/cli-plugins/docker-buildx"
+MIRROR = r"\$RHI_REGISTRY/rhi-mirror"
+BUILDKIT_CONFIG = r"/tmp/rhi-buildkitd\.toml"
 INSTALLS_THE_IMAGE_BUILDER = [
-    re.compile(rf"docker run --privileged --rm tonistiigi/binfmt{DIGEST} --install arm64"),
+    re.compile(
+        r'export RHI_REGISTRY="\$\(aws sts get-caller-identity --query Account --output text\)'
+        r'\.dkr\.ecr\.\$AWS_REGION\.amazonaws\.com"'
+    ),
+    re.compile(r'aws ecr get-login-password \| docker login --username AWS --password-stdin "\$RHI_REGISTRY"'),
+    re.compile(rf'docker run --privileged --rm "{MIRROR}/tonistiigi/binfmt{DIGEST}" --install arm64'),
     re.compile(
         rf'curl -fsSL --create-dirs -o "{BUILDX}" '
         r"https://github\.com/docker/buildx/releases/download/v(\d+\.\d+\.\d+)/buildx-v\1\.linux-amd64"
@@ -245,8 +256,13 @@ INSTALLS_THE_IMAGE_BUILDER = [
     re.compile(rf'echo "[0-9a-f]{{64}}  {BUILDX}" \| sha256sum -c -'),
     re.compile(rf'chmod \+x "{BUILDX}"'),
     re.compile(
-        rf"docker buildx create --name [\w-]+ --driver docker-container --driver-opt image=moby/buildkit{DIGEST}"
-        r" --driver-opt default-load=true --bootstrap --use"
+        r"""printf '\[registry\."%s"\]\\n  mirrors = \["%s"\]\\n' "\$RHI_MIRRORED_REGISTRY" """
+        rf'"{MIRROR}" > {BUILDKIT_CONFIG}'
+    ),
+    re.compile(
+        r"docker buildx create --name [\w-]+ --driver docker-container"
+        rf' --driver-opt "image={MIRROR}/moby/buildkit{DIGEST}"'
+        rf" --driver-opt default-load=true --buildkitd-config {BUILDKIT_CONFIG} --bootstrap --use"
     ),
 ]
 # The modes of a CloudFormation action that only deploy a stack: the others delete one, or replace
@@ -1871,11 +1887,17 @@ def more_than_publishing(cdk: ModuleType, stack: Any, pipeline: Any) -> None:
     pipeline.stage(ASSET_STAGE).add_action(action)
 
 
-# The emulator and the builder as a project that publishes images installs them, pinned.
+# The emulator and the builder as a project that publishes images installs them, pinned, from the
+# mirror in the deploying account's registry.
 PINNED = "@sha256:" + "0" * 64
 PLUGIN = "$HOME/.docker/cli-plugins/docker-buildx"
 IMAGE_BUILDER = [
-    f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64",
+    (
+        'export RHI_REGISTRY="$(aws sts get-caller-identity --query Account --output text)'
+        '.dkr.ecr.$AWS_REGION.amazonaws.com"'
+    ),
+    'aws ecr get-login-password | docker login --username AWS --password-stdin "$RHI_REGISTRY"',
+    f'docker run --privileged --rm "$RHI_REGISTRY/rhi-mirror/tonistiigi/binfmt:qemu-v10.2.3{PINNED}" --install arm64',
     (
         f'curl -fsSL --create-dirs -o "{PLUGIN}" '
         "https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.linux-amd64"
@@ -1883,10 +1905,17 @@ IMAGE_BUILDER = [
     f'echo "{"0" * 64}  {PLUGIN}" | sha256sum -c -',
     f'chmod +x "{PLUGIN}"',
     (
-        f"docker buildx create --name rhi-assets --driver docker-container --driver-opt image=moby/buildkit{PINNED}"
-        " --driver-opt default-load=true --bootstrap --use"
+        """printf '[registry."%s"]\\n  mirrors = ["%s"]\\n' "$RHI_MIRRORED_REGISTRY" "$RHI_REGISTRY/rhi-mirror\""""
+        " > /tmp/rhi-buildkitd.toml"
+    ),
+    (
+        "docker buildx create --name rhi-assets --driver docker-container"
+        f' --driver-opt "image=$RHI_REGISTRY/rhi-mirror/moby/buildkit{PINNED}"'
+        " --driver-opt default-load=true --buildkitd-config /tmp/rhi-buildkitd.toml --bootstrap --use"
     ),
 ]
+# Where the commands that each case below changes are in that list.
+RUNS_THE_EMULATOR, DOWNLOADS_THE_BUILDER, CONFIGURES_THE_BUILDER, CREATES_THE_BUILDER = 2, 3, 6, 7
 
 
 def a_publisher_that_installs(installs: list[str]) -> Change:
@@ -1928,14 +1957,29 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             id="a project of the asset stage that does more than publish assets",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[0].replace(f":qemu-v10.2.3{PINNED}", ":latest")]),
+            a_publisher_that_installs([IMAGE_BUILDER[RUNS_THE_EMULATOR].replace(f":qemu-v10.2.3{PINNED}", ":latest")]),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that installs an emulator without its digest",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[1].replace("download/v0.38.2", "latest/download")]),
+            a_publisher_that_installs([IMAGE_BUILDER[DOWNLOADS_THE_BUILDER].replace("download/v0.38.2", "latest/download")]),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that downloads the builder without its version",
+        ),
+        pytest.param(
+            a_publisher_that_installs([f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64"]),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that runs the emulator from Docker Hub by its digest",
+        ),
+        pytest.param(
+            a_publisher_that_installs([IMAGE_BUILDER[CREATES_THE_BUILDER].replace("$RHI_REGISTRY/rhi-mirror/", "")]),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that creates its builder from Docker Hub by its digest",
+        ),
+        pytest.param(
+            a_publisher_that_installs([IMAGE_BUILDER[CONFIGURES_THE_BUILDER].replace('"$RHI_REGISTRY', '"example.com')]),
+            [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
+            id="a project of the asset stage that configures a mirror outside the deploying account's registry",
         ),
         pytest.param(a_deletion, [f"Rhi/Delete: {CLOUDFORMATION}"], id="a CloudFormation action that deletes a stack"),
     ],
