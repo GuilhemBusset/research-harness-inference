@@ -1110,37 +1110,79 @@ def test_the_job_does_not_start_without_the_minutes_of_the_run(monkeypatch: pyte
     assert started == []
 
 
-def test_the_job_books_for_the_minutes_it_is_given_under_the_bounds_of_the_configuration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    example = config.load({"RHI_CONFIG": "example"})
-    (mock,) = [pool for pool in example.pools if pool.name == "mock"]
-    asked: dict[str, int] = {}
+@dataclasses.dataclass
+class _Job:
+    """What the job did with its session's work replaced: the spikes it started, the runs that
+    booked a session, and the bounds they were asked to book under."""
+
+    started: list[str] = dataclasses.field(default_factory=list)
+    booked: list[s8.Run] = dataclasses.field(default_factory=list)
+    asked: dict[str, int] = dataclasses.field(default_factory=dict)
+
+
+def _job(monkeypatch: pytest.MonkeyPatch, example: config.Config) -> _Job:
+    job = _Job()
 
     def in_session(self: s8.Run, **bounds: int) -> dict[str, int | float]:
-        asked.update(bounds)
+        job.booked.append(self)
+        job.asked.update(bounds)
         return {}
+
+    def run_spike(spike: object, name: str, measure: Callable[[], object], *, environ: object) -> object:
+        job.started.append(name)
+        return measure()
 
     aws = SimpleNamespace(get_credentials=lambda: None, resource=lambda _: SimpleNamespace(Table=lambda name: name))
     monkeypatch.setattr(s8.config, "read_ssm", lambda: example)
     monkeypatch.setattr(s8.boto3, "Session", lambda: aws)
     monkeypatch.setattr(common, "canary_keys", lambda: SimpleNamespace(students=[generate_key()]))
-    monkeypatch.setattr(common, "run_spike", lambda spike, job, measure, *, environ: measure())
+    monkeypatch.setattr(common, "run_spike", run_spike)
     monkeypatch.setattr(s8.Run, "in_session", in_session)
+    return job
 
-    s8.main(
-        {
-            "RHI_SPIKE_RUN_MINUTES": "75",
-            "RHI_S8_REQUESTS": "5",
-            "RHI_SPIKE_ENDPOINT": "https://gateway.example.com",
-            "RHI_SPIKE_WORKSPACE_URL": "https://workspace.example.com",
-            "RHI_SPIKE_POOL_STATE_TABLE": "pool-state-under-test",
-            "AWS_REGION": "us-east-1",
-        }
-    )
 
-    assert asked == {
+def _environ(endpoint: str) -> dict[str, str]:
+    return {
+        "RHI_SPIKE_RUN_MINUTES": "75",
+        "RHI_S8_REQUESTS": "5",
+        "RHI_SPIKE_ENDPOINT": endpoint,
+        "RHI_SPIKE_WORKSPACE_URL": "https://workspace.example.com",
+        "RHI_SPIKE_POOL_STATE_TABLE": "pool-state-under-test",
+        "AWS_REGION": "us-east-1",
+    }
+
+
+def test_the_job_books_for_the_minutes_it_is_given_under_the_bounds_of_the_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    example = config.load({"RHI_CONFIG": "example"})
+    (mock,) = [pool for pool in example.pools if pool.name == "mock"]
+    job = _job(monkeypatch, example)
+
+    s8.main(_environ("https://gateway.example.com"))
+
+    assert job.asked == {
         "minutes": 75,
         "max_instances": mock.max_instances,
         "session_max_hours": example.session_max_hours,
     }
+
+
+def test_the_job_given_the_gateway_stacks_host_name_reaches_the_gateway_over_https(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = _job(monkeypatch, config.load({"RHI_CONFIG": "example"}))
+
+    s8.main(_environ("gateway.example.com"))
+
+    # A run sends every request to its endpoint (`loadgen.replay`).
+    assert [run.endpoint for run in job.booked] == ["https://gateway.example.com"]
+
+
+def test_the_job_given_an_http_address_starts_nothing_and_books_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    job = _job(monkeypatch, config.load({"RHI_CONFIG": "example"}))
+
+    with pytest.raises(ValueError, match="https"):
+        s8.main(_environ("http://gateway.example.com"))
+
+    assert (job.started, job.booked) == ([], [])
