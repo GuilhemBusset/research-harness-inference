@@ -346,13 +346,21 @@ def test_a_temporary_refusal_is_waited_out_until_the_deadline(
     assert len(stub.statuses) == 1
 
 
-def test_a_rate_limit_reset_that_has_come_is_posted_again_at_once(stub: Stub, client: github.StatusClient) -> None:
+def test_a_retry_after_of_0_or_a_reset_that_has_come_is_posted_again_at_once(
+    stub: Stub, client: github.StatusClient
+) -> None:
     come = (403, {}, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(int(stub.now))})
     stub.queued[STATUS] = [come]
     client.post_status(COMMIT, **POSTED, deadline=stub.now + 0.5)
     assert (len(stub.attempts), stub.sleeps, len(stub.statuses)) == (2, [], 1)
 
-    # Not twice in a row: GitHub is not asked again and again with no wait.
+    # A retry-after of 0 is waited at once each time GitHub gives it.
+    stub.attempts.clear()
+    stub.queued[STATUS] = [(429, {}, {"Retry-After": "0"})] * 2
+    client.post_status(COMMIT, **POSTED, deadline=stub.now + 0.5)
+    assert (len(stub.attempts), stub.sleeps, len(stub.statuses)) == (3, [], 2)
+
+    # A reset that has come, not twice in a row: GitHub is not asked again and again with no wait.
     stub.attempts.clear()
     stub.queued[STATUS] = [come, come]
     client.post_status(COMMIT, **POSTED, deadline=stub.now + 60)

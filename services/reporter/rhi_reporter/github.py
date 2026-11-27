@@ -26,8 +26,9 @@ remain, then a new one is asked for.
 **Temporary refusals.** A call given a deadline, a time on the client's clock, is made again while
 GitHub's answer is one it asks to be waited out: 429, a 403 that carries `retry-after` or an
 `x-ratelimit-remaining` of 0 (a secondary rate limit), a 5xx, or no answer at all. The next attempt
-begins after the seconds `retry-after` gives, else at the time `x-ratelimit-reset` gives, at once
-when that time has come (once in a row: then the doubling wait), else after `FIRST_WAIT_SECONDS`,
+begins after the seconds `retry-after` gives, none when it gives 0, else at the time
+`x-ratelimit-reset` gives, at once when that time has come (once in a row: a time that has come
+again is behind, and the doubling wait follows), else after `FIRST_WAIT_SECONDS`,
 doubled at each attempt up to `LONGEST_WAIT_SECONDS`. GitHub may have taken a status it did not
 answer, or answered with a 5xx: a post given the id the commit's statuses had reached reads them
 before it posts again, and stops when the status is there (`post_status`). Any other refusal,
@@ -167,16 +168,17 @@ def _doubled(attempt: int) -> float:
     return min(FIRST_WAIT_SECONDS * 2 ** (attempt - 1), LONGEST_WAIT_SECONDS)
 
 
-def _wait_of(headers: Message | None, now: float, attempt: int) -> float:
-    """The seconds before the next attempt, the `attempt`-th made again: what `retry-after` gives,
-    else until the time `x-ratelimit-reset` gives, none once it has come, else the doubling wait."""
+def _wait_of(headers: Message | None, now: float, attempt: int) -> tuple[float, bool]:
+    """The seconds before the next attempt, the `attempt`-th made again, and whether they are a
+    reset time that has come: what `retry-after` gives, else until the time `x-ratelimit-reset`
+    gives, none once it has come, else the doubling wait."""
     after = _seconds(headers.get("retry-after")) if headers is not None else None
     if after is not None:
-        return float(after)
+        return float(after), False
     reset = _seconds(headers.get("x-ratelimit-reset")) if headers is not None else None
     if reset is not None:
-        return max(reset - now, 0.0)
-    return _doubled(attempt)
+        return max(reset - now, 0.0), reset <= now
+    return _doubled(attempt), False
 
 
 def _unanswered(status: int | None) -> bool:
@@ -354,9 +356,10 @@ class StatusClient:
         """One call to GitHub's API, made again while GitHub asks to wait and `deadline` allows
         (the module's docstring). Returns the status, the JSON and the headers of an accepted call,
         or of the last attempt when, after one GitHub may have taken (`_unanswered`), `taken` says
-        it did. A wait of none is made once in a row: the next is the doubling wait."""
+        it did. A reset time that has come is waited at once only once in a row: the next is the
+        doubling wait. A `retry-after` of 0 is waited at once each time GitHub gives it."""
         attempt = 0
-        at_once = False
+        came = False
         while True:
             if deadline is not None and self._clock() > deadline:
                 raise RefusedError(None, None)
@@ -368,10 +371,10 @@ class StatusClient:
                 raise refused
             attempt += 1
             now = self._clock()
-            wait = _wait_of(headers, now, attempt)
-            if wait <= 0 and at_once:
+            wait, come = _wait_of(headers, now, attempt)
+            if come and came:
                 wait = _doubled(attempt)
-            at_once = wait <= 0
+            came = come
             if now + wait > deadline:
                 raise refused
             if wait > 0:

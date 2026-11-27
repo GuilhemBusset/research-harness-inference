@@ -1043,7 +1043,9 @@ def test_a_measurement_invoked_again_completes_the_posting_cut_short(stub: Stub)
     with pytest.raises(handler.NotAllPostedError):
         run([event], stub, first)
 
-    again = Client(held=as_held(first.posted))
+    # GitHub lists one of them on two pages, as when the commit took another status between reads.
+    held = as_held(first.posted)
+    again = Client(held=[*held[:20], held[19], *held[20:]])
     run([event], stub, again)
     assert parts(again) == list(range(43, 62))
     # Each part is posted as one the commit must not hold twice: none newer than its statuses.

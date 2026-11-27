@@ -70,7 +70,8 @@ def test_the_rebuilt_entry_is_the_event_the_job_sent_and_completes_its_posting(
     assert len(parts) > 3
     held = listed(parts[:-2])
 
-    code, out, err = entries(printed(runs, tmp_path), held, monkeypatch, capsys)
+    # GitHub lists one of them on two pages, as when the commit took another status between reads.
+    code, out, err = entries(printed(runs, tmp_path), [*held[:3], held[2], *held[3:]], monkeypatch, capsys)
     assert code == 0
     (rebuilt,) = json.loads(out)
     assert (rebuilt["Source"], rebuilt["DetailType"], rebuilt["EventBusName"]) == (

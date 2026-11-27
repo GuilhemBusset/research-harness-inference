@@ -275,13 +275,19 @@ def newest_posting(listed: Iterable[Mapping[str, object]], measurement: str, lab
     of `measurement` among `listed`, a commit's statuses as GitHub lists them, each with its `id`,
     `context`, `state` and `description`: the label's newest status of part 1, by GitHub's id, which
     grows with each status it takes, and each status of another part with a greater id, in the
-    order of their ids. Empty when the label has no part 1. A status without an id is passed over."""
+    order of their ids. Empty when the label has no part 1. A status without an id is passed over,
+    and one listed again with the same id, as on two pages read while the commit took another
+    status, is counted once."""
     held: list[tuple[int, int, str, str]] = []
+    seen: set[int] = set()
     for status in listed:
         number, context, state = status.get("id"), status.get("context"), status.get("state")
         description = status.get("description") or ""
         if type(number) is not int or not isinstance(context, str) or not isinstance(state, str):
             continue
+        if number in seen:
+            continue
+        seen.add(number)
         try:
             of_measurement, of_label, part = context_parts(context)
         except ValueError:
