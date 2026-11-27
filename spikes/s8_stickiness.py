@@ -117,7 +117,7 @@ its numbers with no verdict (`Verdict.NOT_MEASURED`, the state error).
 
 | Variable | What it is |
 | --- | --- |
-| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output |
+| `RHI_SPIKE_ENDPOINT` | The gateway's address, the gateway stack's output: a host name, reached over HTTPS (`common.gateway_address`) |
 | `RHI_SPIKE_WORKSPACE_URL` | The Prometheus workspace's query address, the observability stack's output |
 | `RHI_SPIKE_POOL_STATE_TABLE` | The name of the stage's pool-state table, the pools stack's output |
 | `RHI_S8_REQUESTS` | The requests each student sends in each phase, one after another |
@@ -967,8 +967,10 @@ class Run:
 
 def main(environ: Mapping[str, str] = os.environ) -> Verdict:
     """Runs the spike with the job's environment and credentials, and posts its numbers. ValueError,
-    with nothing booked, sent or posted, without the minutes of `RHI_SPIKE_RUN_MINUTES`."""
+    with nothing booked, sent or posted, without the minutes of `RHI_SPIKE_RUN_MINUTES`, or when
+    `RHI_SPIKE_ENDPOINT` is neither a host name nor an https address (`common.gateway_address`)."""
     minutes = common.needs_of(environ).run_minutes
+    endpoint = common.gateway_address(environ.get(ENDPOINT_VARIABLE, ""))
 
     def measure() -> dict[str, int | float]:
         name = environ.get(POOL_VARIABLE, DEFAULT_POOL)
@@ -981,7 +983,7 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
         if requests < 1:
             raise ValueError("each student sends one request or more")
         keys = common.canary_keys().students
-        run = Run(Pool(name, workspace, table), environ[ENDPOINT_VARIABLE], keys, requests, pool.target_concurrency)
+        run = Run(Pool(name, workspace, table), endpoint, keys, requests, pool.target_concurrency)
         return run.in_session(
             minutes=minutes, max_instances=pool.max_instances, session_max_hours=deployed.session_max_hours
         )
