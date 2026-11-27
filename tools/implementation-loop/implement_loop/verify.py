@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -155,6 +156,11 @@ def unconditional_failures(root: Path, files: list[str]) -> list[str]:
 
 PLUGIN = "implement_loop.loop_pytest"
 ENGINE_DIR = Path(__file__).resolve().parent.parent   # what PYTHONPATH needs for PLUGIN
+# How the name of a copy of the plugin begins: a top-level module alone in a directory of its own
+# (`run_check`'s `plugin_copy`), which the second run of a reproduction loads (`Engine._reproduction`).
+# That directory exposes no `implement_loop` package, to the command or to a process it starts, and
+# the rest of the name is drawn for each run, so no module written before the run can stand in for it.
+PLUGIN_COPY_PREFIX = "implement_loop_result_plugin_"
 # outcome -> what it means for a check; a worse outcome of the same test wins (as in loop_pytest)
 OUTCOMES = {"passed": "passed", "xfailed": "skipped", "skipped": "skipped", "xpassed": "failed",
             "failed": "failed", "error": "failed"}
@@ -240,14 +246,16 @@ def _pytest_said(output: str, status: int | None) -> str:
     return ""
 
 
-def _notes(cases: dict | None, output: str) -> list[str]:
-    """Why the pytest runs of a command do not prove anything, in words."""
-    if cases is None:
-        if f'Error importing plugin "{PLUGIN}"' in output:
-            return [("pytest could not load the verifier's result plugin; if the command sets PYTHONPATH, "
-                     "extend it (PYTHONPATH=src:$PYTHONPATH) instead of replacing it")]
-        return []
+def _notes(cases: dict | None, output: str, plugin: str = PLUGIN) -> list[str]:
+    """Why the pytest runs of a command do not prove anything, in words. A pytest that could not
+    load the run's result plugin (`plugin`) ran unaccounted, whatever records the others left and
+    whatever the command made of its exit status."""
     notes = []
+    if f'Error importing plugin "{plugin}"' in output:
+        notes.append("pytest could not load the verifier's result plugin; if the command sets PYTHONPATH, "
+                     "extend it (PYTHONPATH=src:$PYTHONPATH) instead of replacing it")
+    if cases is None:
+        return notes
     if cases["failed"]:
         notes.append(f"failed tests: {cases['failed'][:5]}")
     if cases["skipped"]:
@@ -266,6 +274,34 @@ def _notes(cases: dict | None, output: str) -> list[str]:
     return notes + stopped
 
 
+def _recorder(name: str) -> bool:
+    """Whether a plugin name is one a verifier loads its result plugin by: PLUGIN, or a copy."""
+    return name == PLUGIN or name.startswith(PLUGIN_COPY_PREFIX)
+
+
+def without_plugin(addopts: str) -> str:
+    """`addopts` (a PYTEST_ADDOPTS value) without the options that load a verifier's result plugin
+    (PLUGIN or a copy of it), read as pytest reads them: split as a shell would, `-p` taking the
+    next word, `-pNAME` joined, the name stripped. Every other word is kept as it was; a value with
+    nothing to remove, or one pytest could not split either, is returned as written."""
+    try:
+        words = shlex.split(addopts)
+    except ValueError:
+        return addopts
+    kept: list[str] = []
+    rest = iter(words)
+    for word in rest:
+        if word == "-p":
+            name = next(rest, None)
+            if name is None:
+                kept.append(word)
+            elif not _recorder(name.strip()):
+                kept += [word, name]
+        elif not (word.startswith("-p") and _recorder(word[2:].strip())):
+            kept.append(word)
+    return addopts if kept == words else shlex.join(kept)
+
+
 CREDENTIAL_VARS = sandbox.GITHUB_VARS
 
 
@@ -277,8 +313,8 @@ def scrubbed_env(env: dict[str, str], work_dir: Path) -> dict[str, str]:
 
 
 def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, default_timeout: int = 900,
-              extra_env: dict[str, str] | None = None,
-              mounts: sandbox.Mounts | None = None) -> tuple[Evidence, dict | None]:
+              extra_env: dict[str, str] | None = None, mounts: sandbox.Mounts | None = None,
+              plugin_copy: Path | None = None) -> tuple[Evidence, dict | None]:
     """Run one check command. Returns its evidence, and what its pytest processes reported:
     `{"passed", "failed", "skipped", "collected": [ids], "processes": n, "bad_exit": [status]}`
     (failed includes errors and xpasses, skipped includes xfails), or None when no pytest ran.
@@ -286,6 +322,11 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
     The command runs in the sandbox. `mounts` is what the engine lets it see of the tree under
     judgement and its git (default: `root`, read-write); the verifier's plugin, the record
     directory and the run's package caches are added here.
+
+    With `plugin_copy`, a copy of the plugin alone in its directory, as a top-level module whose
+    name begins with `PLUGIN_COPY_PREFIX`, pytest loads the plugin by that module's name instead,
+    and the directory comes after the engine's on PYTHONPATH and is added to what the command may
+    read.
 
     The command passes when it exits 0, no test failed, erred, xpassed, xfailed or was skipped,
     and, if pytest ran at all, at least one test ran and every pytest ended with a test result
@@ -306,8 +347,13 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
     env.pop("LOOP_PYTEST_PID", None)   # a verification is never nested in an outer one's pytest
     env["LOOP_REPORT_DIR"] = str(report_dir)
     env["LOOP_REPO_ROOT"] = str(Path(root).resolve())
-    env["PYTEST_ADDOPTS"] = (env.get("PYTEST_ADDOPTS", "") + f" -p {PLUGIN} -p no:cacheprovider").strip()
-    env["PYTHONPATH"] = os.pathsep.join([str(ENGINE_DIR)] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    # This run's recorder alone: a verifier run under another's pytest (the engine's own tests, run
+    # as a check) inherits that verifier's `-p` of its own, which this command may not reach.
+    plugin = plugin_copy.stem if plugin_copy is not None else PLUGIN
+    env["PYTEST_ADDOPTS"] = (without_plugin(env.get("PYTEST_ADDOPTS", "")) + f" -p {plugin} -p no:cacheprovider").strip()
+    plugin_dirs = [ENGINE_DIR, *([plugin_copy.parent] if plugin_copy is not None else [])]
+    path = [str(d) for d in plugin_dirs] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else [])
+    env["PYTHONPATH"] = os.pathsep.join(path)
     cwd = root / spec.cwd
     timeout = spec.timeout_s or default_timeout
     start = time.monotonic()
@@ -324,13 +370,13 @@ def run_check(root: Path, spec: CheckSpec, head_sha: str, work_dir: Path, defaul
         notes.append(output)
     else:
         box = (mounts if mounts is not None else sandbox.Mounts(writable=(Path(root),))).plus(
-            readable=[ENGINE_DIR], writable=[report_dir, *sandbox.cache_dirs(extra_env)])
+            readable=plugin_dirs, writable=[report_dir, *sandbox.cache_dirs(extra_env)])
         code, output, timed_out = _run(spec.command, cwd, timeout, env, box)
         if timed_out:
             notes.append(f"timed out after {timeout} s")
     duration = round(time.monotonic() - start, 2)
     cases = _read_records(report_dir)
-    notes += _notes(cases, output)
+    notes += _notes(cases, output, plugin)
     ev = Evidence(criterion=spec.criterion, kind="command", command=spec.command, cwd=spec.cwd, head_sha=head_sha,
                   exit_code=code, passed=code == 0 and not notes, duration_s=duration,
                   output_tail=output[-OUTPUT_TAIL:], output_sha256=hashlib.sha256(output.encode()).hexdigest(),

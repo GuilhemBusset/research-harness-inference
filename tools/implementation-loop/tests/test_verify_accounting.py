@@ -42,7 +42,8 @@ class PluginRecordTests(TempTree):
 
     def pytest(self, *args: str, cwd: Path | None = None, env: dict | None = None) -> list[dict]:
         reports = self.root / ".reports"
-        base = {k: v for k, v in os.environ.items() if not k.startswith("LOOP_")}
+        # Its own plugin alone: a verifier this suite runs under gives its own through PYTEST_ADDOPTS.
+        base = {k: v for k, v in os.environ.items() if not k.startswith("LOOP_") and k != "PYTEST_ADDOPTS"}
         base |= {"LOOP_REPORT_DIR": str(reports), "LOOP_REPO_ROOT": str(self.root), "PYTHONPATH": PLUGIN_PATH}
         subprocess.run([PY, "-m", "pytest", "-p", "implement_loop.loop_pytest", "-p", "no:cacheprovider", *args],
                        cwd=cwd or self.root, env=base | (env or {}), capture_output=True, text=True, check=False)
@@ -130,7 +131,7 @@ class PluginRecordTests(TempTree):
     def test_without_its_environment_the_plugin_does_nothing(self):
         self.write("tests/test_a.py", "def test_a():\n    pass\n")
         reports = self.root / ".reports"
-        env = {k: v for k, v in os.environ.items() if not k.startswith("LOOP_")} | {"PYTHONPATH": PLUGIN_PATH}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("LOOP_") and k != "PYTEST_ADDOPTS"} | {"PYTHONPATH": PLUGIN_PATH}
         proc = subprocess.run([PY, "-m", "pytest", "-p", "implement_loop.loop_pytest", "tests/test_a.py"],
                               cwd=self.root, env=env, capture_output=True, text=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -148,6 +149,15 @@ class RunCheckTests(TempTree):
         self.assertEqual(cases["passed"], ["tests/test_a.py::test_a", "tests/test_b.py::test_b"])
         self.assertEqual(sorted(cases["collected"]), ["tests/test_a.py::test_a", "tests/test_b.py::test_b"])
         self.assertEqual(ev.tests, {"passed": 2, "failed": 0, "skipped": 0})
+
+    def test_a_pytest_that_cannot_load_the_plugin_fails_the_check_beside_one_that_recorded(self):
+        """Its tests ran unaccounted, whatever the command made of its exit status."""
+        self.write("tests/test_a.py", "def test_a():\n    pass\n")
+        self.write("tests/test_b.py", "def test_b():\n    pass\n")
+        ev, cases = self.check(f"{PY} -m pytest -q tests/test_a.py && (PYTHONPATH=src {PY} -m pytest -q tests/test_b.py || true)")
+        self.assertEqual((ev.exit_code, cases["passed"], cases["processes"]), (0, ["tests/test_a.py::test_a"], 1))
+        self.assertFalse(ev.passed)
+        self.assertIn("pytest could not load the verifier's result plugin", ev.note)
 
     def test_a_failure_in_the_first_of_two_runs_is_not_lost(self):
         self.write("tests/test_a.py", "def test_a():\n    assert False\n")
