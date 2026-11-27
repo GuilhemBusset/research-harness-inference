@@ -26,7 +26,6 @@ root = [
     "tools/advisories",
     # `tools` itself, for the one tool that is a package: `evaluate` (tools/evaluate/__init__.py).
     "tools",
-    "tests/examiner",
     "tests/replay",
     "tests/unit/spikes",
     "src",
@@ -48,8 +47,8 @@ root = [
 # What is checked: the tools, the app's entry point (app.py, which arrives with the CDK app), the
 # roots above and the tests.
 include = [
-    "tools/implementation-loop", "tools/hygiene", "tools/backlog", "tools/measurements",
-    "tools/advisories", "tools/evaluate",
+    # Every tool, the engine among them, by its folder.
+    "tools",
     "app.py",
     "src",
     "services/common",

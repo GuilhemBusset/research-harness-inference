@@ -118,22 +118,22 @@ spikes = [
 [tool.uv]
 package = false
 
-# `uv run pytest` runs these. The implement loop's tests have their own command and their own
-# Python (scripts/check.sh engine-tests), so they are not listed here.
+# `uv run pytest` runs these: every tool's tests, found by folder so a new tool needs no edit here,
+# and the product's tests.
 #
-# tests/container/ is left out: its tests start a container, and the host of the coding agents
-# has no container runtime (tests/container/README.md). `norecursedirs` keeps a run that names no
-# path, such as scripts/check.sh tests, from entering the folder; a run that names the folder, as
-# scripts/check.sh container-tests does, still collects it. The other entries are pytest's own
-# defaults, which a value here replaces.
+# `norecursedirs` keeps a run that names no path, such as scripts/check.sh tests, out of two
+# folders; a run that names the folder still collects it, because pytest applies the list only to
+# the folders it recurses into:
+# - tools/implementation-loop: the implement loop's tests have their own command and their own
+#   Python (scripts/check.sh engine-tests);
+# - tests/container: its tests start a container, and the host of the coding agents has no
+#   container runtime (tests/container/README.md); scripts/check.sh container-tests runs them.
+# The other entries are pytest's own defaults, which a value here replaces.
 [tool.pytest.ini_options]
-testpaths = [
-    "tools/hygiene/tests", "tools/backlog/tests", "tools/measurements/tests",
-    "tools/advisories/tests", "tools/evaluate/tests", "tests",
-]
+testpaths = ["tools", "tests"]
 norecursedirs = [
     "*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}",
-    "tests/container",
+    "tools/implementation-loop", "tests/container",
 ]
 # A test module is imported under a name made from its path, not its bare file name, so two test
 # files of one name in different folders (tests/synth/test_pipeline.py and
@@ -161,10 +161,8 @@ pythonpath = [
     "spikes",
     # Not roots of the layout. The implement loop's tests (scripts/check.sh engine-tests) read
     # this configuration too, and import their helpers and each other by bare name, which the
-    # default import mode allowed by putting each test file's folder on the path. The examiner's
-    # probes of the engine, in tests/examiner, import each other the same way.
+    # default import mode allowed by putting each test file's folder on the path.
     "tools/implementation-loop/tests",
-    "tests/examiner",
     # The replay harness and the capture scrubber, which the replay tests import by name
     # (tests/captures/README.md).
     "tests/replay",
