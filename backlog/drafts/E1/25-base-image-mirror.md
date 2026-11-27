@@ -57,8 +57,10 @@ new pin, and in this step, never in the stage Assets once E1-26 is merged. Docke
 anonymous pulls per address by the hour, and a first fill reads every platform's manifest of four
 images, so the first runs of the step may be refused before the mirror holds them all. The step
 copies image by image, keeps what it copied, and fails only after trying every image: a retried
-execution copies what is left. Whether that residual read is acceptable, against "no Docker Hub at
-build time", is the owner's decision (last acceptance item).
+execution copies what is left. Decided by the orchestrator on 2026-11-27: the step Mirror reads
+Docker Hub anonymously, once for each pin the mirror lacks, in the stage Build only, which is what
+filling a mirror means and keeps Docker Hub out of every ordinary build; the owner reverses it by
+editing this issue.
 
 **A new image.** The stage Build runs before the self-update that creates a new image's
 repository. The step leaves an image whose repository does not exist yet for a later execution,
@@ -101,8 +103,6 @@ Suggested branch: `feat/base-image-mirror`
 - [ ] `uv run --locked pytest tests/unit/test_mirror_images.py tests/synth/test_pipeline_mirror.py tests/synth/test_pipeline.py tests/policy/test_pipeline.py tests/policy/test_acknowledged.py` passes.
 - [ ] `scripts/check.sh fast` exits 0.
 - [ ] The first execution that runs the step Mirror passes its stage Build, once retried if Docker Hub refused a copy, and the five repositories then hold the digests the source pins (needs aws:deployed-environment).
-- [ ] The owner accepts that the step Mirror reads Docker Hub anonymously, once for each pin the mirror lacks, in the stage Build, since no Docker Hub credential is assumed (needs human:owner-decision).
-
 ## References
 
 - `docs/design/system-design.md`, sections 8.2 (steps 2 and 4), 9 and 17 (the cooling-off)
