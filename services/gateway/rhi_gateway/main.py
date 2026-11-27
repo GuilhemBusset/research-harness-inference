@@ -155,7 +155,8 @@ def build(
         return profile.rewrites(profiles, route)
 
     filters: dict[routes.Route, Filter] = {
-        # Both Messages routes replace the blocks no engine here can serve, so a count counts what is read.
+        # Both Messages routes replace the blocks no engine here can serve, so a count counts what is
+        # read, and refuse a request that declares one of Anthropic's own tools.
         routes.MESSAGES: BodyFilter(
             messages.MESSAGES,
             pools,
