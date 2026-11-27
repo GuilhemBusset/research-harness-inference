@@ -826,7 +826,7 @@ Students install the CLI with one `uv tool install` command from this repository
 
 ### 8.2 Pipeline
 
-CDK Pipelines on CodePipeline V2, queued execution `[E20]`.
+CDK Pipelines on CodePipeline V2, superseded execution `[E20]`. A stage holds one execution at a time. An execution that waits in front of a stage while another holds it is overtaken by a newer one that reaches the same point: the waiting one ends `Superseded`, and the newer one deploys a commit of `main` that holds it. An execution is never superseded inside a stage, so an execution in the deployment hold of the stage `Rhi` deploys its own commit once the session ends; the merges that gather in front of `Rhi` meanwhile end with one execution, the newest, which deploys its commit and the configuration SSM holds. A failed deployment therefore names a batch of commits, its own and those it covers. Queued mode was dropped: an execution stopped by hand, to let a newer one through, left its commit pending for good `[E20]`.
 
 1. **Source.** GitHub through a CodeConnections connection created by the pipeline stack. It starts pending; the owner authorizes it once, for this repository only. Push to `main` only.
 2. **Synth.** CodeBuild: `uv sync --locked`, read configuration from SSM into an untracked file, `cdk synth --lookups=false`, tests. cdk-nag's AWS Solutions pack runs inside synth as a policy-validation plugin and fails the build on a finding `[E20]`. The synth role can read the configuration path and nothing else. This step also greps the source tree for the real configuration values, the one place that knows them, and alerts if any is present.
@@ -861,7 +861,7 @@ ty is beta and changes diagnostics between releases `[E20]`. It is pinned exactl
 
 - The public status carries a state, a fixed context, and a description chosen from an enumerated set. It never carries text from AWS: error messages contain bucket names, addresses and resource IDs that no deny-list reliably catches.
 - A structured report accompanies a failure, as further commit statuses on the same commit, one per fact. Each is assembled only from allow-listed parts: the stage and action that failed, the logical IDs of failed resources (checked against the names in that commit's own synthesized template), CloudFormation's status codes, the IDs of failed smoke tests, and the last lifecycle stage an instance reached. Enumerations and names from this repository only: no free text, and no commit comment.
-- A pipeline's self-update can cancel executions still queued `[E20]`. The reporter marks such a commit as superseded and names the commit whose execution covers it, so every merge ends with a verdict.
+- A commit's execution can end without deploying it: superseded, when a newer execution overtakes it while it waits between stages, or cancelled, with every pending one, when the pipeline updates itself `[E20]`. The reporter marks such a commit as superseded and names the commit whose execution covers it, the earliest later one that did not end so, and gives it that execution's verdict once it ends, so every merge ends with a verdict.
 - Spikes and canaries post their numeric results the same way, and a housekeeping change records them under `docs/measurements/`.
 - Anything beyond that goes to the owner by SNS. Some failures in phases 1 and 2 will therefore need the owner to relay a diagnosis; the design does not pretend otherwise.
 - The reporting Lambda's credential is a GitHub App installation that can write commit statuses on this repository and nothing else.

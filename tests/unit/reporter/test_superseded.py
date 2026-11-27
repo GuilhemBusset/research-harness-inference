@@ -1,11 +1,17 @@
-"""Commits that a self-update of the pipeline left without an execution end with the verdict of the
-execution that covers them (system design, section 8.4; evidence E20).
+"""Commits whose execution did not deploy them end with the verdict of the execution that covers
+them (system design, section 8.4; evidence E20).
 
-The pipeline runs queued, one execution per commit. `Pipeline` simulates it, as CodePipeline's API
-shows it, and hands every event to the reporter's function in the order it happens: a push queues
-an execution of its commit; the first queued execution runs; one that updates the pipeline ends
-superseded, cancels every execution still queued, and the pipeline restarts on the latest commit.
-The commits are made here.
+Two simulations, as CodePipeline's API shows them, hand every event to the reporter's function in
+the order it happens. The commits are made here.
+
+- `Pipeline`, in queued mode: a push queues an execution of its commit; the first queued execution
+  runs; one that updates the pipeline ends superseded, cancels every execution still queued, and
+  the pipeline restarts on the latest commit.
+- `SupersededPipeline`, in superseded mode, the pipeline's: a push's execution passes the stages
+  before `Rhi` and enters it when it is free, or waits in front of it, and a push while one waits
+  there ends the waiting one superseded; a run is that of the execution in `Rhi`, after which the
+  waiting one enters. A push whose execution updates the pipeline ends superseded and cancels the
+  execution in `Rhi` and the waiting one; the pipeline starts nothing until the next push.
 """
 
 from __future__ import annotations
@@ -36,6 +42,8 @@ SUCCEEDS, FAILS_TO_DEPLOY, FAILS_TO_VERIFY, IS_STOPPED, UPDATES_THE_PIPELINE = (
 )
 RUNS = (SUCCEEDS, FAILS_TO_DEPLOY, FAILS_TO_VERIFY, IS_STOPPED, UPDATES_THE_PIPELINE)
 PUSH = "push"
+# The statuses of an execution that ended without deploying its commit.
+SUPERSEDED = ("Cancelled", "Superseded")
 
 
 class Client:
@@ -89,22 +97,31 @@ class Pipeline:
             self.queue.append(self._execution(self.commits[-1]))
             return execution
         self._stage(execution, "InProgress", "STARTED")
+        self._deploy(execution, outcome)
+        return execution
+
+    def settle(self) -> None:
+        """Runs, to success, what the pipeline still has to run."""
+        while self.queue:
+            self.run(SUCCEEDS)
+
+    def _deploy(self, execution: str, outcome: str) -> None:
+        """Runs the stage `Rhi` of an execution that has entered it to its end."""
         if outcome == FAILS_TO_DEPLOY:
             self._action(execution, "Network.Deploy", "Failed", "FAILED")
             self._stage(execution, "Failed", "FAILED")
             self._end(execution, "Failed", "FAILED")
-            return execution
+            return
         if outcome == IS_STOPPED:
             self._stage(execution, "Stopped", "STOPPED")
             self._end(execution, "Stopped", "STOPPED")
-            return execution
+            return
         self._action(execution, "Network.Deploy", "Succeeded", "SUCCEEDED")
         self._event("Action", execution, stage=STAGE, action="Verify", state="STARTED")
         verified = outcome == SUCCEEDS
         self._action(execution, "Verify", *(("Succeeded", "SUCCEEDED") if verified else ("Failed", "FAILED")))
         self._stage(execution, *(("Succeeded", "SUCCEEDED") if verified else ("Failed", "FAILED")))
         self._end(execution, *(("Succeeded", "SUCCEEDED") if verified else ("Failed", "FAILED")))
-        return execution
 
     def _execution(self, commit: str) -> str:
         execution = f"execution-{len(self.executions)}"
@@ -174,29 +191,98 @@ class Pipeline:
         return {"StackEvents": []}
 
 
+class SupersededPipeline(Pipeline):
+    """The same pipeline in superseded mode. The stages before `Rhi` take no time; `Rhi` holds one
+    execution at a time, `active`, which waits in the hold until it runs, and one more may wait in
+    front of it, `waiting`."""
+
+    def __init__(self, client: Client) -> None:
+        super().__init__(client)
+        self.active: str | None = None
+        self.waiting: str | None = None
+        # The executions a newer one overtook while they waited.
+        self.overtaken: list[str] = []
+
+    def push(self) -> str:
+        commit = secrets.token_hex(20)
+        self.commits.append(commit)
+        execution = self._execution(commit)
+        self._event("Pipeline", execution, state="STARTED")
+        if self.active is None:
+            self.active = execution
+            self._stage(execution, "InProgress", "STARTED")
+        else:
+            overtaken, self.waiting = self.waiting, execution
+            if overtaken is not None:
+                self.overtaken.append(overtaken)
+                self.cancelled.append(overtaken)
+                self._end(overtaken, "Superseded", "SUPERSEDED")
+        return commit
+
+    def run(self, outcome: str) -> str:
+        """Runs the execution in `Rhi` to its end; the waiting one then enters `Rhi`. A run that
+        updates the pipeline is a push whose execution updates it at the self-update."""
+        if outcome == UPDATES_THE_PIPELINE:
+            commit = secrets.token_hex(20)
+            self.commits.append(commit)
+            execution = self._execution(commit)
+            self._event("Pipeline", execution, state="STARTED")
+            self._event("Action", execution, stage="UpdatePipeline", action="SelfMutate", state="SUCCEEDED")
+            self._end(execution, "Superseded", "SUPERSEDED")
+            self.cancelled.append(execution)
+            if self.active is not None:
+                # Its running action, the hold, ends first.
+                self._stage(self.active, "Cancelled", "CANCELED")
+            for other in (self.active, self.waiting):
+                if other is not None:
+                    self.cancelled.append(other)
+                    self._end(other, "Cancelled", "CANCELED")
+            self.active = self.waiting = None
+            return execution
+        execution = self.active
+        assert execution is not None
+        self._deploy(execution, outcome)
+        self.active, self.waiting = self.waiting, None
+        if self.active is not None:
+            self._stage(self.active, "InProgress", "STARTED")
+        return execution
+
+    def settle(self) -> None:
+        """Runs, to success, what is in `Rhi` or waits for it. When the newest execution was
+        cancelled or superseded, the next merge's execution covers it."""
+        while self.active is not None:
+            self.run(SUCCEEDS)
+        newest = max(self.executions.values(), key=lambda record: record["started"], default=None)
+        if newest is not None and newest["status"] in SUPERSEDED:
+            self.push()
+            while self.active is not None:
+                self.run(SUCCEEDS)
+
+
+MODES = {"queued": Pipeline, "superseded": SupersededPipeline}
+
+
 @pytest.fixture(autouse=True)
 def secret(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(SECRET_VARIABLE, SECRET)
 
 
-@pytest.mark.parametrize(
-    ("outcome", "expected"),
-    [
-        (SUCCEEDS, {DEPLOY: ("success", Description.DEPLOYED), VERIFY: ("success", Description.VERIFIED)}),
-        (
-            FAILS_TO_VERIFY,
-            {DEPLOY: ("failure", Description.DEPLOYMENT_FAILED), VERIFY: ("failure", Description.VERIFICATION_FAILED)},
-        ),
-        # No verification ran: the verification's context gets the execution's state, and claims none.
-        (
-            FAILS_TO_DEPLOY,
-            {DEPLOY: ("failure", Description.DEPLOYMENT_FAILED), VERIFY: ("failure", Description.DEPLOYMENT_FAILED)},
-        ),
-    ],
-)
-def test_the_cancelled_commits_end_with_the_state_of_the_execution_that_covered_them(
-    outcome: str, expected: dict[str, tuple[str, str]]
-) -> None:
+VERDICTS = {
+    SUCCEEDS: {DEPLOY: ("success", Description.DEPLOYED), VERIFY: ("success", Description.VERIFIED)},
+    FAILS_TO_VERIFY: {
+        DEPLOY: ("failure", Description.DEPLOYMENT_FAILED),
+        VERIFY: ("failure", Description.VERIFICATION_FAILED),
+    },
+    # No verification ran: the verification's context gets the execution's state, and claims none.
+    FAILS_TO_DEPLOY: {
+        DEPLOY: ("failure", Description.DEPLOYMENT_FAILED),
+        VERIFY: ("failure", Description.DEPLOYMENT_FAILED),
+    },
+}
+
+
+@pytest.mark.parametrize("outcome", VERDICTS)
+def test_the_cancelled_commits_end_with_the_state_of_the_execution_that_covered_them(outcome: str) -> None:
     client = Client()
     pipeline = Pipeline(client)
     first, second, third = pipeline.push(), pipeline.push(), pipeline.push()
@@ -216,23 +302,56 @@ def test_the_cancelled_commits_end_with_the_state_of_the_execution_that_covered_
 
     pipeline.run(outcome)
     for commit in (first, second, third):
-        for context, verdict in expected.items():
+        for context, verdict in VERDICTS[outcome].items():
             assert client.last(commit, context) == verdict
     # Every pending status of a cancelled commit named the covering commit.
     superseded = {text for sha, state, _, text in client.posted if sha == second and state == "pending"}
     assert superseded == {superseded_description(third)}
 
 
-def sequences(length: int) -> list[tuple[str, ...]]:
+@pytest.mark.parametrize("outcome", VERDICTS)
+def test_a_commit_overtaken_while_it_waited_ends_with_the_state_of_the_execution_that_overtook_it(
+    outcome: str,
+) -> None:
+    client = Client()
+    pipeline = SupersededPipeline(client)
+    pipeline.push()
+    waited = pipeline.push()
+    newer = pipeline.push()
+    # The second push's execution waited in front of Rhi: the third overtook it.
+    (overtaken,) = pipeline.overtaken
+    assert pipeline.executions[overtaken]["commit"] == waited
+    assert pipeline.executions[overtaken]["status"] == "Superseded"
+    # While the execution that overtook it waits and runs, the commit is pending and names its commit.
+    pending = ("pending", superseded_description(newer))
+    assert client.last(waited, DEPLOY) == client.last(waited, VERIFY) == pending
+    pipeline.run(SUCCEEDS)
+    assert client.last(waited, DEPLOY) == client.last(waited, VERIFY) == pending
+
+    pipeline.run(outcome)
+    for context, verdict in VERDICTS[outcome].items():
+        assert client.last(waited, context) == verdict
+    # The overtaken commit's states are those of the execution that overtook it. A deployment that
+    # failed ran no verification: the overtaken commit's verify/Rhi takes that execution's failure.
+    assert client.last(waited, DEPLOY) == client.last(newer, DEPLOY)
+    if outcome != FAILS_TO_DEPLOY:
+        assert client.last(waited, VERIFY) == client.last(newer, VERIFY)
+
+
+def sequences(length: int, mode: str = "queued") -> list[tuple[str, ...]]:
     """Every sequence of pushes and runs of at most `length` steps, in which a run always has an
-    execution to run."""
+    execution to run: in queued mode one that is queued, in superseded mode one in `Rhi`, except
+    a run that updates the pipeline, which brings its own."""
     found = []
     for size in range(1, length + 1):
         for steps in itertools.product((PUSH, *RUNS), repeat=size):
+            # Queued mode: the executions queued. Superseded mode: those in and in front of Rhi.
             queued, valid = 0, True
             for step in steps:
                 if step == PUSH:
-                    queued += 1
+                    queued = queued + 1 if mode == "queued" else min(queued + 1, 2)
+                elif step == UPDATES_THE_PIPELINE and mode == "superseded":
+                    queued = 0
                 elif queued == 0:
                     valid = False
                     break
@@ -244,24 +363,49 @@ def sequences(length: int) -> list[tuple[str, ...]]:
     return found
 
 
-def test_every_commit_ends_with_a_verdict() -> None:
-    generated = sequences(6)
+def uncovered(pipeline: Pipeline) -> list[str]:
+    """The commits of the executions that ended cancelled or superseded and that no later
+    execution covers yet."""
+    ordered = sorted(pipeline.executions.values(), key=lambda record: record["started"])
+    return [
+        record["commit"]
+        for position, record in enumerate(ordered)
+        if record["status"] in SUPERSEDED and all(later["status"] in SUPERSEDED for later in ordered[position + 1 :])
+    ]
+
+
+def play(mode: str, steps: tuple[str, ...]) -> tuple[Client, Pipeline]:
+    client = Client()
+    pipeline = MODES[mode](client)
+    for step in steps:
+        if step == PUSH:
+            pipeline.push()
+        else:
+            pipeline.run(step)
+    return client, pipeline
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_every_commit_ends_with_a_verdict(mode: str) -> None:
+    generated = sequences(6, mode)
     assert any(steps.count(UPDATES_THE_PIPELINE) >= 2 for steps in generated)
+    overtaken = 0
     for steps in generated:
-        client = Client()
-        pipeline = Pipeline(client)
-        for step in steps:
-            if step == PUSH:
-                pipeline.push()
-            else:
-                pipeline.run(step)
-        # The pipeline runs what is still queued.
-        while pipeline.queue:
-            pipeline.run(SUCCEEDS)
+        client, pipeline = play(mode, steps)
+        overtaken += len(getattr(pipeline, "overtaken", []))
+        # A commit whose execution did not deploy it has no verdict before one covers it.
+        for commit in uncovered(pipeline):
+            for context in (DEPLOY, VERIFY):
+                status = client.last(commit, context)
+                assert status is None or status[0] == "pending", steps
+        # The pipeline runs what it still has to.
+        pipeline.settle()
         for commit in pipeline.commits:
             deployed, verified = client.last(commit, DEPLOY), client.last(commit, VERIFY)
             assert deployed is not None and deployed[0] != "pending", steps
             assert verified is None or verified[0] != "pending", steps
+    # Only superseded mode overtakes an execution that waits.
+    assert (overtaken > 0) == (mode == "superseded")
 
 
 def test_a_cancelled_commit_waits_for_an_execution_that_covers_it() -> None:
@@ -275,17 +419,11 @@ def test_a_cancelled_commit_waits_for_an_execution_that_covers_it() -> None:
     assert client.last(queued, DEPLOY) is None
 
 
-def test_a_late_cancellation_leaves_the_covering_verdict() -> None:
-    for steps in sequences(5):
-        client = Client()
-        pipeline = Pipeline(client)
-        for step in steps:
-            if step == PUSH:
-                pipeline.push()
-            else:
-                pipeline.run(step)
-        while pipeline.queue:
-            pipeline.run(SUCCEEDS)
+@pytest.mark.parametrize("mode", MODES)
+def test_a_late_cancellation_leaves_the_covering_verdict(mode: str) -> None:
+    for steps in sequences(5, mode):
+        client, pipeline = play(mode, steps)
+        pipeline.settle()
         verdicts = {
             (commit, context): client.last(commit, context)
             for commit in pipeline.commits
