@@ -245,7 +245,7 @@ The candidates that fit one GPU, and the two larger ones, worth a session that o
 | --- | --- | --- | --- | --- | --- | --- |
 | **Qwen3.8-27B** | 27.8B, dense; 31 GB at 8 bits, 22 GB at 4 | Apache-2.0 | 262,144 | Yes | Its publisher ran SWE-bench Pro inside Claude Code: 61.7. An independent index puts it above the one other single-GPU candidate that has a score. No independent agent benchmark yet | **The coursework model** |
 | Qwen3.6-27B | 27.8B, dense | Apache-2.0 | 262,144 | Yes | The only candidate with an independent agent result: 31.2% on SWE-rebench. Its publisher scores it 53.5 where the 3.8 scores 61.7. Loses its reasoning mid-loop in Claude Code | The fallback if the 3.8 fails `[S3]` for a reason of its own. Same size and speed |
-| Qwen3.6-35B-A3B | 36B, 3B active per token | Apache-2.0 | 262,144 | Yes | Independent: 24.7% on SWE-rebench, below the dense model of its generation. Same loss of reasoning. Needs model code | About three times faster per stream, weaker at the work. The fallback if speed proves the constraint |
+| Qwen3.6-35B-A3B | 36B, 3B active per token | Apache-2.0 | 262,144 | Yes | Independent: 24.7% on SWE-rebench, below the dense model of its generation. Same loss of reasoning. Needs no model code: vLLM builds its architecture in `[E28]` | About three times faster per stream, weaker at the work. The fallback if speed proves the constraint |
 | gpt-oss-120b | 117B, 5B active | Apache-2.0 | 131,072 | No | The example in vLLM's own guide for Claude Code. Drops images and flattens Claude Code's tool schemas | Fails on context and on images |
 | **Qwen3.8-Flash-Next** | 176B, 6B active; 186 GB at 8 bits | Qwen community licence | 262,144 | Yes | Publisher, in Claude Code: 62.5 on SWE-bench Pro, and 58.7 against the 27B's 42.2 on a second set | **The upgrade model** |
 | DeepSeek-V4.1-Flash | 763B by its repository's count, 16B active; 510 GB | MIT | 1M | Yes | Highest independent index of the models that fit one machine. Rejects one of Claude Code's effort values | The optional xl model |
@@ -305,7 +305,7 @@ The engine image is a thin layer over the upstream vLLM image pinned by digest, 
 ### 4.4 Model weights
 
 - A pipeline job copies each pool's model, at its pinned revision, from Hugging Face into the model bucket. It copies only an allow-list of file types (safetensors, JSON, tokenizer files) and refuses pickle formats and Python files. It verifies every file against a SHA-256 manifest committed to the repository. Only that job's role can write to the bucket.
-- Model code from a repository (`trust-remote-code`) is off by default. The coursework and upgrade models do not need it `[E28]`. A pool that does is a reviewed exception recorded with that pool; the DeepSeek V4 recipes ask for it `[E2]`.
+- Model code from a repository (`trust-remote-code`) is off by default. The coursework and upgrade models do not need it `[E28]`. Neither does the faster sibling, Qwen3.6-35B-A3B: vLLM v0.33.0 builds its architecture in, and its repository holds no code `[E28]`. A pool that does is a reviewed exception recorded with that pool; the DeepSeek V4 recipes ask for it `[E2]`.
 - Instances read weights through the S3 gateway endpoint and never talk to Hugging Face.
 - vLLM's Run:ai streamer loads from `s3://` into GPU memory. AWS measured 15 GB in about 5 seconds and 200 GB in about 25 seconds when tuned; defaults can be ten times slower, and one model was reported slower than the plain loader `[E11]`. The loader is a per-pool setting, with "download to local disk, then load" as the fallback `[S4]`.
 - At rest, S3 costs $0.023 per GB-month: under $1 for the coursework model, about $4 for the upgrade model, about $12 for the 510 GB one.
@@ -411,7 +411,7 @@ Three of these rows carry the design.
 - **A shared cache salt for class sessions.** With one salt for the class, students would share whatever part of the 20,000-token opening is identical, and a class starting together would not queue behind its own openings. It would also let one student test whether another has sent a given text (section 6.6). The default stays per student.
 - **A larger instance of the same family**, if the four cores prove the limit on the time to first token.
 - **More instances.** An instance adds streams, not speed: each student still gets what one GPU gives one stream.
-- **The faster sibling.** Qwen3.6-35B-A3B should generate about three times faster per stream, going by a measurement of a model of its shape on this GPU `[E29]`, and is weaker at agent work (section 4.2).
+- **The faster sibling.** Qwen3.6-35B-A3B should generate about three times faster per stream, going by a measurement of a model of its shape on this GPU `[E29]`, and is weaker at agent work (section 4.2). The lever serves NVIDIA's 4-bit build, `nvidia/Qwen3.6-35B-A3B-NVFP4`, the same publisher and quantization as the coursework model's 4-bit build. This build's chat template has no reasoning-effort switch, only one that turns thinking off, so it ignores the effort the request profile maps (section 6.2) without an error `[E28]`.
 
 **The larger pools.**
 
