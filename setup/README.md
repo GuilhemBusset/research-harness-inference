@@ -254,6 +254,7 @@ when the script ends: it needs no `uv sync` first, and leaves no `.venv` and no 
 | Hygiene scanner | Checked in under `tools/hygiene/` (standard-library Python); installs nothing |
 | Implement loop | Checked in under `tools/implementation-loop/` (standard-library Python); where its run state and worktrees live is described in `docs/factory/operating.md` |
 | Skills | Checked in under `.claude/skills/` and `.agents/skills/`; no global skill installation, no MCP server |
+| crane, of go-containerregistry, for the pipeline's step `Mirror` | Version v0.22.1, the release archive `go-containerregistry_Linux_x86_64.tar.gz` checked against its pinned SHA-256 (`src/rhi/pipeline/mirror.py`); downloaded and unpacked by the step's install phase into `/tmp/rhi-crane/` on its CodeBuild host only, which goes with the build. Nothing installs it on a contributor's machine, and the tests use a stand-in |
 | CI tools | `astral-sh/setup-uv` installs the pinned uv on the runner; gitleaks and actionlint are downloaded at a pinned version and verified against a pinned SHA-256 (`.github/workflows/ci.yml`) |
 
 When adding a repository-wide tool, put its installer and manifest here or at the root, pin it,
