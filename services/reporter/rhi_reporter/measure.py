@@ -39,6 +39,11 @@ is read:
 
 `read_event` checks the shape of each, then hands them to `encode`, which checks them again as it
 checks a job's own call: whatever either refuses raises ValueError, and no status is built.
+
+**A posting cut short.** `still_to_post` says which of a run's statuses a commit does not hold
+yet: those of the parts its newest posting lacks, when every part that posting holds is the run's
+own, and every one of them otherwise. The reporter reads it before it posts, and so completes a
+posting that stopped part-way rather than begin another.
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ from typing import TYPE_CHECKING
 from rhi_reporter.status import DESCRIPTION_LIMIT, CommitStatus, State
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable, Mapping, Sequence
 
 MEASURE_CONTEXT = "measure/"
 
@@ -263,3 +268,43 @@ def decode(statuses: Iterable[CommitStatus]) -> list[Run]:
             numbers.update(found)
         runs.append(Run(measurement=measurement, label=label, verdict=Verdict(states.pop()), numbers=numbers))
     return runs
+
+
+def newest_posting(listed: Iterable[Mapping[str, object]], measurement: str, label: str) -> list[tuple[int, str, str]]:
+    """The part, state and description of each status of the newest posting of the run `label`
+    of `measurement` among `listed`, a commit's statuses as GitHub lists them, each with its `id`,
+    `context`, `state` and `description`: the label's newest status of part 1, by GitHub's id, which
+    grows with each status it takes, and each status of another part with a greater id, in the
+    order of their ids. Empty when the label has no part 1. A status without an id is passed over."""
+    held: list[tuple[int, int, str, str]] = []
+    for status in listed:
+        number, context, state = status.get("id"), status.get("context"), status.get("state")
+        description = status.get("description") or ""
+        if type(number) is not int or not isinstance(context, str) or not isinstance(state, str):
+            continue
+        try:
+            of_measurement, of_label, part = context_parts(context)
+        except ValueError:
+            continue
+        if (of_measurement, of_label) == (measurement, label) and isinstance(description, str):
+            held.append((number, part, state, description))
+    first = max((number for number, part, _, _ in held if part == 1), default=None)
+    if first is None:
+        return []
+    return [(part, state, description) for number, part, state, description in sorted(held) if number >= first]
+
+
+def still_to_post(statuses: Sequence[CommitStatus], listed: Iterable[Mapping[str, object]]) -> list[CommitStatus]:
+    """Of `statuses`, one run's in the order of their parts, those its commit does not hold yet,
+    in order: when every status of the run label's newest posting among `listed` (`newest_posting`)
+    is equal, in state and description, to the status of `statuses` of its part, the statuses of the
+    other parts; otherwise all of them, from part 1."""
+    if not statuses:
+        return []
+    measurement, label, _ = context_parts(statuses[0].context)
+    held = newest_posting(listed, measurement, label)
+    own = {part: (str(status.state), status.description) for part, status in enumerate(statuses, start=1)}
+    if any(own.get(part) != (state, description) for part, state, description in held):
+        return list(statuses)
+    parts = {part for part, _, _ in held}
+    return [status for part, status in enumerate(statuses, start=1) if part not in parts]

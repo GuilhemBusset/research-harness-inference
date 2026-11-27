@@ -25,7 +25,7 @@ from botocore.exceptions import ClientError
 from rhi_lifecycle import serving
 from rhi_lifecycle.stages import Stage
 from rhi_reporter import handler, measure
-from rhi_reporter.github import SECRET_VARIABLE, RefusedError
+from rhi_reporter.github import SECRET_VARIABLE, CredentialError, RefusedError
 from rhi_reporter.status import VERIFIED_DESCRIPTION, CommitStatus, Description, State
 
 ACCOUNT = "123456789012"
@@ -284,13 +284,28 @@ class Stub:
 
 
 class Client:
-    """The GitHub client: it records what it is asked to post."""
+    """The GitHub client: it records what it is asked to post, and lists what a commit holds,
+    `held` before the posts, newest first, as GitHub does. `refuse` refuses the post of that
+    number, counted from 1, with `refusal`; `deadlines` are the deadlines it was given."""
 
-    def __init__(self) -> None:
+    def __init__(self, held: list[dict[str, Any]] | None = None) -> None:
         self.posted: list[tuple[str, str, str, str]] = []
+        self.held = list(held or [])
+        self.deadlines: list[float | None] = []
+        self.refuse: int | None = None
+        self.refusal: Exception = RefusedError(None, None)
 
-    def post_status(self, commit: str, state: str, context: str, description: str) -> None:
+    def post_status(
+        self, commit: str, state: str, context: str, description: str, *, deadline: float | None = None
+    ) -> None:
+        self.deadlines.append(deadline)
+        if self.refuse == len(self.posted) + 1:
+            raise self.refusal
         self.posted.append((commit, state, context, description))
+
+    def statuses(self, commit: str, *, deadline: float | None = None) -> list[dict[str, Any]]:
+        self.deadlines.append(deadline)
+        return self.held[::-1]
 
 
 @pytest.fixture
@@ -948,16 +963,107 @@ def test_a_bad_measurement_posts_nothing(
     assert [record.getMessage() for record in caplog.records] == [handler.NOT_A_MEASUREMENT]
 
 
-def test_a_refused_measurement_is_logged_and_not_retried(stub: Stub, caplog: pytest.LogCaptureFixture) -> None:
-    class Refusing(Client):
-        def post_status(self, commit: str, state: str, context: str, description: str) -> None:
-            super().post_status(commit, state, context, description)
-            raise RefusedError(422, "unprocessable")
+# A run of S5's size: its 163 numbers encode as 61 parts, 41 of three numbers then 20 of two.
+WIDE = {f"short_{at:03}_".ljust(41, "x"): 1000 + at for at in range(123)} | {
+    f"long_{at:03}_".ljust(55, "x"): 1000 + at for at in range(40)
+}
+WIDE_LABEL = "4bit-draft-head-1"
 
-    client = Refusing()
-    with caplog.at_level(logging.DEBUG):
-        run([measurement(secrets.token_hex(20), "8bit")], stub, client)
-    assert len(client.posted) == 1
-    assert [record.getMessage() for record in caplog.records] == [
-        f"{handler.REFUSED} GitHub refused the call: HTTP 422, code unprocessable"
+
+def wide(commit: str) -> dict[str, Any]:
+    """The event EventBridge delivers for a run of 163 numbers that a job sent from `commit`."""
+    entry = measure.measurement_event(
+        "S5", WIDE_LABEL, measure.Verdict.PASS, WIDE, names=list(WIDE), commit=commit, bus="rhi-measurements"
+    )
+    return wrapped(entry["DetailType"], json.loads(entry["Detail"])) | {"source": entry["Source"], "resources": []}
+
+
+def as_held(posted: list[tuple[str, str, str, str]], first_id: int = 1) -> list[dict[str, Any]]:
+    """Posted statuses as GitHub lists them, each with its id, in the order they were posted."""
+    return [
+        {"id": first_id + at, "context": context, "state": state, "description": text}
+        for at, (_, state, context, text) in enumerate(posted)
     ]
+
+
+def parts(client: Client) -> list[int]:
+    return [measure.context_parts(context)[2] for _, _, context, _ in client.posted]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [RefusedError(403, None), RefusedError(429, None), RefusedError(502, None), CredentialError()],
+    ids=["403", "429", "502", "credential"],
+)
+def test_a_measurement_cut_short_is_logged_once_and_fails(
+    stub: Stub, caplog: pytest.LogCaptureFixture, refusal: Exception
+) -> None:
+    event = wide(secrets.token_hex(20))
+    assert len(measure.read_event(event)) == 61
+    client = Client()
+    client.refuse, client.refusal = 43, refusal
+    aws = handler.Aws(codepipeline=stub, cloudformation=stub, s3=stub, secrets=stub)
+    with caplog.at_level(logging.DEBUG), pytest.raises(handler.NotAllPostedError):
+        handler.handle(event, aws=aws, client=client, stages=[STAGE], deadline=1000.0)
+    assert parts(client) == list(range(1, 43))
+    (record,) = [record for record in caplog.records if record.levelno >= logging.WARNING]
+    assert record.levelno == logging.ERROR
+    message = record.getMessage()
+    assert message.startswith(handler.NOT_ALL_POSTED)
+    assert {"S5", WIDE_LABEL, "42", "61"} <= set(message.replace(",", " ").split())
+    # Every call of the invocation had its deadline.
+    assert set(client.deadlines) == {1000.0}
+
+
+def test_a_failed_read_of_the_statuses_posts_nothing_and_fails(stub: Stub, caplog: pytest.LogCaptureFixture) -> None:
+    class Unreadable(Client):
+        def statuses(self, commit: str, *, deadline: float | None = None) -> list[dict[str, Any]]:
+            raise RefusedError(503, None)
+
+    client = Unreadable()
+    with caplog.at_level(logging.DEBUG), pytest.raises(handler.NotAllPostedError):
+        run([wide(secrets.token_hex(20))], stub, client)
+    assert client.posted == []
+    assert [record.levelno for record in caplog.records] == [logging.ERROR]
+
+
+def test_a_measurement_invoked_again_completes_the_posting_cut_short(stub: Stub) -> None:
+    event = wide(secrets.token_hex(20))
+    first = Client()
+    first.refuse = 43
+    with pytest.raises(handler.NotAllPostedError):
+        run([event], stub, first)
+
+    again = Client(held=as_held(first.posted))
+    run([event], stub, again)
+    assert parts(again) == list(range(43, 62))
+    # Once whole, a third invocation posts nothing.
+    whole = Client(held=as_held(first.posted + again.posted))
+    run([event], stub, whole)
+    assert whole.posted == []
+
+
+def test_a_newest_posting_that_differs_is_posted_again_from_part_1(stub: Stub) -> None:
+    event = wide(secrets.token_hex(20))
+    first = Client()
+    first.refuse = 43
+    with pytest.raises(handler.NotAllPostedError):
+        run([event], stub, first)
+    commit, state, context, text = first.posted[20]
+    changed = [*first.posted[:20], (commit, state, context, text.replace("=1", "=2", 1)), *first.posted[21:]]
+
+    again = Client(held=as_held(changed))
+    run([event], stub, again)
+    assert parts(again) == list(range(1, 62))
+    # An older posting that differs says nothing: only the newest counts.
+    older = Client(held=as_held(changed) + as_held(first.posted, first_id=100))
+    run([event], stub, older)
+    assert parts(older) == list(range(43, 62))
+
+
+def test_the_deadline_is_the_context_s_remaining_time_less_ten_seconds() -> None:
+    class Context:
+        def get_remaining_time_in_millis(self) -> int:
+            return 60_000
+
+    assert handler.deadline_of(Context(), 1_000.0) == 1_050.0

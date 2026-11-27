@@ -209,6 +209,26 @@ another pool or instance type is refused, with nothing written, so the runs of e
 are written apart, each with its own. A job is one instance type's, since its rows take one: one
 whose runs another type served, or two, is refused (`Job.measure`). GitHub dates a status to the second: a retry in the same
 second as the run before it is told apart by the statuses' ids.
+
+**A posting cut short.** When the reporter could not post every part of a run, the record reads
+the run as incomplete. Lambda invokes the reporter again with the same event, and the reporter
+posts only the parts the commit lacks; once those retries are spent, `entries` rebuilds the event
+from the runs the job printed. It reads the job's printed lines (its build log, saved to a file:
+its `Measured` JSON lines, one a run, other lines skipped), and the commit's statuses on standard
+input, and writes on standard output the entry of PutEvents that hands that run to the reporter
+again, with the numbers `numbers_of` gives for those runs. The reporter then posts only the parts
+the label's newest posting lacks, and the posting is whole. When a part of that posting differs
+from the rebuilt part of its number, the runs are not the ones posted: `entries` writes nothing and
+exits 1. Otherwise it says on standard error how many parts remain to be posted. The owner, with
+the deployment's credentials:
+
+    gh api --paginate "repos/{owner}/{repo}/commits/<sha>/statuses" |
+        env PYTHONPATH=src:services/common:services/gateway:services/reporter:services/engine/lifecycle:spikes \\
+        uv run --locked python spikes/s5_capacity.py entries --runs <build log> \\
+        --commit <sha> --label <run label> --verdict <pass|fail|error> > entries.json
+    aws events put-events --entries file://entries.json
+
+then, once the parts are listed, writes the record with `record` as above.
 """
 
 from __future__ import annotations
@@ -240,7 +260,15 @@ from rhi_common.causes import Cause
 from rhi_common.engine_metrics import Further, Kind, Name, Quantity, further_names, metric_names
 from rhi_lifecycle.cache import METRIC as CACHE_CAPACITY_METRIC
 from rhi_lifecycle.serving import RELEASE_METRIC
-from rhi_reporter.measure import MEASURE_CONTEXT, Verdict, context_parts
+from rhi_reporter.measure import (
+    MEASURE_CONTEXT,
+    Verdict,
+    context_parts,
+    measurement_event,
+    newest_posting,
+    read_event,
+    still_to_post,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Collection, Generator, Iterable, Mapping, Sequence
@@ -1655,6 +1683,102 @@ def record_main(argv: Sequence[str]) -> int:
     return 0
 
 
+# A posting cut short.
+
+# The verdict as `--verdict` and the event write it.
+VERDICTS = {"pass": Verdict.PASS, "fail": Verdict.FAIL, "error": Verdict.NOT_MEASURED}
+# The measurement bus (`src/rhi/pipeline/reporter.py`).
+MEASUREMENT_BUS = "rhi-measurements"
+DIFFERS = "a part the commit holds differs from the rebuilt part of that number: the runs are not the ones posted"
+NO_RUNS = "the printed lines hold no run of the job at the class's size"
+
+
+def measured_of(line: str) -> Measured | None:
+    """The run one line the job printed holds (`Measured.to_json`), None for any other line."""
+    try:
+        data = json.loads(line)
+        label = data["label"]
+        instances = {
+            name: Instance(one["instance_type"], one["seconds_in_service"], EngineQuantities(**one["engine"]))
+            for name, one in data["instances"].items()
+        }
+        return Measured(
+            label=Label(
+                label["pool"],
+                tuple(label["instance_types"]),
+                label["build"],
+                label["lever"],
+                Shape(label["shape"]),
+                label["streams"],
+                label["students"],
+                label["class_size"],
+            ),
+            seconds=data["seconds"],
+            experience=Experience(**data["experience"]),
+            cost_per_million_output_tokens=data["cost_per_million_output_tokens"],
+            instances=instances,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def entries_of(
+    printed: str,
+    statuses: Sequence[Mapping[str, Any]],
+    *,
+    commit: str,
+    label: str,
+    verdict: Verdict,
+    bus: str = MEASUREMENT_BUS,
+) -> tuple[list[dict[str, str]], int]:
+    """The entries of PutEvents that hand again to the reporter the run `label` of S5 the job
+    printed in `printed` on `commit`, with `verdict`, and how many of its parts `statuses`, the
+    commit's, do not hold yet. ValueError for printed lines with no run at the class's size, runs
+    `numbers_of` or the event refuses, and a part of the label's newest posting among `statuses`
+    that differs from the rebuilt part of its number."""
+    runs = [one for one in map(measured_of, printed.splitlines()) if one is not None]
+    class_sizes = {one.label.class_size for one in runs} - {None}
+    if len(class_sizes) != 1:
+        raise ValueError(NO_RUNS)
+    (class_size,) = class_sizes
+    numbers = numbers_of(runs, class_size or 0)
+    names = [name.value for name in Number]
+    entry = measurement_event(MEASUREMENT, label, verdict, numbers, names=names, commit=commit, bus=bus)
+    parts = read_event({"detail": json.loads(entry["Detail"])})
+    rest = still_to_post(parts, statuses)
+    if newest_posting(statuses, MEASUREMENT, label) and len(rest) == len(parts):
+        raise ValueError(DIFFERS)
+    return [entry], len(rest)
+
+
+def entries_main(argv: Sequence[str]) -> int:
+    """`entries`: the entries of PutEvents that complete a posting cut short."""
+    parser = argparse.ArgumentParser(
+        prog="s5_capacity.py entries", description="Rebuild the measurement event of a run of S5 the job printed."
+    )
+    parser.add_argument("--runs", required=True, help="the job's printed lines, its build log")
+    parser.add_argument("--commit", required=True, help="the commit the job ran from: its full id")
+    parser.add_argument("--label", required=True, help="the run label, <build>-<lever>-<instances>")
+    parser.add_argument("--verdict", required=True, choices=sorted(VERDICTS), help="the verdict the job posted")
+    parser.add_argument("--bus", default=MEASUREMENT_BUS, help="the measurement bus (default: rhi-measurements)")
+    args = parser.parse_args(argv)
+    try:
+        entries, remaining = entries_of(
+            Path(args.runs).read_text(encoding="utf-8"),
+            statuses_of(sys.stdin.read()),
+            commit=args.commit,
+            label=args.label,
+            verdict=VERDICTS[args.verdict],
+            bus=args.bus,
+        )
+    except ValueError as refusal:  # each refusal is fixed text, and quotes nothing it read
+        print(f"entries: {refusal}", file=sys.stderr)
+        return 1
+    print(f"entries: {remaining} of the run's parts remain to be posted", file=sys.stderr)
+    print(json.dumps(entries))
+    return 0
+
+
 # The job's inputs.
 
 
@@ -1769,4 +1893,6 @@ def main(environ: Mapping[str, str] = os.environ) -> Verdict:
 if __name__ == "__main__":
     if sys.argv[1:2] == ["record"]:
         sys.exit(record_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["entries"]:
+        sys.exit(entries_main(sys.argv[2:]))
     main()

@@ -140,9 +140,23 @@ after the first deployment.
 cannot post a status itself (sections 8.4 and 12). Such an event takes no other path. Its statuses
 are the ones `measure.read_event` gives, posted in the order of their parts on the commit the event
 names, the one the job ran from. When the measure module refuses any part of it, nothing is posted
-and `NOT_A_MEASUREMENT` is logged, without the event's content. When GitHub refuses a status, a
-commit not in the repository among other reasons, `REFUSED` is logged with the HTTP status and
-GitHub's error code, and the rest is not posted.
+and `NOT_A_MEASUREMENT` is logged, without the event's content.
+
+Before it posts, the function reads the commit's statuses, and posts only what the commit does not
+hold yet (`measure.still_to_post`): when every part of the run label's newest posting there is the
+event's part of that number, in state and description, only the event's other parts, in order;
+otherwise every part from part 1. So an invocation again of an event whose posting stopped
+part-way completes that posting rather than begin another, which the record would read as two
+postings that overlap. When a part is left unposted, by a refusal of GitHub's, a commit not in the
+repository among other reasons, by a credential that stops signing, by a read of the statuses that
+fails, or by the deadline, the function logs at ERROR `NOT_ALL_POSTED`, with the measurement's id,
+its run label, how many of its parts the commit holds and how many parts it has, and fails, so that
+Lambda invokes it again.
+
+**The deadline.** Every status of an invocation is posted with one deadline, the Lambda context's
+remaining time less `DEADLINE_MARGIN_SECONDS`: until then the client waits out GitHub's temporary
+refusals (`rhi_reporter.github`), and a refusal it cannot wait out by then fails the posting. A
+longer wait is Lambda's own retry of the invocation's event.
 """
 
 from __future__ import annotations
@@ -153,6 +167,7 @@ import json
 import logging
 import os
 import re
+import time
 import zipfile
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
@@ -237,11 +252,20 @@ NO_NOT_RUN = "A verification's success was not posted: whether it ran its tests 
 NO_VERIFICATION = "A superseded commit's verification takes the execution's state: its actions could not be read."
 NOT_SENT = "The details of a failure were not sent to the owner: the topic refused them or could not be reached."
 NOT_A_MEASUREMENT = "No commit status was posted: the measurement event is not one the measure module accepts."
-REFUSED = "A measurement's commit status was not posted:"
+NOT_ALL_POSTED = "A measurement's commit statuses were not all posted:"
+# The time an invocation keeps for itself after its last post may begin: one call's timeout.
+DEADLINE_MARGIN_SECONDS = 10
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 logger = logging.getLogger(__name__)
+
+
+class NotAllPostedError(Exception):
+    """A measurement's statuses were not all posted. The text is fixed."""
+
+    def __init__(self) -> None:
+        super().__init__("a measurement's commit statuses were not all posted")
 
 
 @dataclass(frozen=True)
@@ -293,7 +317,7 @@ def _clients() -> tuple[Aws, github.StatusClient]:
     return aws, github.StatusClient(secrets)
 
 
-def handler(event: Mapping[str, Any], _context: object) -> None:
+def handler(event: Mapping[str, Any], context: Any) -> None:
     """The Lambda function's entry point."""
     aws, client = _clients()
     stages = tuple(stage for stage in os.environ.get(STAGES_VARIABLE, "").split(",") if stage)
@@ -306,7 +330,18 @@ def handler(event: Mapping[str, Any], _context: object) -> None:
         smoke_tests=smoke_test_ids(os.environ),
         lifecycle_stages=lifecycle_stages(os.environ),
         artifacts=os.environ.get(ARTIFACTS_VARIABLE) or None,
+        deadline=deadline_of(context, time.time()),
     )
+
+
+def deadline_of(context: Any, now: float) -> float | None:
+    """The deadline of every post of the invocation `context` is Lambda's context of, on the clock
+    that reads `now`: its remaining time less `DEADLINE_MARGIN_SECONDS`. None, no wait, without a
+    context that tells its remaining time."""
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining is None:
+        return None
+    return now + remaining() / 1000 - DEADLINE_MARGIN_SECONDS
 
 
 def smoke_test_ids(environ: Mapping[str, str]) -> tuple[str, ...]:
@@ -333,20 +368,23 @@ def handle(
     smoke_tests: Sequence[str] = (),
     artifacts: str | None = None,
     lifecycle_stages: Sequence[str] = (),
+    deadline: float | None = None,
 ) -> None:
     """Posts the statuses of one of CodePipeline's events with `client`, which has `post_status`
-    as `github.StatusClient` has it, then sends the details of an action that ended without
-    success to `topic`, the owner's. `stages` are the stages the pipeline deploys,
+    and `statuses` as `github.StatusClient` has them, then sends the details of an action that ended
+    without success to `topic`, the owner's. `stages` are the stages the pipeline deploys,
     `smoke_tests` the IDs a report of a failure may name a smoke test by, `lifecycle_stages` the
     names it may name a lifecycle stage by, and `artifacts` the pipeline's artifact bucket, where
-    a verification leaves its marks. An event of a measurement
-    posts its statuses and nothing else."""
+    a verification leaves its marks. Every call of `client` is given `deadline`, a time on its
+    clock: None waits out no refusal. An event of a measurement posts its statuses and nothing
+    else."""
+    post = functools.partial(_post, client, deadline=deadline)
     if event.get("source") == measure.SOURCE:
-        _measurement(event, aws=aws, client=client)
+        _measurement(event, aws=aws, client=client, deadline=deadline)
         return
     kind, detail = event.get("detail-type"), event.get("detail")
     if kind == PIPELINE_CHANGE and isinstance(detail, dict):
-        _supersede(detail, aws=aws, client=client, stages=stages, artifacts=artifacts)
+        _supersede(detail, aws=aws, post=post, stages=stages, artifacts=artifacts)
         return
     if kind not in (STAGE_CHANGE, ACTION_CHANGE) or not isinstance(detail, dict):
         return
@@ -359,7 +397,7 @@ def handle(
     pipeline, execution = detail.get("pipeline"), detail.get("execution-id")
     commit, execution_status = _execution(aws.codepipeline, pipeline, execution)
     if execution_status in superseded.SUPERSEDED_STATUSES or detail.get("state") == CANCELED:
-        _reconcile(detail, aws=aws, client=client, stages=stages, artifacts=artifacts)
+        _reconcile(detail, aws=aws, post=post, stages=stages, artifacts=artifacts)
         return
     if commit is None:
         logger.warning(NO_COMMIT)
@@ -401,14 +439,14 @@ def handle(
                 status = _as_approvals_stand(status, runs, under, own, known)
                 if status is None:
                     continue
-            _post(client, status)
+            post(status)
             if status.state is State.FAILURE and action is not None:
                 marks = _Marks(smoke_tests=smoke_tests, lifecycle_stages=lifecycle_stages)
                 if action == VERIFY_ACTION:
                     marks.failed_tests = _failed_tests(aws, artifacts, execution)
                     marks.last_stages = _last_stages(aws, artifacts, execution)
                 for fact in _report(aws, facts, read(), marks):
-                    _post(client, fact)
+                    post(fact)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
     if action is not None and topic is not None and aws.sns is not None:
@@ -416,9 +454,10 @@ def handle(
         _send(aws, topic, own, execution=execution, read=read)
 
 
-def _measurement(event: Mapping[str, Any], *, aws: Aws, client: Any) -> None:
-    """Posts the statuses of one run that a job sent, on the commit the event names, or nothing
-    when the measure module refuses any part of the event."""
+def _measurement(event: Mapping[str, Any], *, aws: Aws, client: Any, deadline: float | None) -> None:
+    """Posts the statuses of one run that a job sent that its commit does not hold yet, on the
+    commit the event names, or nothing when the measure module refuses any part of the event.
+    Raises `NotAllPostedError`, after logging `NOT_ALL_POSTED`, when a part is left unposted."""
     try:
         statuses = measure.read_event(event)
     except ValueError:
@@ -427,18 +466,34 @@ def _measurement(event: Mapping[str, Any], *, aws: Aws, client: Any) -> None:
     if not github.has_credential(aws.secrets):
         logger.warning(NO_CREDENTIAL)
         return
+    measurement, label, _ = measure.context_parts(statuses[0].context)
+    held = 0
     try:
-        for status in statuses:
-            _post(client, status)
-    except github.CredentialError:
-        logger.warning(NO_CREDENTIAL)
-    except github.RefusedError as error:
-        # The error's text is fixed: the HTTP status and one of GitHub's error codes.
-        logger.warning("%s %s", REFUSED, error)
+        rest = measure.still_to_post(statuses, client.statuses(statuses[0].commit, deadline=deadline))
+        held = len(statuses) - len(rest)
+        for status in rest:
+            _post(client, status, deadline=deadline)
+            held += 1
+    except (github.RefusedError, github.CredentialError):
+        # Fixed text, and names of the measure module's own shapes: nothing GitHub or AWS said.
+        logger.error(
+            "%s measurement %s, run %s, %d of %d parts on the commit",
+            NOT_ALL_POSTED,
+            measurement,
+            label,
+            held,
+            len(statuses),
+        )
+        raise NotAllPostedError from None
 
 
 def _supersede(
-    detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], artifacts: str | None
+    detail: Mapping[str, Any],
+    *,
+    aws: Aws,
+    post: Callable[[CommitStatus], None],
+    stages: Sequence[str],
+    artifacts: str | None,
 ) -> None:
     """Posts the statuses of the superseded commits that the execution of `detail` covers, or
     whose execution it is."""
@@ -447,11 +502,16 @@ def _supersede(
     if not github.has_credential(aws.secrets):
         logger.warning(NO_CREDENTIAL)
         return
-    _reconcile(detail, aws=aws, client=client, stages=stages, artifacts=artifacts)
+    _reconcile(detail, aws=aws, post=post, stages=stages, artifacts=artifacts)
 
 
 def _reconcile(
-    detail: Mapping[str, Any], *, aws: Aws, client: Any, stages: Sequence[str], artifacts: str | None
+    detail: Mapping[str, Any],
+    *,
+    aws: Aws,
+    post: Callable[[CommitStatus], None],
+    stages: Sequence[str],
+    artifacts: str | None,
 ) -> None:
     """Posts the statuses of the superseded commits that the execution of `detail` covers, or
     whose execution it is, as the pipeline's executions stand now. Raises when they, or the marks
@@ -472,7 +532,7 @@ def _reconcile(
                 statuses = superseded.statuses_for(cover, stage, state if isinstance(state, str) else None)
                 started = functools.partial(_started, latest)
                 for status in _as_they_ran(aws, artifacts, cover.covering.execution_id, statuses, started):
-                    _post(client, status)
+                    post(status)
     except github.CredentialError:
         logger.warning(NO_CREDENTIAL)
 
@@ -523,8 +583,8 @@ def _started(run: Mapping[str, Any] | None) -> object:
     return run["startTime"] if run is not None else None
 
 
-def _post(client: Any, status: CommitStatus) -> None:
-    client.post_status(status.commit, status.state.value, status.context, status.description)
+def _post(client: Any, status: CommitStatus, *, deadline: float | None) -> None:
+    client.post_status(status.commit, status.state.value, status.context, status.description, deadline=deadline)
 
 
 def _listed(s3: Any, bucket: str | None, execution: object, name: str) -> Mapping[str, Any] | None:

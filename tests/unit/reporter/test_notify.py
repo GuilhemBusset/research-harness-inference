@@ -132,7 +132,9 @@ class Stub:
             raise ClientError({"Error": {"Code": "AuthorizationError", "Message": ERROR}}, "Publish")
         return {"MessageId": str(uuid.uuid4())}
 
-    def post_status(self, commit: str, state: str, context: str, description: str) -> None:
+    def post_status(
+        self, commit: str, state: str, context: str, description: str, *, deadline: float | None = None
+    ) -> None:
         self.calls.append(("status", (commit, state, context, description)))
 
     def run(self, events: list[dict[str, Any]]) -> None:
