@@ -1973,6 +1973,12 @@ IMAGE_BUILDER = [
 RUNS_THE_EMULATOR, DOWNLOADS_THE_BUILDER, CONFIGURES_THE_BUILDER, CREATES_THE_BUILDER = 2, 3, 6, 7
 
 
+def the_image_builder_with(at: int, command: str) -> list[str]:
+    """`IMAGE_BUILDER` with its command at `at` replaced by `command` and every other kept, in its
+    place: a case changes one command, so the one it changes is what lists it."""
+    return [command if index == at else other for index, other in enumerate(IMAGE_BUILDER)]
+
+
 # The variables of its build specification, as `src/rhi/pipeline/stack.py` writes them: the
 # registry the builder's configuration mirrors is Docker Hub's.
 IMAGE_BUILDER_VARIABLES = {"RHI_MIRRORED_REGISTRY": "docker.io"}
@@ -2025,27 +2031,47 @@ def a_deletion(cdk: ModuleType, _stack: Any, pipeline: Any) -> None:
             id="a project of the asset stage that does more than publish assets",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[RUNS_THE_EMULATOR].replace(f":qemu-v10.2.3{PINNED}", ":latest")]),
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    RUNS_THE_EMULATOR, IMAGE_BUILDER[RUNS_THE_EMULATOR].replace(f":qemu-v10.2.3{PINNED}", ":latest")
+                )
+            ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that installs an emulator without its digest",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[DOWNLOADS_THE_BUILDER].replace("download/v0.38.2", "latest/download")]),
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    DOWNLOADS_THE_BUILDER, IMAGE_BUILDER[DOWNLOADS_THE_BUILDER].replace("download/v0.38.2", "latest/download")
+                )
+            ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that downloads the builder without its version",
         ),
         pytest.param(
-            a_publisher_that_installs([f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64"]),
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    RUNS_THE_EMULATOR, f"docker run --privileged --rm tonistiigi/binfmt:qemu-v10.2.3{PINNED} --install arm64"
+                )
+            ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that runs the emulator from Docker Hub by its digest",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[CREATES_THE_BUILDER].replace("$RHI_REGISTRY/rhi-mirror/", "")]),
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    CREATES_THE_BUILDER, IMAGE_BUILDER[CREATES_THE_BUILDER].replace("$RHI_REGISTRY/rhi-mirror/", "")
+                )
+            ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that creates its builder from Docker Hub by its digest",
         ),
         pytest.param(
-            a_publisher_that_installs([IMAGE_BUILDER[CONFIGURES_THE_BUILDER].replace('"$RHI_REGISTRY', '"example.com')]),
+            a_publisher_that_installs(
+                the_image_builder_with(
+                    CONFIGURES_THE_BUILDER, IMAGE_BUILDER[CONFIGURES_THE_BUILDER].replace('"$RHI_REGISTRY', '"example.com')
+                )
+            ),
             [f"stage {ASSET_STAGE}", f"{ASSET_STAGE}/Image: {CODEBUILD}"],
             id="a project of the asset stage that configures a mirror outside the deploying account's registry",
         ),

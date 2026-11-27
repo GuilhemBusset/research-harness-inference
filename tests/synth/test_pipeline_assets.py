@@ -132,11 +132,13 @@ def words_of(command: str) -> list[str]:
 
 
 def images_of(words: list[str]) -> list[str]:
-    """The container images a command names: an `image=` option, and in each simple command of
-    Docker's, what one of `TAKES_AN_IMAGE` starts, creates or pulls (options written as one word),
-    and, in any other but those of `NAMES_NO_IMAGE` (a manifest's lookup, a tag, a push), each of
-    its words: what this does not know how to read is taken to name an image."""
-    found = [part.split("=", 1)[1] for word in words for part in word.split(",") if part.startswith("image=")]
+    """The container images a command names: an `image=` option, as its own word or attached to
+    its option (`--driver-opt=image=...`), and in each simple command of Docker's, what one of
+    `TAKES_AN_IMAGE` starts, creates or pulls (options written as one word), and, in any other but
+    those of `NAMES_NO_IMAGE` (a manifest's lookup, a tag, a push), each of its words: what this
+    does not know how to read is taken to name an image."""
+    values = [word.split("=", 1)[1] if word.startswith("-") and "=" in word else word for word in words]
+    found = [part.split("=", 1)[1] for value in values for part in value.split(",") if part.startswith("image=")]
     simple: list[list[str]] = [[]]
     for word in words:
         if word and set(word) <= set("();<>|&"):
@@ -272,6 +274,11 @@ def test_an_image_on_docker_hub_is_found(image: str, expected: bool) -> None:
         pytest.param("commands", "docker container run --rm python", id="a run under the container group"),
         pytest.param("commands", "docker manifest inspect python:3.13-slim", id="a manifest's lookup"),
         pytest.param("commands", "true && docker pull python", id="a pull after an operator"),
+        pytest.param(
+            "commands",
+            "docker buildx create --name second --driver docker-container --driver-opt=image=moby/buildkit --bootstrap",
+            id="a builder's image attached to its option",
+        ),
     ],
 )
 def test_a_command_that_names_an_image_on_docker_hub_is_found(
