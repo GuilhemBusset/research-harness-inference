@@ -19,13 +19,16 @@
 # What leaves the node. Run Command keeps a command's output in the account, so this script prints
 # only a fixed vocabulary, which any reader of the output may copy: one line
 # `rhi-contract <test> <outcome>` for each of the four tests, the outcome passed, failed, error,
-# skipped or missing (the test did not run, or the run stopped before pytest), then
+# skipped or missing (the test did not run, or the run stopped before pytest), each failed test's
+# followed by one line `rhi-contract-reason <test> <request> <check> <finish>`, which request
+# failed which check and how its answer ended, in the suite's own words (the patterns below), then
 # `rhi-contract exit <status>`, and it exits with that status, pytest's. pytest's own report goes
 # nowhere: a failure's report carries the engine's answers and the test's arguments, the secret
-# among them. The plugin rhi_contract_outcomes.py keeps each test's outcome in memory and writes
-# only the test's name and its outcome to the descriptor 3, which the container's shell opens on
-# its standard output; this script keeps a line only if it is one of those words. Every
-# program's standard error, AWS's text included, goes nowhere.
+# among them. The plugin rhi_contract_outcomes.py keeps each test's outcome and reason in memory
+# and writes only the test's name and its outcome, and `<test> reason <request> <check> <finish>`,
+# to the descriptor 3, which the container's shell opens on its standard output; this script keeps
+# a line only if it is one of those words. Every program's standard error, AWS's text included,
+# goes nowhere.
 #
 # RHI_CONTRACT_ROOT, only for the tests, puts the paths above under a folder of their own.
 
@@ -36,7 +39,17 @@ release="$root/opt/rhi/release"
 contract=/opt/rhi/release/contract
 address=http://127.0.0.1:8000
 tests=(test_inference test_health test_metrics test_bearer_secret)
-declare -A outcomes=()
+declare -A outcomes=() reasons=()
+# The words of a reason (system design, section 4.1): the request, the check, the finish. The
+# quantities are those of rhi_common.engine_metrics.Quantity.
+quantities='running_requests|waiting_requests|time_to_first_token|time_per_output_token|input_tokens|cached_input_tokens|output_tokens|cache_usage'
+request_words='health|metrics|count|none|(chat|responses|messages)-(whole|streamed)(-calling)?'
+request_words+='|(chat|responses|messages|count)-(without|wrong|with)-secret'
+check_words='status-[0123456789]{3}|not-a-stream|no-end-event|no-usage|no-text|a-call|no-call'
+check_words+="|arguments-not-an-object|no-input-tokens|metric-(missing|kind)-($quantities)|metrics-elsewhere"
+check_words+='|timeout|no-connection|unreadable|unexplained'
+finish_words='stop|length|tool_calls|completed|incomplete|end_turn|max_tokens|tool_use|stop_sequence|other|none'
+reason_pattern="^($request_words) ($check_words) ($finish_words)\$"
 
 exec 2>/dev/null
 
@@ -44,6 +57,9 @@ report() {
   local name
   for name in "${tests[@]}"; do
     printf 'rhi-contract %s %s\n' "$name" "${outcomes[$name]:-missing}"
+    if [ "${outcomes[$name]:-}" = failed ] && [ -n "${reasons[$name]:-}" ]; then
+      printf 'rhi-contract-reason %s %s\n' "$name" "${reasons[$name]}"
+    fi
   done
   printf 'rhi-contract exit %s\n' "$1"
   exit "$1"
@@ -86,9 +102,11 @@ status=$?
 unset secret
 
 while read -r name outcome rest; do
-  [ -z "$rest" ] || continue
   for known in "${tests[@]}"; do
-    if [ "$name" = "$known" ]; then
+    [ "$name" = "$known" ] || continue
+    if [ "$outcome" = reason ]; then
+      [[ "$rest" =~ $reason_pattern ]] && reasons[$known]="$rest"
+    elif [ -z "$rest" ]; then
       case "$outcome" in
         passed | failed | error | skipped) outcomes[$known]="$outcome" ;;
       esac

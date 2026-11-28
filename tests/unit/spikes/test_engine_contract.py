@@ -18,6 +18,7 @@ import botocore.session
 import pytest
 
 import engine_contract as job
+from rhi_common.engine_metrics import Quantity
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -309,10 +310,32 @@ def test_only_the_vocabulary_of_the_output_is_written(pool_state: Any) -> None:
     assert status == 1
 
 
+def test_a_failed_test_s_reason_is_recorded_in_the_vocabulary_only(pool_state: Any) -> None:
+    failed = PASSING.replace("test_inference passed", "test_inference failed").replace("exit 0", "exit 1")
+    given = "rhi-contract-reason test_inference messages-whole no-text max_tokens"
+    dropped = [
+        "rhi-contract-reason test_shutdown chat-whole timeout none",
+        "rhi-contract-reason test_health health sentinel none",
+        "rhi-contract-reason test_metrics metrics status-200 none sentinel",
+    ]
+    output = "\n".join([failed, given, *dropped])
+    status, lines, written = ran(pool_state, RunCommand([(FIRST, "Failed", output), (SECOND, "Success", PASSING)]))
+    assert status == 1
+    reasons = [one["reasons"] for one in lines if one["kind"] == "instance_check"]
+    assert reasons == [
+        dict.fromkeys(job.TESTS) | {"test_inference": ["messages-whole", "no-text", "max_tokens"]},
+        dict.fromkeys(job.TESTS),
+    ]
+    assert "sentinel" not in "".join(written) and "test_shutdown" not in "".join(written)
+
+
 def test_the_vocabulary_is_the_contract_script_s() -> None:
     script = (Path(__file__).resolve().parents[3] / "services/engine/contract/run.sh").read_text(encoding="utf-8")
     (tests,) = re.findall(r"^tests=\(([^)]*)\)$", script, flags=re.MULTILINE)
     assert tuple(tests.split()) == job.TESTS
+    # The quantities a reason may name: the script's, the job's and the table's are the same.
+    (quantities,) = re.findall(r"^quantities='([^']*)'$", script, flags=re.MULTILINE)
+    assert quantities.split("|") == list(job.QUANTITIES) == [quantity.value for quantity in Quantity]
 
 
 def test_time_spent_before_the_session_admits_the_run_never_shortens_it(
