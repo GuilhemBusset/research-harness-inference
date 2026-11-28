@@ -42,7 +42,7 @@ from collections.abc import AsyncIterator, Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import httpx
 import pytest
@@ -107,8 +107,10 @@ FINISHES: dict[str, frozenset[str]] = {
     RESPONSES: frozenset({"completed", "incomplete"}),
     MESSAGES: frozenset({"end_turn", "max_tokens", "tool_use", "stop_sequence"}),
 }
-# The events that end a Responses stream, each carrying the response and its status.
-RESPONSES_ENDS = frozenset({"response.completed", "response.incomplete", "response.failed"})
+# The events that end a Responses stream, each carrying the response and its status; of them, those
+# that end it with an answer.
+RESPONSES_LAST = frozenset({"response.completed", "response.incomplete", "response.failed"})
+RESPONSES_ENDS = frozenset({"response.completed", "response.incomplete"})
 
 # An address no engine is scraped from (a documentation range).
 ELSEWHERE = "203.0.113.7"
@@ -178,6 +180,13 @@ class Answer(NamedTuple):
     output_tokens: object
 
 
+def text_of(value: object) -> str:
+    """The text a format's field holds: a string, or nothing. Any other value is not of the format's shape."""
+    if value is None or isinstance(value, str):
+        return value or ""
+    raise TypeError("the answer's text is not a string")
+
+
 class Calls:
     """The function calls of an answer, each put together from the pieces that carry its key."""
 
@@ -186,8 +195,8 @@ class Calls:
 
     def add(self, key: object, name: object = None, arguments: object = None) -> None:
         call = self._calls.setdefault(key, ["", ""])
-        call[0] += name if isinstance(name, str) else ""
-        call[1] += arguments if isinstance(arguments, str) else ""
+        call[0] += text_of(name)
+        call[1] += text_of(arguments)
 
     def all(self) -> list[tuple[str, str]]:
         return [(name, arguments) for name, arguments in self._calls.values()]
@@ -204,24 +213,48 @@ def read_chat(answer: dict[str, Any], said: Exchange) -> Answer:
     for index, call in enumerate(message.get("tool_calls") or []):
         calls.add(index, call["function"]["name"], call["function"]["arguments"])
     return Answer(
-        message.get("content") or "", calls.all(), *counts(answer.get("usage"), "prompt_tokens", "completion_tokens")
+        text_of(message.get("content")),
+        calls.all(),
+        *counts(answer.get("usage"), "prompt_tokens", "completion_tokens"),
     )
 
 
-def read_chat_stream(data: list[str], said: Exchange) -> Answer:
-    done = data[-1:] == ["[DONE]"]
-    text, calls, usage = "", Calls(), None
-    for chunk in map(json.loads, data[:-1] if done else data):
-        usage = chunk.get("usage") or usage
+class Stream:
+    """A stream's reader, fed each event's data as it arrives, so that a stream cut short still
+    says how far its answer was read: how it said it ended, among the rest."""
+
+    def __init__(self, said: Exchange) -> None:
+        self.said, self.text, self.calls = said, "", Calls()
+
+    def feed(self, data: str) -> None:
+        raise NotImplementedError
+
+    def answer(self) -> Answer:
+        raise NotImplementedError
+
+
+class ChatStream(Stream):
+    def __init__(self, said: Exchange) -> None:
+        super().__init__(said)
+        self.done, self.usage = False, cast(object, None)
+
+    def feed(self, data: str) -> None:
+        self.done = data == "[DONE]"
+        if self.done:
+            return
+        chunk = json.loads(data)
+        self.usage = chunk.get("usage") or self.usage
         for choice in chunk.get("choices") or []:
-            said.ended(choice.get("finish_reason"))
+            self.said.ended(choice.get("finish_reason"))
             delta = choice.get("delta") or {}
-            text += delta.get("content") or ""
+            self.text += text_of(delta.get("content"))
             for call in delta.get("tool_calls") or []:
                 function = call.get("function") or {}
-                calls.add(call.get("index"), function.get("name"), function.get("arguments"))
-    said.check(done, "no-end-event", "the stream does not end with [DONE]")
-    return Answer(text, calls.all(), *counts(usage, "prompt_tokens", "completion_tokens"))
+                self.calls.add(call.get("index"), function.get("name"), function.get("arguments"))
+
+    def answer(self) -> Answer:
+        self.said.check(self.done, "no-end-event", "the stream does not end with [DONE]")
+        return Answer(self.text, self.calls.all(), *counts(self.usage, "prompt_tokens", "completion_tokens"))
 
 
 def read_responses(answer: dict[str, Any], said: Exchange) -> Answer:
@@ -229,27 +262,35 @@ def read_responses(answer: dict[str, Any], said: Exchange) -> Answer:
     text, calls = "", Calls()
     for index, item in enumerate(answer["output"]):
         if item["type"] == "message":
-            text += "".join(part["text"] for part in item["content"] if part["type"] == "output_text")
+            text += "".join(text_of(part["text"]) for part in item["content"] if part["type"] == "output_text")
         elif item["type"] == "function_call":
             calls.add(index, item["name"], item["arguments"])
     return Answer(text, calls.all(), *counts(answer.get("usage"), "input_tokens", "output_tokens"))
 
 
-def read_responses_stream(data: list[str], said: Exchange) -> Answer:
-    events = [json.loads(one) for one in data]
-    end = events[-1] if events and events[-1].get("type") in RESPONSES_ENDS else None
-    if end is not None:
-        said.ended(end["response"].get("status"))
-    said.check(end is not None, "no-end-event", "the stream does not end with the response's last event")
-    text, calls = "", Calls()
-    for event in events:
-        if event["type"] == "response.output_text.delta":
-            text += event["delta"]
+class ResponsesStream(Stream):
+    def __init__(self, said: Exchange) -> None:
+        super().__init__(said)
+        self.last: dict[str, Any] = {}
+
+    def feed(self, data: str) -> None:
+        event = json.loads(data)
+        self.last = event
+        if event["type"] in RESPONSES_LAST:
+            self.said.ended(event["response"].get("status"))
+        elif event["type"] == "response.output_text.delta":
+            self.text += text_of(event["delta"])
         elif event["type"] == "response.output_item.added" and event["item"]["type"] == "function_call":
-            calls.add(event["output_index"], name=event["item"]["name"])
+            self.calls.add(event["output_index"], name=event["item"]["name"])
         elif event["type"] == "response.function_call_arguments.delta":
-            calls.add(event["output_index"], arguments=event["delta"])
-    return Answer(text, calls.all(), *counts(events[-1]["response"].get("usage"), "input_tokens", "output_tokens"))
+            self.calls.add(event["output_index"], arguments=event["delta"])
+
+    def answer(self) -> Answer:
+        # A stream that says the response failed has ended, but not with an answer.
+        ended = self.last.get("type") in RESPONSES_ENDS
+        self.said.check(ended, "no-end-event", "the stream does not end with a response that completed")
+        usage = self.last["response"].get("usage")
+        return Answer(self.text, self.calls.all(), *counts(usage, "input_tokens", "output_tokens"))
 
 
 def read_messages(answer: dict[str, Any], said: Exchange) -> Answer:
@@ -257,37 +298,44 @@ def read_messages(answer: dict[str, Any], said: Exchange) -> Answer:
     text, calls = "", Calls()
     for index, block in enumerate(answer["content"]):
         if block["type"] == "text":
-            text += block["text"]
+            text += text_of(block["text"])
         elif block["type"] == "tool_use":
             calls.add(index, block["name"], json.dumps(block["input"]))
     return Answer(text, calls.all(), *counts(answer.get("usage"), "input_tokens", "output_tokens"))
 
 
-def read_messages_stream(data: list[str], said: Exchange) -> Answer:
-    events = [json.loads(one) for one in data]
-    text, calls, usage = "", Calls(), {}
-    for event in events:
+class MessagesStream(Stream):
+    def __init__(self, said: Exchange) -> None:
+        super().__init__(said)
+        self.usage: dict[str, Any] = {}
+        self.last: dict[str, Any] = {}
+
+    def feed(self, data: str) -> None:
+        event = json.loads(data)
+        self.last = event
         if event["type"] == "message_start":
-            usage.update(event["message"].get("usage") or {})
+            self.usage.update(event["message"].get("usage") or {})
         elif event["type"] == "content_block_start" and event["content_block"]["type"] == "tool_use":
-            calls.add(event["index"], name=event["content_block"]["name"])
+            self.calls.add(event["index"], name=event["content_block"]["name"])
         elif event["type"] == "content_block_delta" and event["delta"]["type"] == "text_delta":
-            text += event["delta"]["text"]
+            self.text += text_of(event["delta"]["text"])
         elif event["type"] == "content_block_delta" and event["delta"]["type"] == "input_json_delta":
-            calls.add(event["index"], arguments=event["delta"]["partial_json"])
+            self.calls.add(event["index"], arguments=event["delta"]["partial_json"])
         elif event["type"] == "message_delta":
-            said.ended((event.get("delta") or {}).get("stop_reason"))
+            self.said.ended((event.get("delta") or {}).get("stop_reason"))
             # The input count travels in the first event and the output count in this one.
-            usage.update(event.get("usage") or {})
-    ended = bool(events) and events[-1]["type"] == "message_stop"
-    said.check(ended, "no-end-event", "the stream does not end with message_stop")
-    return Answer(text, calls.all(), *counts(usage, "input_tokens", "output_tokens"))
+            self.usage.update(event.get("usage") or {})
+
+    def answer(self) -> Answer:
+        ended = self.last.get("type") == "message_stop"
+        self.said.check(ended, "no-end-event", "the stream does not end with message_stop")
+        return Answer(self.text, self.calls.all(), *counts(self.usage, "input_tokens", "output_tokens"))
 
 
-READERS: dict[str, tuple[Callable[[dict[str, Any], Exchange], Answer], Callable[[list[str], Exchange], Answer]]] = {
-    CHAT: (read_chat, read_chat_stream),
-    RESPONSES: (read_responses, read_responses_stream),
-    MESSAGES: (read_messages, read_messages_stream),
+READERS: dict[str, tuple[Callable[[dict[str, Any], Exchange], Answer], type[Stream]]] = {
+    CHAT: (read_chat, ChatStream),
+    RESPONSES: (read_responses, ResponsesStream),
+    MESSAGES: (read_messages, MessagesStream),
 }
 
 
@@ -313,7 +361,10 @@ async def ask(
             if streamed:
                 content_type = response.headers.get("content-type", "")
                 said.check(content_type.startswith("text/event-stream"), "not-a-stream")
-                answer = stream([data async for data in events_of(response)], said)
+                reader = stream(said)
+                async for data in events_of(response):
+                    reader.feed(data)
+                answer = reader.answer()
             else:
                 answer = whole(json.loads(await response.aread()), said)
         carried = all(isinstance(count, int) and count > 0 for count in (answer.input_tokens, answer.output_tokens))
@@ -431,7 +482,10 @@ def test_shutdown(engine_process: Any) -> None:
             return [first] + [data async for data in events]
 
     # The request runs to its end: the terminal event, the text and the usage, as with no signal.
-    answer = read_chat_stream(asyncio.run(scenario()), Exchange("chat-streamed", CHAT))
+    reader = ChatStream(Exchange("chat-streamed", CHAT))
+    for data in asyncio.run(scenario()):
+        reader.feed(data)
+    answer = reader.answer()
     assert answer.text
     assert isinstance(answer.output_tokens, int) and answer.output_tokens > 0
     # Then the engine stops.
@@ -549,6 +603,46 @@ def reasoning_alone(*, streamed: bool) -> Callable[[httpx.Request, str], str]:
     return answer
 
 
+def failed_responses_stream(request: httpx.Request, content: str) -> str:
+    """The Responses streams, ended by the event that says the response failed, and not completed."""
+    if request.url.path != RESPONSES or json.loads(request.content).get("stream") is not True:
+        return content
+    lines = []
+    for line in content.split("\n"):
+        if line == "event: response.completed":
+            line = "event: response.failed"
+        elif line.startswith("data: ") and '"response.completed"' in line:
+            event = json.loads(line.removeprefix("data: "))
+            event["type"], event["response"]["status"] = "response.failed", "failed"
+            line = f"data: {json.dumps(event)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def chat_text_not_a_string(request: httpx.Request, content: str) -> str:
+    """The whole Chat answers, with an object where their text belongs."""
+    if request.url.path != CHAT or json.loads(request.content).get("stream") is True:
+        return content
+    answer = json.loads(content)
+    answer["choices"][0]["message"]["content"] = {"text": "not a string"}
+    return json.dumps(answer)
+
+
+class StallsAfterItsFinish(httpx.AsyncByteStream):
+    """A Chat stream that says it ended at its budget, then stalls until the client gives up."""
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}\n\n'
+        raise httpx.ReadTimeout("no more of the stream")
+
+
+def stalled(engine: Any) -> Any:
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=StallsAfterItsFinish())
+
+    return replace(engine, connect=lambda peer: httpx.MockTransport(answer))
+
+
 def reason_of(check: Callable[[Any], None], engine: Any) -> str:
     """The first line of the failure a test of the contract ends in, against the engine."""
     with pytest.raises(AssertionError) as failed:
@@ -592,6 +686,17 @@ def test_the_suite_catches_a_broken_engine(mock_engine: Any) -> None:
 
     assert reason_of(test_inference, altered(mock_engine, answer=both)) == "messages-whole no-text max_tokens"
     assert reason_of(test_inference, altered(mock_engine, answer=cut[1])) == "messages-streamed no-text max_tokens"
+
+    # A Responses stream that says its response failed, though it carried text and usage.
+    broken = altered(mock_engine, answer=failed_responses_stream)
+    assert reason_of(test_inference, broken) == "responses-streamed no-end-event other"
+
+    # An answer not of its format's shape, read as far as it says how it ended.
+    broken = altered(mock_engine, answer=chat_text_not_a_string)
+    assert reason_of(test_health, broken) == "chat-whole unreadable stop"
+
+    # A stream that times out after it said how it ended keeps that word.
+    assert reason_of(test_metrics, stalled(mock_engine)) == "chat-streamed timeout length"
 
 
 # Where each generation format asks for its effort and its output budget: the object that holds the
