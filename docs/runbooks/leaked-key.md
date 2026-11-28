@@ -232,4 +232,4 @@ A key that only expired at the course end is not a leak: there is nothing to rev
 3. **The student is back.** The student confirms that `rhi login` succeeded on each of their
    installations and that their harness works during the next session.
 
-Walked through on the deployed system: not yet.
+Walked through on the deployed system: 2026-11-27, with a test roster entry and keys the admin CLI issued to it, in place of a student's login; Check 2's dashboard and Verify 3 were not walked.

@@ -279,4 +279,4 @@ pool, by its name in the configuration, which is also the model name `rhi status
    rhi status
    ```
 
-Walked through on the deployed system: not yet.
+Walked through on the deployed system: 2026-11-27, with no pool's launches suspended: Check, Verify and the refusal of Act, step 2; finding a suspension's cause and clearing it were not walked.
