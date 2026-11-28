@@ -390,4 +390,4 @@ alias rhi_admin='env PYTHONPATH=admin:services/common:services/issuer:src uv run
 
 3. **What students reported is gone,** at the next session.
 
-Walked through on the deployed system: not yet.
+Walked through on the deployed system: 2026-11-27, Check, on a deployment whose verification failed and that was fixed forward; the reverts of Act, steps 2 and 3, were not walked.

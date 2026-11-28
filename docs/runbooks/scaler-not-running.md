@@ -327,4 +327,4 @@ and this runbook does not apply.
    is the runbook [a pool whose launches are suspended](suspended-launches.md), which finds why
    the launches were abandoned before it clears anything.
 
-Walked through on the deployed system: not yet.
+Walked through on the deployed system: 2026-11-28, during an induced outage of the scaler's schedule: Check, Act, step 1, and Verify; emptying a group by hand (Act, steps 2 and 3) was not walked.

@@ -293,4 +293,4 @@ A session is active and has fewer instances in service than it asks for:
    rhi_admin pool status
    ```
 
-Walked through on the deployed system: not yet.
+Walked through on the deployed system: 2026-11-27, on a session of the mock pool short until its instance arrived; the causes quota, launches-suspended and launch-failed did not occur.

@@ -335,4 +335,4 @@ Do these the day before the class.
    A group that still lists an instance after twenty minutes, with none in service, raises the
    alarm on instances running with nothing in service (section 5.1).
 
-Walked through on the deployed system: not yet.
+Walked through on the deployed system: 2026-11-27, on the mock pool, with a key the admin CLI issued in place of rhi login.
