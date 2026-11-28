@@ -155,7 +155,7 @@ in a shell startup file, and do not give the key to the shared background server
 `opencode service set env`: it would keep the key beyond your shell. After a new login, the old key
 stops working: set the variable again from `rhi token` and restart OpenCode.
 
-Spike S3 (section 7) has not yet run OpenCode, so the course has no tested version of it yet.
+The course tests OpenCode 1.19.5 (section 7). Check yours with `opencode --version`.
 
 ### Pi
 
@@ -187,7 +187,7 @@ The entry holds no key. The leading `!` of `apiKey` tells Pi to run a command fo
 `rhi token` each time it sends a request, so the key is in no file, and after a new login Pi uses
 the new key with nothing to change. Start Pi as usual and choose `coursework` with `/model`.
 
-Spike S3 (section 7) has not yet run Pi, so the course has no tested version of it yet.
+The course tests Pi 1.5.2 (section 7). Check yours with `pi --version`.
 
 ## 4. Choose a model
 
@@ -285,13 +285,14 @@ kind on the coursework model, and runs the task's check on what the harness left
 | Claude Code | 2.1.323 |
 | Codex | 0.169.0 |
 | OpenAI Python SDK, for the SDK script | 3.57.0 |
-| OpenCode | Not yet run by spike S3 |
-| Pi | Not yet run by spike S3 |
+| OpenCode | 1.19.5 |
+| Pi | 1.5.2 |
 
 The spike stops if an installed harness reports another version, and each run prints the versions
 it used in its log. What those runs show decides which harnesses each model supports, and the
 instructor tells you which those are. With a newer version, something may fail that worked before. If it
-does, tell the instructor which version you run (`claude --version`, `codex --version`).
+does, tell the instructor which version you run (`claude --version`, `codex --version`,
+`opencode --version`, `pi --version`).
 
 ## 8. When a request fails: the causes
 
