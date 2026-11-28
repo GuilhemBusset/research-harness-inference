@@ -64,7 +64,7 @@ shapes.
 before the rest of either bundle is read: the requested settings that differ, the observed ones
 that differ, any setting a run observed other than it requested, the run's settings that differ,
 and the lever each changed setting belongs to (`Lever`). A run whose observed settings contradict
-its requested ones is refused (`CONTRADICTED_SETTING`): no change can be attributed to what it
+its requested ones, where it requested a value, is refused (`CONTRADICTED_SETTING`): no change can be attributed to what it
 requested. Observed settings that differ with their lever not declared changed are refused as
 undeclared, setting by setting: a declared host count does not cover another instance type
 observed. A paired decision is withheld (inconclusive, `LOAD_UNSHOWN`) unless both runs show the
@@ -74,11 +74,12 @@ Two runs compare only when they are one planned workload: a changed floor (`obje
 budget (`sampling`) is refused by name, any other change of the workload as incompatible. Each
 lever that changed must be shown to have served, in both runs: the hosts and the release by the
 observed settings, the launch settings by every serving host's launch fingerprint, through each
-attempt and equal to the one its run's release requests (and the two runs' requests differ), with
-every host the attempt observed accounted for, the gateway profile by the observed one. A
-flags-only change needs both provenances, the engines' and the gateway's. A change that lacks
-that evidence, a flags-only one in particular, is refused as unverified, and so are launch
-fingerprints that differ when no launch setting was declared changed. A change of several levers is labelled `combined`.
+attempt and equal to the one the run's manifest requests and its checkpoints say (and the two
+runs' requests differ), with every host the attempt observed accounted for, and by no setting its
+engines expose contradicting one the run requested a value for; the gateway profile by the
+observed one, beside the engines' fingerprints. A change that lacks that evidence is refused as
+unverified, a gateway profile while no gateway observation exists in particular, and so are
+launch fingerprints that differ when no launch setting was declared changed. A change of several levers is labelled `combined`.
 
 **Exporting** (`export`) is explicit and writes a new directory under `docs/evaluations/` and
 nowhere else. It reads the bundle as `load` does, which holds every value to the contracts (an
@@ -215,6 +216,7 @@ LEVERS: dict[str, Lever] = {
     "speculative_decoding": Lever.LAUNCH_SETTINGS,
     "renderer_digest": Lever.LAUNCH_SETTINGS,
     "gateway_profile_digest": Lever.GATEWAY_PROFILE,
+    "launch_fingerprint": Lever.LAUNCH_SETTINGS,
 }
 # The levers a release does not show by itself: the same image and model can run other flags.
 FLAGS = frozenset({Lever.LAUNCH_SETTINGS, Lever.GATEWAY_PROFILE})
@@ -1425,12 +1427,13 @@ def _launch_fingerprint(bundle: Bundle) -> str | None:
 
 
 def _launched_as_requested(bundle: Bundle) -> bool:
-    """Whether every serving host of every attempt is accounted for and said the requested launch
-    fingerprint through its time in service: each attempt lists as many hosts as its record
-    observed, which is the run's host count, and no host is left without a fingerprint."""
-    requested = _launch_fingerprint(bundle)
+    """Whether every serving host of every attempt is accounted for and said the launch
+    fingerprint the manifest requests through its time in service: every checkpoint says the
+    release requests that one, each attempt lists as many hosts as its record observed, which is
+    the run's host count, and no host is left without a fingerprint."""
+    requested = bundle.manifest.requested.launch_fingerprint
     hosts = bundle.manifest.requested.host_count
-    if requested is None or not bundle.attempts or hosts is None:
+    if requested is None or _launch_fingerprint(bundle) != requested or not bundle.attempts or hosts is None:
         return False
     return all(
         attempt.record.hosts_observed == hosts
@@ -1463,14 +1466,15 @@ def _served(bundle: Bundle, lever: Lever, changed: Sequence[str]) -> bool:
         )
         return as_observed and ("host_count" not in changed or cells)
     if lever is Lever.LAUNCH_SETTINGS:
-        # What the engine itself exposes must not say otherwise; what it does not expose is
-        # established by the fingerprint alone.
+        # What the engine itself exposes must not say otherwise where the run requested a value,
+        # as telemetry compares it; the rest is established by the engines' fingerprints alone.
         contradicted = any(
-            getattr(manifest.observed, name) is not None
+            getattr(manifest.requested, name) is not None
+            and getattr(manifest.observed, name) is not None
             and getattr(manifest.observed, name) != getattr(manifest.requested, name)
             for name in changed
         )
-        return not contradicted and _launched_as_requested(bundle) and _gateway_as_requested(bundle)
+        return not contradicted and _launched_as_requested(bundle)
     if lever is Lever.GATEWAY_PROFILE:
         # A flags-only change needs both provenances: the gateway's and each engine's.
         return as_observed and _gateway_as_requested(bundle) and _launched_as_requested(bundle)

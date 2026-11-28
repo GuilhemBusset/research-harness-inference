@@ -4,7 +4,7 @@ per run and a final comment per paired comparison (docs/design/agent-session-eva
 
 **What is published.** Only the fields of `Experiment`, `RunResult` and `Comparison`, each checked
 before anything is rendered: a fixed vocabulary (`Ending`, `Reason`, `Verdict`, `Cleanup`,
-`Relative` and the shapes, harnesses and profiles of `evaluate.contracts`), a count, a measured
+`Relative`, a comparison's `Label` and verified `Lever`s, and the shapes, harnesses and profiles of `evaluate.contracts`), a count, a measured
 number as it was measured, a digest, a commit, or the permalink of a reviewed bundle on GitHub. A
 configuration is the public serving settings of `contracts.Settings`, each held to its own rule
 (an image digest, a GPU's public name, ...), and the floors are the suite's `contracts.Objectives`,
@@ -166,6 +166,29 @@ class Relative(StrEnum):
     INCONCLUSIVE = "inconclusive"
 
 
+class Label(StrEnum):
+    """What a comparison's treatment diff calls the pair: the labels of
+    `evaluate.report.treatment_diff`, which the publish-only path does not import."""
+
+    REPEAT = "repeat"
+    COMBINED = "combined"
+    FLAGS_ONLY = "flags_only"
+    HOSTS = "hosts"
+    RELEASE = "release"
+    TOKENIZER = "tokenizer"
+
+
+class Lever(StrEnum):
+    """A lever a comparison verified as served in both runs: the values of
+    `evaluate.report.Lever`."""
+
+    HOSTS = "hosts"
+    RELEASE = "release"
+    TOKENIZER = "tokenizer"
+    LAUNCH_SETTINGS = "launch_settings"
+    GATEWAY_PROFILE = "gateway_profile"
+
+
 class Cleanup(StrEnum):
     """What became of the run's booking: the values of `evaluate.booking.Cleanup`, which the
     publish-only path does not import."""
@@ -270,6 +293,9 @@ class Comparison:
     limits: Mapping[Shape, tuple[Limit | None, Limit | None]] = field(default_factory=dict)
     # The shapes whose paired quality at class load decides nothing, and why.
     undecided: Mapping[Shape, Undecided] = field(default_factory=dict)
+    # What the treatment diff calls the pair, and the levers shown to have served in both runs.
+    label: Label | None = None
+    verified: Sequence[Lever] = ()
 
 
 @dataclass(frozen=True)
@@ -579,6 +605,7 @@ def render_comparison(comparison: Comparison) -> str:
             f" against reference `{_matches(_RUN_ID, comparison.reference_run)}`"
         ),
         "",
+        *_treatment_lines(comparison.label, comparison.verified),
         f"- Capacity by shape: {_by_shape(comparison.capacity, Relative)}",
         *_limit_lines(comparison.capacity, comparison.limits),
         f"- Quality by shape: {_by_shape(comparison.quality, Relative)}",
@@ -586,6 +613,14 @@ def render_comparison(comparison: Comparison) -> str:
         *_bundle(comparison.bundle_digest, comparison.permalink),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _treatment_lines(label: object, verified: object) -> list[str]:
+    """The pair's treatment label and its verified levers, once the label is given."""
+    if not isinstance(verified, tuple | list):
+        raise _reject()
+    levers = ", ".join(f"`{_member(Lever, lever)}`" for lever in verified) or "none"
+    return [] if label is None and not verified else [f"- Treatment: `{_member(Label, label)}`; verified levers: {levers}"]
 
 
 def _limit(value: object) -> str:

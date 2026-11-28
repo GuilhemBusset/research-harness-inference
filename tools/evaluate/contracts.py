@@ -290,6 +290,9 @@ Digest = Annotated[str, _Text(r"sha256:[0-9a-f]{64}", "a digest, `sha256:` and 6
 Commit = Annotated[str, _Text(r"[0-9a-f]{40}", "a commit, 40 hexadecimal digits")]
 # Three parts exactly: an address has four.
 Version = Annotated[str, _Text(r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}", "a version, MAJOR.MINOR.PATCH")]
+# The fingerprint of the arguments an engine was launched with, as the lifecycle agent says it
+# (`rhi_common.launch_settings.fingerprint`): 64 hexadecimal digits, and nothing of the arguments.
+Fingerprint = Annotated[str, _Text(r"[0-9a-f]{64}", "a launch fingerprint, 64 hexadecimal digits")]
 
 
 class Family(StrEnum):
@@ -738,6 +741,9 @@ class Settings(Record):
     speculative_decoding: SpeculativeDecoding | None
     renderer_digest: Digest | None
     gateway_profile_digest: Digest | None
+    # The fingerprint of the engine arguments the release launches: what declares the flags that
+    # no other setting names (`--max-num-seqs`, the draft head, the parsers, the loader).
+    launch_fingerprint: Fingerprint | None
 
     def check(self) -> None:
         if self.instance_type is not None:
@@ -984,10 +990,6 @@ class CellRecord(Document):
         accounted = not self.conversations_skipped and not self.conversations_outstanding
         return self.status is CellStatus.COMPLETE and not self.invalid_flags and accounted
 
-
-# The fingerprint of the arguments an engine was launched with, as the lifecycle agent says it
-# (`rhi_common.launch_settings.fingerprint`): 64 hexadecimal digits, and nothing of the arguments.
-Fingerprint = Annotated[str, _Text(r"[0-9a-f]{64}", "a launch fingerprint, 64 hexadecimal digits")]
 
 
 @dataclass(frozen=True, kw_only=True)

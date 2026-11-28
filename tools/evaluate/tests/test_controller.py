@@ -1123,6 +1123,8 @@ def test_an_issue_backed_comparison_is_posted_once(driver: Driver) -> None:
     assert len(driver.github.issues) == 1
     found = [one for one in comments(driver) if one.startswith("### Comparison")]
     assert len(found) == 1 and f"candidate `{candidate}` against reference `{reference}`" in found[0]
+    # The comment names the pair's treatment and the levers it verified, as the terminal does.
+    assert "- Treatment: `repeat`; verified levers: none" in found[0]
     assert len(comments(driver)) == 3
     # The comment names the measurement behind each capacity verdict: the candidate's missed floor.
     graded = json.loads((driver.runs / candidate / "bundle" / report.SUMMARY).read_text())["capacity"]
@@ -1312,36 +1314,97 @@ def test_a_resumed_booking_s_times_follow_the_earlier_booking_s_in_the_bundle(
     assert all(later.record.started_ms >= earlier.record.ended_ms for earlier, later in itertools.pairwise(kept))
 
 
-def test_a_host_serves_the_release_of_its_latest_scrape(monkeypatch: pytest.MonkeyPatch) -> None:
-    wanted, other, revision = "sha256:" + "a" * 64, "sha256:" + "b" * 64, "f" * 40
-    release = json.dumps({"engine_image": "engine@" + wanted, "engine_flags": [], "model_revision": revision})
+# The part of a deployed pool entry that changes the body the gateway forwards.
+GATEWAY_PROFILE = {"request_profile": ("reasoning",), "reasoning_effort": {"high": "medium"}, "cache_salt_scope": "student"}
+
+
+def resolved(
+    monkeypatch: pytest.MonkeyPatch,
+    stack: contextlib.ExitStack,
+    flags: list[str],
+    said: list[tuple[str, float]] | None = None,
+    profile: dict[str, object] | None = None,
+) -> controller.Instruments:
+    """The instruments of a deployed pool whose release runs `flags`, its hosts reporting the
+    releases `said` (image digest and age), its gateway profile `GATEWAY_PROFILE` with `profile`'s
+    changes."""
+    wanted, revision = "sha256:" + "a" * 64, "f" * 40
+    release = json.dumps({"engine_image": "engine@" + wanted, "engine_flags": flags, "model_revision": revision})
     parameter = SimpleNamespace(get_parameter=lambda **_kwargs: {"Parameter": {"Value": release}})
     session = SimpleNamespace(region_name="test", get_credentials=lambda: None, client=lambda _service: parameter)
     keys = tuple(generate_key() for _ in range(PLAN.canary_identities))
+    entry = SimpleNamespace(instance_types=["g7e.2xlarge"], engine="vllm", **(GATEWAY_PROFILE | (profile or {})))
     monkeypatch.setattr(lookups.admin_main, "pool_access", lambda _session: None)
-    monkeypatch.setattr(lookups.admin_pools, "deployed", lambda _pools: {POOL: SimpleNamespace(instance_types=["g7e.2xlarge"], engine="vllm")})
+    monkeypatch.setattr(lookups.admin_pools, "deployed", lambda _pools: {POOL: entry})
     monkeypatch.setattr(lookups, "_output", lambda *_args: "https://example.com")
     monkeypatch.setattr(lookups.spike_keys, "read", lambda _secrets: SimpleNamespace(students=keys))
     monkeypatch.setattr(lookups.image, "prepare", lambda: SimpleNamespace(image_id=wanted))
     monkeypatch.setattr(lookups.workers, "Workers", lambda *_args, **_kwargs: contextlib.nullcontext(SimpleNamespace(start=None)))
     monkeypatch.setattr(controller, "source_commit", lambda *_args, **_kwargs: "c" * 40)
-    said: list[tuple[str, float]] = []
 
     def samples(_query: str, *, at: float) -> list[Any]:
         labels = {"instance": "host", "model_revision": revision}
-        return [lookups.common.Series(labels={**labels, "image_digest": digest}, samples=((at - age, 1),)) for digest, age in said]
+        return [lookups.common.Series(labels={**labels, "image_digest": digest}, samples=((at - age, 1),)) for digest, age in said or []]
 
     monkeypatch.setattr(lookups.common, "Workspace", lambda *_args: SimpleNamespace(read_samples=samples))
+    return lookups.resolve(controller.Scope(POOL, REPO, 1), PLAN, session, {}, stack)
+
+
+def test_a_host_serves_the_release_of_its_latest_scrape(monkeypatch: pytest.MonkeyPatch) -> None:
+    wanted, other = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+    said: list[tuple[str, float]] = []
     with contextlib.ExitStack() as stack:
-        resolved = lookups.resolve(controller.Scope(POOL, REPO, 1), PLAN, session, {}, stack)
+        instruments = resolved(monkeypatch, stack, [], said)
         # The host left the release: an older scrape of it, answered last, does not count.
         said[:] = [(other, 1), (wanted, 16)]
-        assert resolved.releases() != [resolved.release]
+        assert instruments.releases() != [instruments.release]
         said[:] = [(wanted, 1), (other, 16)]
-        assert resolved.releases() == [resolved.release]
+        assert instruments.releases() == [instruments.release]
         # One scrape that says two releases says none.
         said[:] = [(wanted, 1), (other, 1)]
-        assert resolved.releases() == [lookups.AMBIGUOUS]
+        assert instruments.releases() == [lookups.AMBIGUOUS]
+
+
+def requested(monkeypatch: pytest.MonkeyPatch, flags: list[str], **profile: object) -> Settings:
+    """The settings `resolve` requests for a release that runs `flags`."""
+    with contextlib.ExitStack() as stack:
+        source = resolved(monkeypatch, stack, flags, profile=profile).telemetry
+    assert isinstance(source, phases.Telemetry)
+    assert source.requested.launch_fingerprint == source.requested.settings.launch_fingerprint
+    return source.requested.settings
+
+
+def test_the_release_s_engine_flags_are_requested_as_its_launch_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from rhi_common import launch_settings
+
+    flags = ["model", "--max-num-batched-tokens", "4096", "--max-model-len=131072", "--tensor-parallel-size", "2"]
+    flags += ["--kv-cache-dtype", "fp8", "--no-enable-prefix-caching", "--max-num-seqs", "16"]
+    asked = requested(monkeypatch, flags)
+    assert (asked.step_budget_tokens, asked.launch_fingerprint) == (4096, launch_settings.fingerprint(flags))
+    assert (asked.context_limit_tokens, asked.tensor_parallelism) == (131_072, 2)
+    assert (asked.kv_dtype, asked.prefix_caching) == (contracts.KvDtype.BITS_8, False)
+    assert requested(monkeypatch, [*flags[:6], "--kv-cache-dtype", "auto"]).kv_dtype is contracts.KvDtype.BITS_16
+
+    # An option the flags leave out is not filled with vLLM's default.
+    left_out = requested(monkeypatch, ["model", "--max-num-seqs", "16"])
+    assert left_out.launch_fingerprint == launch_settings.fingerprint(["model", "--max-num-seqs", "16"])
+    assert [left_out.step_budget_tokens, left_out.context_limit_tokens, left_out.tensor_parallelism] == [None] * 3
+    assert (left_out.kv_dtype, left_out.prefix_caching) == (None, None)
+    # Flags the contract does not know request no fingerprint, and none of the settings.
+    unknown = requested(monkeypatch, [*flags, "--unknown-option"])
+    assert (unknown.launch_fingerprint, unknown.step_budget_tokens, unknown.kv_dtype) == (None, None, None)
+
+
+def test_the_deployed_gateway_profile_is_requested_as_its_digest(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hashlib
+
+    profile = {"request_profile": ["reasoning"], "reasoning_effort": {"high": "medium"}, "cache_salt_scope": "student"}
+    canonical = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+    digest = "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+    assert requested(monkeypatch, []).gateway_profile_digest == digest
+    # A request-side change is declared, though the release and its flags are the same.
+    for change in ({"reasoning_effort": {"high": "low"}}, {"cache_salt_scope": "class"}, {"request_profile": ()}):
+        assert requested(monkeypatch, [], **change).gateway_profile_digest not in (None, digest)
 
 
 def test_a_gap_in_a_host_s_launch_series_is_no_whole_window() -> None:

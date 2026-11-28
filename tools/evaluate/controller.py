@@ -1590,8 +1590,8 @@ def _limit(summary: Mapping[str, Any], shape: Shape) -> publisher.Limit | None:
 
 
 def comparison_of(compared: Mapping[str, Any], reference_run: str, candidate_run: str) -> publisher.Comparison:
-    """The comparison's comment fields: capacity by shape from the two scorecards, with each
-    shape's limiting row in both runs; quality by shape from the paired decision at class load,
+    """The comparison's comment fields: the treatment diff's label and verified levers; capacity
+    by shape from the two scorecards, with each shape's limiting row in both runs; quality by shape from the paired decision at class load,
     with the reason of one that decides nothing."""
     ours, theirs = scorecard(compared["candidate"]), scorecard(compared["reference"])
     quality: dict[Shape, publisher.Relative] = {}
@@ -1617,6 +1617,8 @@ def comparison_of(compared: Mapping[str, Any], reference_run: str, candidate_run
             shape: (_limit(compared["reference"], shape), _limit(compared["candidate"], shape)) for shape in Shape
         },
         undecided=undecided,
+        label=publisher.Label(compared["diff"]["label"]),
+        verified=tuple(publisher.Lever(one) for one in compared["diff"]["verified"]),
     )
 
 

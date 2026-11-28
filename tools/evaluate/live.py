@@ -5,12 +5,18 @@ this host (docs/design/agent-session-evaluation.md, "How the operator runs it").
 `resolve` reads, for the scope's pool and nothing else:
 
 - the pool's deployed settings, from the scaler's function of the pools stack
-  (`rhi_admin.main.pool_access`, `rhi_admin.pools.deployed`): its engine and the instance type it
-  runs first;
+  (`rhi_admin.main.pool_access`, `rhi_admin.pools.deployed`): its engine, the instance type it
+  runs first, and its gateway profile, the part of its entry that changes the body the gateway
+  forwards (`request_profile`, `reasoning_effort`, `cache_salt_scope`), requested as the digest
+  of its canonical JSON (`gateway_profile_digest`);
 - the pool's current release, from its release parameter (`/rhi/pools/<pool>/release`, as
   `rhi.pools.group.release_parameter` names it):
   the engine image's digest, the model revision and the engine's flags, whose launch fingerprint
-  (`rhi_common.launch_settings.fingerprint`) is the treatment's;
+  (`rhi_common.launch_settings.fingerprint`) is the treatment's. The flags are read as that
+  contract reads them (`flag_settings`): the step budget, the context limit, the tensor
+  parallelism, the cache's precision and prefix caching are requested where the flags give them
+  and never filled with vLLM's defaults; any other flag is declared by the fingerprint alone, and
+  flags the contract does not know request no fingerprint and none of these settings;
 - the gateway's address and the metrics workspace's query address, the outputs of the gateway and
   the observability stacks;
 - the canary students' keys, from the spikes' secret (`rhi_common.spike_keys`), each under its
@@ -122,6 +128,44 @@ def pool_sessions(session: Any) -> admin_session.Sessions:
     return admin_session.Sessions(
         pools=admin_main.pool_access(session), time_zone="UTC", session_max_hours=hours, default_pool=None
     )
+
+
+# The settings of `contracts.Settings` an engine's flags give, by the option's name as
+# `launch_settings.normalize` reads it; the cache's precision as telemetry reads the engine's own.
+FLAG_SETTINGS = {
+    "max-num-batched-tokens": "step_budget_tokens",
+    "max-model-len": "context_limit_tokens",
+    "tensor-parallel-size": "tensor_parallelism",
+    "kv-cache-dtype": "kv_dtype",
+    "enable-prefix-caching": "prefix_caching",
+}
+KV_DTYPES = telemetry.EFFECTIVE["kv_dtype"][1]
+
+
+def flag_settings(flags: Sequence[str]) -> dict[str, object]:
+    """The requested settings a release's engine flags give: its launch fingerprint and the
+    settings of `FLAG_SETTINGS`, each None where the flags leave its option out, and all of them
+    None for flags the launch-settings contract does not know."""
+    normalized = launch_settings.normalize(flags)
+    found: dict[str, object] = dict.fromkeys(["launch_fingerprint", *FLAG_SETTINGS.values()])
+    if normalized is None:
+        return found
+    found |= {name: normalized.get(option) for option, name in FLAG_SETTINGS.items()}
+    if found["kv_dtype"] is not None:
+        found["kv_dtype"] = KV_DTYPES[str(found["kv_dtype"])]
+    return found | {"launch_fingerprint": launch_settings.fingerprint(flags)}
+
+
+def gateway_profile_digest(pool: Any) -> str:
+    """The digest of the deployed pool entry's gateway profile: the SHA-256 of the canonical JSON
+    of its `request_profile`, `reasoning_effort` and `cache_salt_scope`."""
+    profile = {
+        "request_profile": list(pool.request_profile),
+        "reasoning_effort": pool.reasoning_effort,
+        "cache_salt_scope": pool.cache_salt_scope,
+    }
+    text = json.dumps(profile, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def release_of(image_digest: str, model_revision: str | None) -> str:
@@ -243,26 +287,22 @@ def resolve(
     reader = common.Workspace(workspace_url, session.region_name, session.get_credentials())
     clock = replay.RunClock()
     kind = pool.instance_types[0]
-    fingerprint = launch_settings.fingerprint(flags)
     try:
         requested = Settings.from_json(
             {one.name: None for one in dataclasses.fields(Settings)}
+            | flag_settings(flags)
             | {
                 "host_count": scope.instances,
                 "instance_type": kind if kind in set(InstanceType) else None,
                 "model_revision": revision,
                 "engine_image_digest": image_digest,
+                "gateway_profile_digest": gateway_profile_digest(pool),
             },
             "requested",
         )
     except ValueError as error:  # a `ContractError`: the release does not read as public settings
         raise Unresolved(Check.BINDING) from error
-    source = phases.Telemetry(
-        reader,
-        scope.pool,
-        pool.engine,
-        telemetry.Requested(requested, None if fingerprint == launch_settings.UNAVAILABLE else fingerprint),
-    )
+    source = phases.Telemetry(reader, scope.pool, pool.engine, telemetry.Requested(requested, requested.launch_fingerprint))
     try:
         prepared = image.prepare()
     except (OSError, RuntimeError, ValueError) as error:
