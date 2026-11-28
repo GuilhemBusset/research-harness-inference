@@ -130,8 +130,14 @@ def instance_with(tmp_path: Path, engine: str) -> Instance:
     return Instance(root, record, tools, secrets.token_urlsafe(32))
 
 
-def lines(outcomes: dict[str, str], status: int) -> str:
-    return "".join(f"rhi-contract {name} {outcomes[name]}\n" for name in TESTS) + f"rhi-contract exit {status}\n"
+def lines(outcomes: dict[str, str], status: int, reasons: dict[str, str] | None = None) -> str:
+    """The script's output: each test's outcome, followed by its reason where it has one, then the exit."""
+    printed = ""
+    for name in TESTS:
+        printed += f"rhi-contract {name} {outcomes[name]}\n"
+        if name in (reasons or {}):
+            printed += f"rhi-contract-reason {name} {(reasons or {})[name]}\n"
+    return printed + f"rhi-contract exit {status}\n"
 
 
 @pytest.mark.parametrize(
@@ -188,6 +194,23 @@ def test_the_container_gets_the_secret_on_its_standard_input_and_the_output_is_f
     assert arguments[-len(TESTS) :] == [f"tests/contract/test_engine_contract.py::{name}" for name in TESTS]
 
 
+def test_a_failed_test_s_reason_follows_its_outcome_in_the_suite_s_words_only(tmp_path: Path) -> None:
+    instance = instance_with(tmp_path, "vllm")
+    outcomes = dict.fromkeys(TESTS, "failed") | {"test_health": "passed"}
+    output = "".join(f"{name} {outcome}\n" for name, outcome in outcomes.items())
+    output += "test_inference reason messages-whole no-text max_tokens\n"
+    # A word outside the vocabulary, the secret, more words, a passed test's, a test not run here.
+    output += "test_metrics reason metrics metric-missing-sentinel none\n"
+    output += f"test_bearer_secret reason {instance.secret} status-200 none\n"
+    output += "test_bearer_secret reason chat-with-secret status-401 none and more\n"
+    output += "test_health reason health status-503 none\ntest_shutdown reason none timeout none\n"
+    run = instance.run(output=output, status="1")
+
+    reasons = {"test_inference": "messages-whole no-text max_tokens"}
+    assert run.stdout == lines(outcomes, 1, reasons)
+    assert run.returncode == 1
+
+
 async def _no_sleep(seconds: float) -> None:
     del seconds
 
@@ -218,13 +241,21 @@ def test_the_suite_passes_against_an_engine_on_the_loopback_address(tmp_path: Pa
 
 def test_pytest_s_report_stays_in_the_container_and_only_the_outcomes_leave(tmp_path: Path) -> None:
     """The container's own command, run: against an engine that refuses every connection, each
-    test fails with a report that names the secret, and the script prints the outcomes alone."""
+    test fails with a report that names the secret, and the script prints the outcomes and the
+    reasons alone."""
     instance = instance_with(tmp_path, "mock")
     with socket.socket() as refusing:
         refusing.bind(("127.0.0.1", 0))  # bound and not listening: a connection is refused
         run = instance.run(engine=f"http://127.0.0.1:{refusing.getsockname()[1]}")
 
-    assert run.stdout == lines(dict.fromkeys(TESTS, "failed"), 1)
+    # Each test's reason: the first request it sends found no engine to connect to.
+    reasons = {
+        "test_inference": "chat-whole no-connection none",
+        "test_health": "health no-connection none",
+        "test_metrics": "chat-streamed no-connection none",
+        "test_bearer_secret": "chat-without-secret no-connection none",
+    }
+    assert run.stdout == lines(dict.fromkeys(TESTS, "failed"), 1, reasons)
     assert run.returncode == 1
     assert instance.secret not in run.stdout + run.stderr
     # Nothing written beside the suite: no report, no cache.

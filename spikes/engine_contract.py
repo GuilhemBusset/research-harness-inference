@@ -3,7 +3,8 @@ sections 4.1, 8.4 and 12).
 
 The pools stack's Systems Manager document `rhi-engine-contract` (`rhi.pools.contract_check`)
 runs the release's contract suite on an instance against that instance's own engine, and prints
-only `rhi-contract <test> <outcome>` for each of the four tests and `rhi-contract exit <status>`.
+only `rhi-contract <test> <outcome>` for each of the four tests, `rhi-contract-reason <test>
+<request> <check> <finish>` after a failed one's, and `rhi-contract exit <status>`.
 This job sends it, in a session the owner booked, to the instances whose tag `rhi-pool` is the
 pool's name, and records what each invocation reported. It names no instance, and reads nothing
 of EC2 or Auto Scaling: Run Command finds the instances by the tag.
@@ -51,13 +52,14 @@ keeps. Every line has `at`, its UTC time, and `kind`:
 | Kind | What it holds |
 | --- | --- |
 | `job` | The pool and its engine |
-| `instance_check` | For each instance the command reached, `instance`, its order of appearance from 1, never its ID; `status`, the invocation's status, one of `STATUSES` or `other`; `tests`, each of the four tests and its outcome, `null` for one the output does not give; `exit`, the exit status the output gives, or `null` |
+| `instance_check` | For each instance the command reached, `instance`, its order of appearance from 1, never its ID; `status`, the invocation's status, one of `STATUSES` or `other`; `tests`, each of the four tests and its outcome, `null` for one the output does not give; `reasons`, each of the four tests and the three words of its reason, `null` for one the output does not give; `exit`, the exit status the output gives, or `null` |
 | `job_failed` | An error that stopped the job: the type of the error, never its text, and for a job the pool's session does not carry, the reason |
 
 Of an invocation's output only the lines of the vocabulary of `services/engine/contract/run.sh`
 are read: `rhi-contract <test> <outcome>`, the test one of `TESTS` and the outcome one of
-`OUTCOMES`, and `rhi-contract exit <status>`, the status a number. Every other line is dropped and
-written nowhere.
+`OUTCOMES`; `rhi-contract-reason <test> <request> <check> <finish>`, the test one of `TESTS` and
+each word one of the reason's vocabulary (`is_reason`, system design, section 4.1); and
+`rhi-contract exit <status>`, the status a number. Every other line is dropped and written nowhere.
 
 The job exits 0 only when at least the instances it was given answered, and every invocation
 ended in `Success` with each of the four tests `passed`.
@@ -95,6 +97,35 @@ PREFIX = "rhi-contract"
 TESTS = ("test_inference", "test_health", "test_metrics", "test_bearer_secret")
 OUTCOMES = frozenset({"passed", "failed", "error", "skipped", "missing"})
 PASSED = "passed"
+# A failed test's reason: `REASON_PREFIX <test> <request> <check> <finish>`, each word one of these.
+REASON_PREFIX = "rhi-contract-reason"
+FORMATS = ("chat", "responses", "messages")
+REQUESTS = frozenset(
+    {
+        "health",
+        "metrics",
+        "count",
+        "none",
+        *(f"{f}-{way}{calling}" for f in FORMATS for way in ("whole", "streamed") for calling in ("", "-calling")),
+        *(f"{route}-{way}-secret" for route in (*FORMATS, "count") for way in ("without", "wrong", "with")),
+    }
+)
+# The quantities of `rhi_common.engine_metrics.Quantity`, whose metrics a reason may name.
+QUANTITIES = (
+    *("running_requests", "waiting_requests", "time_to_first_token", "time_per_output_token"),
+    *("input_tokens", "cached_input_tokens", "output_tokens", "cache_usage"),
+)
+CHECKS = frozenset(
+    {
+        *("not-a-stream", "no-end-event", "no-usage", "no-text", "a-call", "no-call", "arguments-not-an-object"),
+        *("no-input-tokens", "metrics-elsewhere", "timeout", "no-connection", "unreadable", "unexplained"),
+        *(f"metric-{kind}-{quantity}" for kind in ("missing", "kind") for quantity in QUANTITIES),
+    }
+)
+FINISHES = frozenset(
+    {"stop", "length", "tool_calls", "completed", "incomplete"}
+    | {"end_turn", "max_tokens", "tool_use", "stop_sequence", "other", "none"}
+)
 # The statuses of an invocation Run Command lists; any other is written `other`. Those after which
 # an invocation does nothing more are `ENDED`.
 STATUSES = ("Pending", "InProgress", "Delayed", "Success", "Cancelled", "TimedOut", "Failed", "Cancelling")
@@ -167,13 +198,23 @@ class Lines:
         self.out(json.dumps({"at": utc(self.wall()), "kind": kind.value, **fields}, separators=(",", ":")))
 
 
-def reported(output: str) -> tuple[dict[str, str | None], int | None]:
-    """Each test's outcome and the exit status an invocation's output gives, from the lines of the
-    vocabulary alone: a test the output does not give is None, and so is a missing exit status."""
+def is_reason(request: str, check: str, finish: str) -> bool:
+    """Whether three words are a reason of the vocabulary."""
+    status = check.startswith("status-") and len(check) == 10 and check[7:].isascii() and check[7:].isdigit()
+    return request in REQUESTS and (check in CHECKS or status) and finish in FINISHES
+
+
+def reported(output: str) -> tuple[dict[str, str | None], dict[str, list[str] | None], int | None]:
+    """Each test's outcome, each test's reason and the exit status an invocation's output gives,
+    from the lines of the vocabulary alone: a test the output does not give is None, and so is a
+    missing reason or exit status."""
     tests: dict[str, str | None] = dict.fromkeys(TESTS)
+    reasons: dict[str, list[str] | None] = dict.fromkeys(TESTS)
     status: int | None = None
     for line in output.splitlines():
         words = line.split()
+        if len(words) == 5 and words[0] == REASON_PREFIX and words[1] in reasons and is_reason(*words[2:]):
+            reasons[words[1]] = words[2:]
         if len(words) != 3 or words[0] != PREFIX:
             continue
         _, name, value = words
@@ -181,7 +222,7 @@ def reported(output: str) -> tuple[dict[str, str | None], int | None]:
             tests[name] = value
         elif name == "exit" and value.isascii() and value.isdigit() and len(value) <= 3:
             status = int(value)
-    return tests, status
+    return tests, reasons, status
 
 
 def status_of(invocation: Mapping[str, Any]) -> str:
@@ -265,8 +306,8 @@ def record(lines: Lines, checked: Iterable[Mapping[str, Any]], *, instances: int
     passed = []
     for number, invocation in enumerate(checked, start=1):
         status = status_of(invocation)
-        tests, exit_status = reported(output_of(invocation))
-        lines.write(Line.INSTANCE_CHECK, instance=number, status=status, tests=tests, exit=exit_status)
+        tests, reasons, exit_status = reported(output_of(invocation))
+        lines.write(Line.INSTANCE_CHECK, instance=number, status=status, tests=tests, reasons=reasons, exit=exit_status)
         passed.append(status == SUCCESS and all(outcome == PASSED for outcome in tests.values()))
     return 0 if len(passed) >= instances and all(passed) else 1
 

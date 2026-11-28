@@ -17,8 +17,11 @@ elsewhere. So are the engine settings the contract fixes for vLLM.
 `conftest.py` says which engine the suite runs against: the mock in this process, or the engine at
 the address the environment gives. The suite asks only what any engine answers. A request forces
 the call of its function, so a model has no choice to make, and nothing is read from an answer but
-where its format puts the text, the call, and the usage. Streams are read with the gateway's own
-reader of server-sent events.
+where its format puts the text, the call, the usage, and how it ended. Streams are read with the
+gateway's own reader of server-sent events. Every generation request asks for the effort `low` and
+2,048 tokens, which leave a model that reasons first room to answer (`ROOM`). Every check fails
+with a message whose first line is its reason, `<request> <check> <finish>` (`Exchange`): the one
+line of a failure that leaves the node (system design, section 4.1).
 
 The last tests are about the suite itself: that it fails on a broken engine, that it runs against
 an engine at an address, and what the environment asks for.
@@ -35,10 +38,11 @@ import signal
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Generator, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import httpx
 import pytest
@@ -52,13 +56,26 @@ REPO = Path(__file__).resolve().parents[2]
 CHAT, RESPONSES, MESSAGES, COUNT = "/v1/chat/completions", "/v1/responses", "/v1/messages", "/v1/messages/count_tokens"
 FORMATS = (CHAT, RESPONSES, MESSAGES)
 INFERENCE_ROUTES = (*FORMATS, COUNT)
+# Each route's word in a reason.
+WORDS = {CHAT: "chat", RESPONSES: "responses", MESSAGES: "messages", COUNT: "count"}
 
 MODEL = "coursework"
 PROMPT = "Read the file notes.txt and say what it holds."
+# What every generation request asks for, as every harness does: an effort, and a budget the
+# reasoning fits in. The coursework model reasons first, at `xhigh` unless asked, and a smaller
+# budget can end inside the reasoning, with no text and no call. `low` is the lowest effort its
+# template accepts; 2,048 tokens take about 36 seconds at one stream's rate, within the client's
+# read time (system design, section 4.1). Each in its format's own field.
+EFFORT, BUDGET = "low", 2048
+ROOM: dict[str, dict[str, Any]] = {
+    CHAT: {"reasoning_effort": EFFORT, "max_completion_tokens": BUDGET},
+    RESPONSES: {"reasoning": {"effort": EFFORT}, "max_output_tokens": BUDGET},
+    MESSAGES: {"output_config": {"effort": EFFORT}, "max_tokens": BUDGET},
+}
 REQUESTS: dict[str, dict[str, Any]] = {
-    CHAT: {"model": MODEL, "messages": [{"role": "user", "content": PROMPT}]},
-    RESPONSES: {"model": MODEL, "input": PROMPT},
-    MESSAGES: {"model": MODEL, "max_tokens": 1024, "messages": [{"role": "user", "content": PROMPT}]},
+    CHAT: {"model": MODEL, "messages": [{"role": "user", "content": PROMPT}], **ROOM[CHAT]},
+    RESPONSES: {"model": MODEL, "input": PROMPT, **ROOM[RESPONSES]},
+    MESSAGES: {"model": MODEL, "messages": [{"role": "user", "content": PROMPT}], **ROOM[MESSAGES]},
     COUNT: {"model": MODEL, "messages": [{"role": "user", "content": PROMPT}]},
 }
 # What asks each format for a stream that carries its usage.
@@ -84,9 +101,71 @@ CALLING: dict[str, dict[str, Any]] = {
         "tool_choice": {"type": "tool", "name": FUNCTION},
     },
 }
+# How each format says its answer ended, in the words it uses; any other value is `other`.
+FINISHES: dict[str, frozenset[str]] = {
+    CHAT: frozenset({"stop", "length", "tool_calls"}),
+    RESPONSES: frozenset({"completed", "incomplete"}),
+    MESSAGES: frozenset({"end_turn", "max_tokens", "tool_use", "stop_sequence"}),
+}
+# The events that end a Responses stream, each carrying the response and its status; of them, those
+# that end it with an answer.
+RESPONSES_LAST = frozenset({"response.completed", "response.incomplete", "response.failed"})
+RESPONSES_ENDS = frozenset({"response.completed", "response.incomplete"})
 
 # An address no engine is scraped from (a documentation range).
 ELSEWHERE = "203.0.113.7"
+
+
+# --- Saying why a check failed -------------------------------------------------------------------
+
+
+class Exchange:
+    """One request of a test, and how far its answer was read.
+
+    A failed check raises an assertion whose message begins with the line `<request> <check>
+    <finish>`: the request's name, the check's, and how the answer said it ended, all words of the
+    suite's own (system design, section 4.1), so that the line holds nothing of the request or the
+    answer. The plugin of `services/engine/contract/` passes that line on, and nothing else.
+    """
+
+    def __init__(self, request: str, route: str | None = None) -> None:
+        self.request, self.route, self.finish = request, route, "none"
+
+    def ended(self, value: object) -> None:
+        """Note how the answer said it ended. A value of `None` says nothing."""
+        if value is not None and self.route in FINISHES:
+            self.finish = value if isinstance(value, str) and value in FINISHES[self.route] else "other"
+
+    def reason(self, check: str) -> str:
+        return f"{self.request} {check} {self.finish}"
+
+    def check(self, holds: bool, check: str, detail: str = "") -> None:
+        if not holds:
+            raise AssertionError(self.reason(check) + (f"\n{detail}" if detail else ""))
+
+
+def status_word(response: httpx.Response) -> str:
+    return f"status-{response.status_code:03d}"
+
+
+@contextmanager
+def exchanging(request: str, route: str | None = None) -> Generator[Exchange]:
+    """The exchange of one request, whose every failure begins with its reason: one the suite
+    raised as it is, a timeout, a transport error, an answer not of its format's shape, or else
+    `unexplained`."""
+    said = Exchange(request, route)
+    try:
+        yield said
+    except AssertionError:
+        raise
+    except httpx.TimeoutException as error:
+        raise AssertionError(said.reason("timeout")) from error
+    except httpx.TransportError as error:
+        raise AssertionError(said.reason("no-connection")) from error
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError, httpx.DecodingError) as error:
+        raise AssertionError(said.reason("unreadable")) from error
+    except Exception as error:
+        raise AssertionError(said.reason("unexplained")) from error
 
 
 # --- Reading an answer ---------------------------------------------------------------------------
@@ -101,6 +180,18 @@ class Answer(NamedTuple):
     output_tokens: object
 
 
+def text_of(value: object) -> str:
+    """The text a field that may be empty holds: a string, or nothing. Any other value is not of the format's shape."""
+    return "" if value is None else string_of(value)
+
+
+def string_of(value: object) -> str:
+    """The text a field that must hold one holds: a string, and nothing else is of the format's shape."""
+    if isinstance(value, str):
+        return value
+    raise TypeError("the answer's text is not a string")
+
+
 class Calls:
     """The function calls of an answer, each put together from the pieces that carry its key."""
 
@@ -109,8 +200,8 @@ class Calls:
 
     def add(self, key: object, name: object = None, arguments: object = None) -> None:
         call = self._calls.setdefault(key, ["", ""])
-        call[0] += name if isinstance(name, str) else ""
-        call[1] += arguments if isinstance(arguments, str) else ""
+        call[0] += text_of(name)
+        call[1] += text_of(arguments)
 
     def all(self) -> list[tuple[str, str]]:
         return [(name, arguments) for name, arguments in self._calls.values()]
@@ -120,86 +211,139 @@ def counts(usage: object, input_key: str, output_key: str) -> tuple[object, obje
     return (usage.get(input_key), usage.get(output_key)) if isinstance(usage, Mapping) else (None, None)
 
 
-def read_chat(answer: dict[str, Any]) -> Answer:
-    message, calls = answer["choices"][0]["message"], Calls()
+def read_chat(answer: dict[str, Any], said: Exchange) -> Answer:
+    choice, calls = answer["choices"][0], Calls()
+    said.ended(choice.get("finish_reason"))
+    message = choice["message"]
     for index, call in enumerate(message.get("tool_calls") or []):
         calls.add(index, call["function"]["name"], call["function"]["arguments"])
     return Answer(
-        message.get("content") or "", calls.all(), *counts(answer.get("usage"), "prompt_tokens", "completion_tokens")
+        text_of(message.get("content")),
+        calls.all(),
+        *counts(answer.get("usage"), "prompt_tokens", "completion_tokens"),
     )
 
 
-def read_chat_stream(data: list[str]) -> Answer:
-    assert data[-1:] == ["[DONE]"], "the stream does not end with [DONE]"
-    text, calls, usage = "", Calls(), None
-    for chunk in map(json.loads, data[:-1]):
-        usage = chunk.get("usage") or usage
+class Stream:
+    """A stream's reader, fed each event's data as it arrives, so that a stream cut short still
+    says how far its answer was read: how it said it ended, among the rest."""
+
+    def __init__(self, said: Exchange) -> None:
+        self.said, self.text, self.calls = said, "", Calls()
+
+    def feed(self, data: str) -> None:
+        raise NotImplementedError
+
+    def answer(self) -> Answer:
+        raise NotImplementedError
+
+
+class ChatStream(Stream):
+    def __init__(self, said: Exchange) -> None:
+        super().__init__(said)
+        self.done, self.usage = False, cast(object, None)
+
+    def feed(self, data: str) -> None:
+        # `[DONE]` ends the stream: an event after it is not of the format's shape.
+        if self.done:
+            raise ValueError("an event after [DONE]")
+        self.done = data == "[DONE]"
+        if self.done:
+            return
+        chunk = json.loads(data)
+        self.usage = chunk.get("usage") or self.usage
         for choice in chunk.get("choices") or []:
+            self.said.ended(choice.get("finish_reason"))
             delta = choice.get("delta") or {}
-            text += delta.get("content") or ""
+            self.text += text_of(delta.get("content"))
             for call in delta.get("tool_calls") or []:
                 function = call.get("function") or {}
-                calls.add(call.get("index"), function.get("name"), function.get("arguments"))
-    return Answer(text, calls.all(), *counts(usage, "prompt_tokens", "completion_tokens"))
+                self.calls.add(call.get("index"), function.get("name"), function.get("arguments"))
+
+    def answer(self) -> Answer:
+        self.said.check(self.done, "no-end-event", "the stream does not end with [DONE]")
+        return Answer(self.text, self.calls.all(), *counts(self.usage, "prompt_tokens", "completion_tokens"))
 
 
-def read_responses(answer: dict[str, Any]) -> Answer:
+def read_responses(answer: dict[str, Any], said: Exchange) -> Answer:
+    said.ended(answer.get("status"))
     text, calls = "", Calls()
     for index, item in enumerate(answer["output"]):
         if item["type"] == "message":
-            text += "".join(part["text"] for part in item["content"] if part["type"] == "output_text")
+            text += "".join(string_of(part["text"]) for part in item["content"] if part["type"] == "output_text")
         elif item["type"] == "function_call":
             calls.add(index, item["name"], item["arguments"])
     return Answer(text, calls.all(), *counts(answer.get("usage"), "input_tokens", "output_tokens"))
 
 
-def read_responses_stream(data: list[str]) -> Answer:
-    events = [json.loads(one) for one in data]
-    assert events and events[-1]["type"] == "response.completed", "the stream does not end with response.completed"
-    text, calls = "", Calls()
-    for event in events:
-        if event["type"] == "response.output_text.delta":
-            text += event["delta"]
+class ResponsesStream(Stream):
+    def __init__(self, said: Exchange) -> None:
+        super().__init__(said)
+        self.last: dict[str, Any] = {}
+
+    def feed(self, data: str) -> None:
+        event = json.loads(data)
+        self.last = event
+        if event["type"] in RESPONSES_LAST:
+            self.said.ended(event["response"].get("status"))
+        elif event["type"] == "response.output_text.delta":
+            self.text += string_of(event["delta"])
         elif event["type"] == "response.output_item.added" and event["item"]["type"] == "function_call":
-            calls.add(event["output_index"], name=event["item"]["name"])
+            self.calls.add(event["output_index"], name=event["item"]["name"])
         elif event["type"] == "response.function_call_arguments.delta":
-            calls.add(event["output_index"], arguments=event["delta"])
-    return Answer(text, calls.all(), *counts(events[-1]["response"].get("usage"), "input_tokens", "output_tokens"))
+            self.calls.add(event["output_index"], arguments=event["delta"])
+
+    def answer(self) -> Answer:
+        # A stream that says the response failed has ended, but not with an answer.
+        ended = self.last.get("type") in RESPONSES_ENDS
+        self.said.check(ended, "no-end-event", "the stream does not end with a response that completed")
+        usage = self.last["response"].get("usage")
+        return Answer(self.text, self.calls.all(), *counts(usage, "input_tokens", "output_tokens"))
 
 
-def read_messages(answer: dict[str, Any]) -> Answer:
+def read_messages(answer: dict[str, Any], said: Exchange) -> Answer:
+    said.ended(answer.get("stop_reason"))
     text, calls = "", Calls()
     for index, block in enumerate(answer["content"]):
         if block["type"] == "text":
-            text += block["text"]
+            text += string_of(block["text"])
         elif block["type"] == "tool_use":
             calls.add(index, block["name"], json.dumps(block["input"]))
     return Answer(text, calls.all(), *counts(answer.get("usage"), "input_tokens", "output_tokens"))
 
 
-def read_messages_stream(data: list[str]) -> Answer:
-    events = [json.loads(one) for one in data]
-    assert events and events[-1]["type"] == "message_stop", "the stream does not end with message_stop"
-    text, calls, usage = "", Calls(), {}
-    for event in events:
+class MessagesStream(Stream):
+    def __init__(self, said: Exchange) -> None:
+        super().__init__(said)
+        self.usage: dict[str, Any] = {}
+        self.last: dict[str, Any] = {}
+
+    def feed(self, data: str) -> None:
+        event = json.loads(data)
+        self.last = event
         if event["type"] == "message_start":
-            usage.update(event["message"].get("usage") or {})
+            self.usage.update(event["message"].get("usage") or {})
         elif event["type"] == "content_block_start" and event["content_block"]["type"] == "tool_use":
-            calls.add(event["index"], name=event["content_block"]["name"])
+            self.calls.add(event["index"], name=event["content_block"]["name"])
         elif event["type"] == "content_block_delta" and event["delta"]["type"] == "text_delta":
-            text += event["delta"]["text"]
+            self.text += string_of(event["delta"]["text"])
         elif event["type"] == "content_block_delta" and event["delta"]["type"] == "input_json_delta":
-            calls.add(event["index"], arguments=event["delta"]["partial_json"])
+            self.calls.add(event["index"], arguments=event["delta"]["partial_json"])
         elif event["type"] == "message_delta":
+            self.said.ended((event.get("delta") or {}).get("stop_reason"))
             # The input count travels in the first event and the output count in this one.
-            usage.update(event.get("usage") or {})
-    return Answer(text, calls.all(), *counts(usage, "input_tokens", "output_tokens"))
+            self.usage.update(event.get("usage") or {})
+
+    def answer(self) -> Answer:
+        ended = self.last.get("type") == "message_stop"
+        self.said.check(ended, "no-end-event", "the stream does not end with message_stop")
+        return Answer(self.text, self.calls.all(), *counts(self.usage, "input_tokens", "output_tokens"))
 
 
-READERS: dict[str, tuple[Callable[[dict[str, Any]], Answer], Callable[[list[str]], Answer]]] = {
-    CHAT: (read_chat, read_chat_stream),
-    RESPONSES: (read_responses, read_responses_stream),
-    MESSAGES: (read_messages, read_messages_stream),
+READERS: dict[str, tuple[Callable[[dict[str, Any], Exchange], Answer], type[Stream]]] = {
+    CHAT: (read_chat, ChatStream),
+    RESPONSES: (read_responses, ResponsesStream),
+    MESSAGES: (read_messages, MessagesStream),
 }
 
 
@@ -212,22 +356,35 @@ async def events_of(response: httpx.Response) -> AsyncIterator[str]:
                 yield event.data
 
 
-async def ask(client: httpx.AsyncClient, engine: Any, route: str, *, streamed: bool, calling: bool = False) -> Answer:
+async def ask(
+    client: httpx.AsyncClient, engine: Any, route: str, *, streamed: bool, calling: bool = False
+) -> tuple[Exchange, Answer]:
     """Send the route its request, with the secret, and read the answer: it is served, and it carries its usage."""
-    what = f"{route}, {'streamed' if streamed else 'whole'}{', calling a function' if calling else ''}"
+    name = f"{WORDS[route]}-{'streamed' if streamed else 'whole'}{'-calling' if calling else ''}"
     body = REQUESTS[route] | (STREAMED[route] if streamed else {}) | (CALLING[route] if calling else {})
     whole, stream = READERS[route]
-    async with client.stream("POST", route, json=body, headers=engine.authorized) as response:
-        assert response.status_code == 200, f"{what}: answered {response.status_code}"
-        if streamed:
-            content_type = response.headers.get("content-type", "")
-            assert content_type.startswith("text/event-stream"), f"{what}: not a stream of server-sent events"
-            answer = stream([data async for data in events_of(response)])
-        else:
-            answer = whole(json.loads(await response.aread()))
-    for count in (answer.input_tokens, answer.output_tokens):
-        assert isinstance(count, int) and count > 0, f"{what}: the answer does not carry its usage"
-    return answer
+    with exchanging(name, route) as said:
+        async with client.stream("POST", route, json=body, headers=engine.authorized) as response:
+            said.check(response.status_code == 200, status_word(response))
+            if streamed:
+                content_type = response.headers.get("content-type", "")
+                said.check(content_type.startswith("text/event-stream"), "not-a-stream")
+                reader = stream(said)
+                async for data in events_of(response):
+                    reader.feed(data)
+                answer = reader.answer()
+            else:
+                answer = whole(json.loads(await response.aread()), said)
+        carried = all(isinstance(count, int) and count > 0 for count in (answer.input_tokens, answer.output_tokens))
+        said.check(carried, "no-usage", "the answer does not carry its usage")
+    return said, answer
+
+
+def is_an_object(arguments: str) -> bool:
+    try:
+        return isinstance(json.loads(arguments), dict)
+    except ValueError:
+        return False
 
 
 # --- The contract --------------------------------------------------------------------------------
@@ -238,18 +395,21 @@ def test_inference(engine: Any) -> None:
         async with engine.client() as client:
             for route in FORMATS:
                 for streamed in (False, True):
-                    said = await ask(client, engine, route, streamed=streamed)
-                    assert said.text, (route, streamed)
-                    assert said.calls == [], (route, streamed)
+                    said, answer = await ask(client, engine, route, streamed=streamed)
+                    said.check(bool(answer.text), "no-text")
+                    said.check(answer.calls == [], "a-call")
 
-                    called = await ask(client, engine, route, streamed=streamed, calling=True)
-                    assert [name for name, _ in called.calls] == [FUNCTION], (route, streamed)
-                    assert isinstance(json.loads(called.calls[0][1]), dict), (route, streamed)
+                    said, answer = await ask(client, engine, route, streamed=streamed, calling=True)
+                    said.check([name for name, _ in answer.calls] == [FUNCTION], "no-call")
+                    said.check(is_an_object(answer.calls[0][1]), "arguments-not-an-object")
 
-            counted = await client.post(COUNT, json=REQUESTS[COUNT], headers=engine.authorized)
-            assert counted.status_code == 200
-            input_tokens = counted.json().get("input_tokens")
-            assert isinstance(input_tokens, int) and input_tokens > 0
+            with exchanging("count") as said:
+                counted = await client.post(COUNT, json=REQUESTS[COUNT], headers=engine.authorized)
+                said.check(counted.status_code == 200, status_word(counted))
+                body = counted.json()
+                said.check(isinstance(body, dict), "unreadable")
+                input_tokens = body.get("input_tokens")
+                said.check(isinstance(input_tokens, int) and input_tokens > 0, "no-input-tokens")
 
     asyncio.run(scenario())
 
@@ -258,9 +418,12 @@ def test_health(engine: Any) -> None:
     async def scenario() -> None:
         async with engine.client() as client:
             # Without the secret: the load balancer's health check carries none.
-            assert (await client.get("/health")).status_code == 200
+            with exchanging("health") as said:
+                health = await client.get("/health")
+                said.check(health.status_code == 200, status_word(health))
             # 200 says the model can serve, so the next request is served.
-            assert (await ask(client, engine, CHAT, streamed=False)).text
+            said, answer = await ask(client, engine, CHAT, streamed=False)
+            said.check(bool(answer.text), "no-text")
 
     asyncio.run(scenario())
 
@@ -271,34 +434,41 @@ def test_metrics(engine: Any) -> None:
     async def scenario() -> None:
         async with engine.client() as client:
             await ask(client, engine, CHAT, streamed=True)
-            response = await client.get("/metrics")
-        assert response.status_code == 200
-        families = {family.name: family.type for family in text_string_to_metric_families(response.text)}
+            with exchanging("metrics") as said:
+                response = await client.get("/metrics")
+                said.check(response.status_code == 200, status_word(response))
+                families = {family.name: family.type for family in text_string_to_metric_families(response.text)}
         for quantity in Quantity:
             name = names[quantity]
-            assert name in families, f"{quantity.value}: the engine serves no metric named {name}"
-            assert families[name] == quantity.kind.value, f"{quantity.value}: {name} is a {families[name]}"
+            said.check(name in families, f"metric-missing-{quantity.value}", f"the engine serves no metric {name}")
+            said.check(
+                families[name] == quantity.kind.value, f"metric-kind-{quantity.value}", f"{name} is a {families[name]}"
+            )
 
         # On localhost only. Checked where the suite chooses the address its request comes from.
         if engine.in_process:
             async with engine.client(peer=ELSEWHERE) as client:
-                assert (await client.get("/metrics")).status_code == 404, "the metrics are served to another host"
+                with exchanging("metrics") as said:
+                    elsewhere = await client.get("/metrics")
+                    said.check(
+                        elsewhere.status_code == 404, "metrics-elsewhere", "the metrics are served to another host"
+                    )
 
     asyncio.run(scenario())
 
 
 def test_bearer_secret(engine: Any) -> None:
     wrong = {"Authorization": f"Bearer {secrets.token_urlsafe(32)}"}
+    # Each way of asking, and what it must be answered.
+    ways = (("without", {}, 401), ("wrong", wrong, 401), ("with", engine.authorized, 200))
 
     async def scenario() -> None:
         async with engine.client() as client:
             for route in INFERENCE_ROUTES:
-                without = await client.post(route, json=REQUESTS[route])
-                assert without.status_code == 401, f"{route} answered {without.status_code} with no secret"
-                mistaken = await client.post(route, json=REQUESTS[route], headers=wrong)
-                assert mistaken.status_code == 401, f"{route} answered {mistaken.status_code} to a wrong secret"
-                right = await client.post(route, json=REQUESTS[route], headers=engine.authorized)
-                assert right.status_code == 200, f"{route} answered {right.status_code} to the pool's secret"
+                for way, headers, expected in ways:
+                    with exchanging(f"{WORDS[route]}-{way}-secret") as said:
+                        answered = await client.post(route, json=REQUESTS[route], headers=headers)
+                        said.check(answered.status_code == expected, status_word(answered))
 
     asyncio.run(scenario())
 
@@ -320,7 +490,10 @@ def test_shutdown(engine_process: Any) -> None:
             return [first] + [data async for data in events]
 
     # The request runs to its end: the terminal event, the text and the usage, as with no signal.
-    answer = read_chat_stream(asyncio.run(scenario()))
+    reader = ChatStream(Exchange("chat-streamed", CHAT))
+    for data in asyncio.run(scenario()):
+        reader.feed(data)
+    answer = reader.answer()
     assert answer.text
     assert isinstance(answer.output_tokens, int) and answer.output_tokens > 0
     # Then the engine stops.
@@ -345,6 +518,9 @@ class Altered(httpx.AsyncBaseTransport):
         if self._request is not None:
             self._request(request)
         response = await self._inner.handle_async_request(request)
+        if self._answer is None:
+            # Nothing to change: the answer as it comes, a stream still in flight.
+            return response
         content = (await response.aread()).decode()
         await response.aclose()
         if self._answer is not None:
@@ -404,6 +580,110 @@ def without_metric(name: str) -> Callable[[httpx.Request, str], str]:
     return answer
 
 
+def reasoning_alone(*, streamed: bool) -> Callable[[httpx.Request, str], str]:
+    """The Messages answers, the whole ones or the streamed ones, cut inside the reasoning: one
+    thinking block and no other, and `stop_reason` `max_tokens`."""
+
+    def answer(request: httpx.Request, content: str) -> str:
+        if request.url.path != MESSAGES or (json.loads(request.content).get("stream") is True) != streamed:
+            return content
+        if not streamed:
+            message = json.loads(content)
+            message["content"] = [block for block in message["content"] if block["type"] == "thinking"]
+            return json.dumps(message | {"stop_reason": "max_tokens"})
+        frames, thinking = [], set()
+        for frame in content.split("\n\n"):
+            lines = frame.split("\n")
+            data = [line for line in lines if line.startswith("data: ")]
+            if not data:
+                frames.append(frame)
+                continue
+            event = json.loads(data[0].removeprefix("data: "))
+            if event["type"] == "content_block_start" and event["content_block"]["type"] == "thinking":
+                thinking.add(event["index"])
+            if event["type"].startswith("content_block_") and event["index"] not in thinking:
+                continue
+            if event["type"] == "message_delta":
+                event["delta"]["stop_reason"] = "max_tokens"
+            frames.append("\n".join(f"data: {json.dumps(event)}" if line in data else line for line in lines))
+        return "\n\n".join(frames)
+
+    return answer
+
+
+def failed_responses_stream(request: httpx.Request, content: str) -> str:
+    """The Responses streams, ended by the event that says the response failed, and not completed."""
+    if request.url.path != RESPONSES or json.loads(request.content).get("stream") is not True:
+        return content
+    lines = []
+    for line in content.split("\n"):
+        if line == "event: response.completed":
+            line = "event: response.failed"
+        elif line.startswith("data: ") and '"response.completed"' in line:
+            event = json.loads(line.removeprefix("data: "))
+            event["type"], event["response"]["status"] = "response.failed", "failed"
+            line = f"data: {json.dumps(event)}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def chat_text_not_a_string(request: httpx.Request, content: str) -> str:
+    """The whole Chat answers, with an object where their text belongs."""
+    if request.url.path != CHAT or json.loads(request.content).get("stream") is True:
+        return content
+    answer = json.loads(content)
+    answer["choices"][0]["message"]["content"] = {"text": "not a string"}
+    return json.dumps(answer)
+
+
+def chat_stream_after_done(request: httpx.Request, content: str) -> str:
+    """The Chat streams, with `[DONE]` before their first event, as if they went on after their end."""
+    if request.url.path != CHAT or json.loads(request.content).get("stream") is not True:
+        return content
+    return "data: [DONE]\n\n" + content
+
+
+def null_text_beside_text(path: str) -> Callable[[httpx.Request, str], str]:
+    """The whole answers of Responses or Messages to the request without a function, with one more
+    text part beside their text, whose text is `null`, where the format holds a string."""
+
+    def answer(request: httpx.Request, content: str) -> str:
+        body = json.loads(request.content)
+        if request.url.path != path or body.get("stream") is True or "tools" in body:
+            return content
+        answer = json.loads(content)
+        if path == RESPONSES:
+            message = next(item for item in answer["output"] if item["type"] == "message")
+            message["content"].append({"type": "output_text", "text": None, "annotations": []})
+        else:
+            answer["content"].append({"type": "text", "text": None})
+        return json.dumps(answer)
+
+    return answer
+
+
+class StallsAfterItsFinish(httpx.AsyncByteStream):
+    """A Chat stream that says it ended at its budget, then stalls until the client gives up."""
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield b'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "length"}]}\n\n'
+        raise httpx.ReadTimeout("no more of the stream")
+
+
+def stalled(engine: Any) -> Any:
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=StallsAfterItsFinish())
+
+    return replace(engine, connect=lambda peer: httpx.MockTransport(answer))
+
+
+def reason_of(check: Callable[[Any], None], engine: Any) -> str:
+    """The first line of the failure a test of the contract ends in, against the engine."""
+    with pytest.raises(AssertionError) as failed:
+        check(engine)
+    return str(failed.value).splitlines()[0]
+
+
 def test_the_suite_catches_a_broken_engine(mock_engine: Any) -> None:
     def any_secret(request: httpx.Request) -> None:
         request.headers["Authorization"] = mock_engine.authorized["Authorization"]
@@ -413,19 +693,95 @@ def test_the_suite_catches_a_broken_engine(mock_engine: Any) -> None:
         check(altered(mock_engine))
 
     # Its secret check turned off: every request is answered, whatever it carries.
-    with pytest.raises(AssertionError, match="secret"):
-        test_bearer_secret(altered(mock_engine, request=any_secret))
+    assert (
+        reason_of(test_bearer_secret, altered(mock_engine, request=any_secret)) == "chat-without-secret status-200 none"
+    )
 
     # Its usage removed: from the whole answers or from the streams of one format, each in turn.
+    # The request without a function is the first of each, and the mock's answers end as they should.
+    ends = {CHAT: "stop", RESPONSES: "completed", MESSAGES: "end_turn"}
     for route in FORMATS:
         for streamed in (False, True):
-            with pytest.raises(AssertionError, match="usage"):
-                test_inference(altered(mock_engine, answer=without_usage(route, streamed=streamed)))
+            broken = altered(mock_engine, answer=without_usage(route, streamed=streamed))
+            way = "streamed" if streamed else "whole"
+            assert reason_of(test_inference, broken) == f"{WORDS[route]}-{way} no-usage {ends[route]}"
 
     # One metric of its row missing: each in turn, and the failure names the quantity left without one.
     for quantity, name in metric_names(mock_engine.name).items():
-        with pytest.raises(AssertionError, match=f"^{quantity.value}: "):
-            test_metrics(altered(mock_engine, answer=without_metric(name)))
+        broken = altered(mock_engine, answer=without_metric(name))
+        assert reason_of(test_metrics, broken) == f"metrics metric-missing-{quantity.value} none"
+
+    # Its Messages answers cut inside the reasoning, as a budget too small for a model that reasons
+    # first cuts them: the whole ones and the streamed ones, then the streamed ones alone.
+    cut = [reasoning_alone(streamed=False), reasoning_alone(streamed=True)]
+
+    def both(request: httpx.Request, content: str) -> str:
+        return cut[1](request, cut[0](request, content))
+
+    assert reason_of(test_inference, altered(mock_engine, answer=both)) == "messages-whole no-text max_tokens"
+    assert reason_of(test_inference, altered(mock_engine, answer=cut[1])) == "messages-streamed no-text max_tokens"
+
+    # A Responses stream that says its response failed, though it carried text and usage.
+    broken = altered(mock_engine, answer=failed_responses_stream)
+    assert reason_of(test_inference, broken) == "responses-streamed no-end-event other"
+
+    # An answer not of its format's shape, read as far as it says how it ended.
+    broken = altered(mock_engine, answer=chat_text_not_a_string)
+    assert reason_of(test_health, broken) == "chat-whole unreadable stop"
+    # Text that must be a string and is `null`, beside the answer's text.
+    broken = altered(mock_engine, answer=null_text_beside_text(RESPONSES))
+    assert reason_of(test_inference, broken) == "responses-whole unreadable completed"
+    broken = altered(mock_engine, answer=null_text_beside_text(MESSAGES))
+    assert reason_of(test_inference, broken) == "messages-whole unreadable end_turn"
+    # A Chat stream that goes on after `[DONE]`.
+    broken = altered(mock_engine, answer=chat_stream_after_done)
+    assert reason_of(test_inference, broken) == "chat-streamed unreadable none"
+
+    # A stream that times out after it said how it ended keeps that word.
+    assert reason_of(test_metrics, stalled(mock_engine)) == "chat-streamed timeout length"
+
+
+# Where each generation format asks for its effort and its output budget: the object that holds the
+# effort, then its key in that object, and the key of the budget.
+ROOM_FIELDS = {
+    CHAT: (None, "reasoning_effort", "max_completion_tokens"),
+    RESPONSES: ("reasoning", "effort", "max_output_tokens"),
+    MESSAGES: ("output_config", "effort", "max_tokens"),
+}
+
+
+def leaves_room(path: str, body: dict[str, Any]) -> bool:
+    """Whether a generation request asks for the effort `low` and 2,048 tokens, in its format's fields."""
+    parent, effort, budget = ROOM_FIELDS[path]
+    holder = body if parent is None else body.get(parent)
+    return isinstance(holder, dict) and holder.get(effort) == "low" and body.get(budget) == 2048
+
+
+def test_every_generation_request_leaves_a_reasoning_model_room_to_answer(
+    mock_engine: Any, engine_process: Any
+) -> None:
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def record(request: httpx.Request) -> None:
+        if request.url.path in FORMATS:
+            sent.append((request.url.path, json.loads(request.content)))
+
+    for check in (test_inference, test_health, test_metrics, test_bearer_secret):
+        check(altered(mock_engine, request=record))
+    before = len(sent)
+    test_shutdown(replace(engine_process, engine=altered(engine_process.engine, request=record)))
+    # The shutdown's one request, a stream, is among them.
+    assert [(path, body.get("stream")) for path, body in sent[before:]] == [(CHAT, True)]
+
+    assert {path for path, _ in sent} == set(FORMATS)
+    assert [(path, body) for path, body in sent if not leaves_room(path, body)] == []
+
+    # A request without either field, or with another value, is one the check refuses.
+    for path, (parent, effort, budget) in ROOM_FIELDS.items():
+        body = REQUESTS[path]
+        effortless = {key: value for key, value in body.items() if key != (parent or effort)}
+        for lacking in (effortless, body | {budget: 1024}, {k: v for k, v in body.items() if k != budget}):
+            assert not leaves_room(path, lacking)
 
 
 def contract_tests(*arguments: str, environ: Mapping[str, str]) -> subprocess.CompletedProcess[str]:
