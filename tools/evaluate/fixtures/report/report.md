@@ -1,8 +1,8 @@
 # Evaluation scorecard
 
-Summary digest: `sha256:3f047a5bb8735c0777bf5f64dc443b9bfd62f4990b3f93146d580998a3e79db5`
+Summary digest: `sha256:4051a14fe063c4f8004a5bc3b84980c154911cdede0c4ba7fe50d7b377eda2bc`
 
-Run `sha256:0bebfca6e2eb75da84f51d05234b2e68a6ef8730bc6b74a411842f7ba216becf`, workload `sha256:ac1ca1fdb960e3392556d26c40721d25c8436af4ee71cfd31f614e1a23e1ef36`, treatment `sha256:ee1b33aaf2e3f77f617a0ad0b079867172d3e63f5aadc98190352b2560f55170`.
+Run `sha256:f8768785a0188d5da7a51ad13813af8cbb8e14fe2d9a239cbb30eafe1b1bb72a`, workload `sha256:ac1ca1fdb960e3392556d26c40721d25c8436af4ee71cfd31f614e1a23e1ef36`, treatment `sha256:1ed0453d304fadc3676b771ce3803fd983e42bea5ca5f544e95cf48c2b2f551c`.
 Suite course-v1, profile qualify, class size 2.
 
 ## Recommendation
@@ -35,6 +35,7 @@ Class size 2. Common configuration: none. Any other class size or host count: un
 | speculative_decoding | off | off | match |
 | renderer_digest | sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff | – | not_observed |
 | gateway_profile_digest | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | match |
+| launch_fingerprint | f0d66805f5c4871bcbd4d3dc80e01863c6115286850ccbcf6fd870c6e0d86de2 | – | not_observed |
 
 ## Capacity at the class size
 

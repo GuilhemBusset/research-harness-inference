@@ -766,6 +766,9 @@ class Driver:
         issue's URL once its number is journaled, which only GitHub's confirmation does, whichever
         invocation (the run's, or `publish --resume`) got it."""
         run_id = record["run_id"]
+        # The exit is read first: it is written only once the run's status is final, so a shown
+        # exit never comes with a status read before the run wrote its last one.
+        exit_code = self._exit_of(record)
         try:
             status = controller.run_status(self.root, run_id)
             number = controller.saved_state(self.root, run_id).get("issue_number")
@@ -781,7 +784,7 @@ class Driver:
             "step": status.get("step", "admitted"),
             "issue": controller.issue_url(record["run"]["repository"], number) if confirmed else None,
             "ending": status.get("ending"),
-            "exit": self._exit_of(record),
+            "exit": exit_code,
             "publication": status.get("publication"),
             "cancel_requested": self._cancel_requested(record),
             "running": worker is not None and worker.is_alive(),

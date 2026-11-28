@@ -131,6 +131,8 @@ def settings(variant: Variant, *, observed: bool) -> Settings:
         speculative_decoding=SpeculativeDecoding.OFF,
         renderer_digest=None if observed else "sha256:" + "f" * 64,
         gateway_profile_digest="sha256:" + "a" * 64,
+        # The hosts' fingerprints are in the checkpoints: the manifest observes none.
+        launch_fingerprint=None if observed else variant.requested_launch,
     )
 
 
@@ -1027,8 +1029,6 @@ def test_the_script_reads_and_compares_saved_bundles_offline_from_any_folder(tmp
             Refusal.UNVERIFIED_TREATMENT,
         ),
         (Variant(step_budget_tokens=4096), Refusal.UNVERIFIED_TREATMENT),
-        # Launched arguments that differ with no setting declared changed.
-        (Variant(launched=launch("other"), requested_launch=launch("other")), Refusal.UNDECLARED_TREATMENT),
     ],
 )
 def test_compare_refuses_another_workload_floor_budget_or_an_unproven_treatment(
@@ -1043,18 +1043,50 @@ def test_compare_refuses_another_workload_floor_budget_or_an_unproven_treatment(
     assert printed.out.startswith("treatment diff") and printed.err.startswith(f"refused: {reason.value}")
 
 
-def test_a_flags_only_treatment_compares_once_each_host_launched_what_its_run_requested(tmp_path: Path):
-    candidate = build(
-        tmp_path / "candidate",
-        Variant(step_budget_tokens=4096, launched=launch("step-4096"), requested_launch=launch("step-4096")),
+def unobserved_gateway(tmp_path: Path, candidate: Variant) -> tuple[Path, Path]:
+    """The saved bundle and a candidate, each requesting a gateway profile and observing none, as
+    a live run does while the gateway publishes none."""
+    runs = (
+        shutil.copytree(FIXTURE, tmp_path / "reference", ignore=shutil.ignore_patterns(*report.DERIVED)),
+        build(tmp_path / "candidate", candidate),
     )
-    diff = compared(FIXTURE, candidate)["diff"]
+    for run in runs:
+        manifest_edited(run, lambda manifest: manifest["observed"].update(gateway_profile_digest=None))
+    return runs
+
+
+@pytest.mark.parametrize(
+    ("variant", "rows"),
+    [
+        # Another step budget, and the fingerprint of the flags that give it.
+        (
+            Variant(step_budget_tokens=4096, launched=launch("step-4096"), requested_launch=launch("step-4096")),
+            {"step_budget_tokens", "launch_fingerprint"},
+        ),
+        # A flag no other setting names (`--max-num-seqs`): declared by the fingerprint alone.
+        (Variant(launched=launch("seqs-16"), requested_launch=launch("seqs-16")), {"launch_fingerprint"}),
+    ],
+)
+def test_a_flags_only_treatment_compares_once_each_host_launched_what_its_run_requested(
+    tmp_path: Path, variant: Variant, rows: set[str]
+):
+    diff = compared(*unobserved_gateway(tmp_path, variant))["diff"]
     assert (diff["label"], diff["verified"]) == ("flags_only", ["launch_settings"])
-    assert [row["setting"] for row in diff["settings"]] == ["step_budget_tokens"]
+    assert {row["setting"] for row in diff["settings"]} == rows
 
 
-@pytest.mark.parametrize("gap", ["host", "gateway"])
-def test_a_flags_only_treatment_needs_every_serving_host_and_the_gateway_observed(tmp_path: Path, gap: str):
+def test_a_setting_the_candidate_does_not_request_is_not_contradicted_by_its_engines(tmp_path: Path):
+    fingerprint = launch("cache-16bit")
+    runs = unobserved_gateway(tmp_path, Variant(launched=fingerprint, requested_launch=fingerprint))
+    # The candidate's flags leave `--kv-cache-dtype` out; its engines say 16 bits, the reference's 8.
+    manifest_edited(runs[1], lambda manifest: manifest["requested"].update(kv_dtype=None))
+    manifest_edited(runs[1], lambda manifest: manifest["observed"].update(kv_dtype=KvDtype.BITS_16.value))
+    diff = compared(*runs)["diff"]
+    assert (diff["label"], diff["verified"]) == ("flags_only", ["launch_settings"])
+
+
+@pytest.mark.parametrize("gap", ["host", "manifest"])
+def test_a_flags_only_treatment_needs_every_serving_host_to_launch_the_requested_fingerprint(tmp_path: Path, gap: str):
     fingerprint = launch("step-4096")
     candidate = build(
         tmp_path / "candidate", Variant(step_budget_tokens=4096, launched=fingerprint, requested_launch=fingerprint)
@@ -1066,14 +1098,39 @@ def test_a_flags_only_treatment_needs_every_serving_host_and_the_gateway_observe
         lines[0]["hosts"].pop()
         path.write_text("".join(json.dumps(line) + "\n" for line in lines))
     else:
-        manifest_edited(candidate, lambda manifest: manifest["observed"].update(gateway_profile_digest=None))
+        # The hosts launched what the checkpoints say, not the treatment the manifest declares.
+        manifest_edited(candidate, lambda manifest: manifest["requested"].update(launch_fingerprint=launch("other")))
     with pytest.raises(ReportError) as refused:
         compared(FIXTURE, candidate)
     assert (refused.value.reason, refused.value.lever) == (Refusal.UNVERIFIED_TREATMENT, report.Lever.LAUNCH_SETTINGS)
 
 
-def test_a_declared_host_count_does_not_cover_other_hardware_observed(reference: Path, tmp_path: Path):
-    runs = shutil.copytree(reference, tmp_path / "reference"), build(tmp_path / "candidate")
+def test_launched_arguments_that_differ_with_no_fingerprint_requested_are_undeclared(tmp_path: Path):
+    runs = build(tmp_path / "reference"), build(tmp_path / "candidate", Variant(launched=launch("other"), requested_launch=launch("other")))
+    for run in runs:
+        manifest_edited(run, lambda manifest: manifest["requested"].update(launch_fingerprint=None))
+    with pytest.raises(ReportError) as refused:
+        compared(*runs)
+    assert (refused.value.reason, refused.value.lever) == (Refusal.UNDECLARED_TREATMENT, report.Lever.LAUNCH_SETTINGS)
+
+
+def test_a_request_side_change_is_unverified_while_no_gateway_profile_is_observed(tmp_path: Path):
+    runs = unobserved_gateway(tmp_path, CANDIDATE)
+    # Another reasoning-effort mapping or cache-salt scope: the same release and flags.
+    manifest_edited(runs[1], lambda manifest: manifest["requested"].update(gateway_profile_digest="sha256:" + "b" * 64))
+    with pytest.raises(ReportError) as refused:
+        compared(*runs)
+    assert (refused.value.reason, refused.value.lever) == (Refusal.UNVERIFIED_TREATMENT, report.Lever.GATEWAY_PROFILE)
+
+
+@pytest.mark.parametrize("change", ["host_count", "step_budget"])
+def test_a_declared_change_does_not_cover_other_hardware_observed(reference: Path, tmp_path: Path, change: str):
+    fingerprint = launch("step-4096")
+    if change == "host_count":
+        runs = shutil.copytree(reference, tmp_path / "reference"), build(tmp_path / "candidate")
+    else:
+        variant = Variant(step_budget_tokens=4096, launched=fingerprint, requested_launch=fingerprint)
+        runs = build(tmp_path / "reference"), build(tmp_path / "candidate", variant)
     for run in runs:
         manifest_edited(run, lambda manifest: manifest["requested"].update(instance_type=None, gpus_per_host=None))
     manifest_edited(

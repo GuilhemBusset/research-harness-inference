@@ -152,6 +152,7 @@ def settings(**changes: Any) -> contracts.Settings:
         speculative_decoding=contracts.SpeculativeDecoding.OFF,
         renderer_digest=digest("4"),
         gateway_profile_digest=digest("5"),
+        launch_fingerprint="6" * 64,
     )
     return contracts.Settings(**declared | changes)
 

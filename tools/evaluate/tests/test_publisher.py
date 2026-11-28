@@ -516,6 +516,22 @@ def test_a_comparison_shows_each_shape_s_limiting_rows_or_the_evidence_missing()
             render_comparison(replace(comparison("a" * 16), limits=limits))
 
 
+def test_a_comparison_names_its_treatment_label_and_the_levers_it_verified() -> None:
+    from evaluate import report
+
+    # The mirrored vocabularies are those of the treatment diff.
+    assert {one.value for one in publisher.Lever} == {one.value for one in report.Lever}
+    others = {lever.value for lever in report.Lever if lever not in report.FLAGS}
+    assert {one.value for one in publisher.Label} == {"repeat", "combined", "flags_only"} | others
+    flags_only = replace(
+        comparison("a" * 16), label=publisher.Label.FLAGS_ONLY, verified=(publisher.Lever.LAUNCH_SETTINGS,)
+    )
+    assert "- Treatment: `flags_only`; verified levers: `launch_settings`" in render_comparison(flags_only)
+    for refused in ({"label": "flags only"}, {"verified": ("launch_settings",)}, {"label": None, "verified": ("x",)}):
+        with pytest.raises(PublishError):
+            render_comparison(replace(flags_only, **refused))
+
+
 def test_a_rejected_question_or_a_scan_finding_sends_nothing(
     tmp_path: Path, fake: FakeGitHub, driver: Publisher
 ) -> None:
