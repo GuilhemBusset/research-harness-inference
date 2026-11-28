@@ -181,9 +181,14 @@ class Answer(NamedTuple):
 
 
 def text_of(value: object) -> str:
-    """The text a format's field holds: a string, or nothing. Any other value is not of the format's shape."""
-    if value is None or isinstance(value, str):
-        return value or ""
+    """The text a field that may be empty holds: a string, or nothing. Any other value is not of the format's shape."""
+    return "" if value is None else string_of(value)
+
+
+def string_of(value: object) -> str:
+    """The text a field that must hold one holds: a string, and nothing else is of the format's shape."""
+    if isinstance(value, str):
+        return value
     raise TypeError("the answer's text is not a string")
 
 
@@ -239,6 +244,9 @@ class ChatStream(Stream):
         self.done, self.usage = False, cast(object, None)
 
     def feed(self, data: str) -> None:
+        # `[DONE]` ends the stream: an event after it is not of the format's shape.
+        if self.done:
+            raise ValueError("an event after [DONE]")
         self.done = data == "[DONE]"
         if self.done:
             return
@@ -262,7 +270,7 @@ def read_responses(answer: dict[str, Any], said: Exchange) -> Answer:
     text, calls = "", Calls()
     for index, item in enumerate(answer["output"]):
         if item["type"] == "message":
-            text += "".join(text_of(part["text"]) for part in item["content"] if part["type"] == "output_text")
+            text += "".join(string_of(part["text"]) for part in item["content"] if part["type"] == "output_text")
         elif item["type"] == "function_call":
             calls.add(index, item["name"], item["arguments"])
     return Answer(text, calls.all(), *counts(answer.get("usage"), "input_tokens", "output_tokens"))
@@ -279,7 +287,7 @@ class ResponsesStream(Stream):
         if event["type"] in RESPONSES_LAST:
             self.said.ended(event["response"].get("status"))
         elif event["type"] == "response.output_text.delta":
-            self.text += text_of(event["delta"])
+            self.text += string_of(event["delta"])
         elif event["type"] == "response.output_item.added" and event["item"]["type"] == "function_call":
             self.calls.add(event["output_index"], name=event["item"]["name"])
         elif event["type"] == "response.function_call_arguments.delta":
@@ -298,7 +306,7 @@ def read_messages(answer: dict[str, Any], said: Exchange) -> Answer:
     text, calls = "", Calls()
     for index, block in enumerate(answer["content"]):
         if block["type"] == "text":
-            text += text_of(block["text"])
+            text += string_of(block["text"])
         elif block["type"] == "tool_use":
             calls.add(index, block["name"], json.dumps(block["input"]))
     return Answer(text, calls.all(), *counts(answer.get("usage"), "input_tokens", "output_tokens"))
@@ -318,7 +326,7 @@ class MessagesStream(Stream):
         elif event["type"] == "content_block_start" and event["content_block"]["type"] == "tool_use":
             self.calls.add(event["index"], name=event["content_block"]["name"])
         elif event["type"] == "content_block_delta" and event["delta"]["type"] == "text_delta":
-            self.text += text_of(event["delta"]["text"])
+            self.text += string_of(event["delta"]["text"])
         elif event["type"] == "content_block_delta" and event["delta"]["type"] == "input_json_delta":
             self.calls.add(event["index"], arguments=event["delta"]["partial_json"])
         elif event["type"] == "message_delta":
@@ -628,6 +636,32 @@ def chat_text_not_a_string(request: httpx.Request, content: str) -> str:
     return json.dumps(answer)
 
 
+def chat_stream_after_done(request: httpx.Request, content: str) -> str:
+    """The Chat streams, with `[DONE]` before their first event, as if they went on after their end."""
+    if request.url.path != CHAT or json.loads(request.content).get("stream") is not True:
+        return content
+    return "data: [DONE]\n\n" + content
+
+
+def null_text_beside_text(path: str) -> Callable[[httpx.Request, str], str]:
+    """The whole answers of Responses or Messages to the request without a function, with one more
+    text part beside their text, whose text is `null`, where the format holds a string."""
+
+    def answer(request: httpx.Request, content: str) -> str:
+        body = json.loads(request.content)
+        if request.url.path != path or body.get("stream") is True or "tools" in body:
+            return content
+        answer = json.loads(content)
+        if path == RESPONSES:
+            message = next(item for item in answer["output"] if item["type"] == "message")
+            message["content"].append({"type": "output_text", "text": None, "annotations": []})
+        else:
+            answer["content"].append({"type": "text", "text": None})
+        return json.dumps(answer)
+
+    return answer
+
+
 class StallsAfterItsFinish(httpx.AsyncByteStream):
     """A Chat stream that says it ended at its budget, then stalls until the client gives up."""
 
@@ -694,6 +728,14 @@ def test_the_suite_catches_a_broken_engine(mock_engine: Any) -> None:
     # An answer not of its format's shape, read as far as it says how it ended.
     broken = altered(mock_engine, answer=chat_text_not_a_string)
     assert reason_of(test_health, broken) == "chat-whole unreadable stop"
+    # Text that must be a string and is `null`, beside the answer's text.
+    broken = altered(mock_engine, answer=null_text_beside_text(RESPONSES))
+    assert reason_of(test_inference, broken) == "responses-whole unreadable completed"
+    broken = altered(mock_engine, answer=null_text_beside_text(MESSAGES))
+    assert reason_of(test_inference, broken) == "messages-whole unreadable end_turn"
+    # A Chat stream that goes on after `[DONE]`.
+    broken = altered(mock_engine, answer=chat_stream_after_done)
+    assert reason_of(test_inference, broken) == "chat-streamed unreadable none"
 
     # A stream that times out after it said how it ended keeps that word.
     assert reason_of(test_metrics, stalled(mock_engine)) == "chat-streamed timeout length"
